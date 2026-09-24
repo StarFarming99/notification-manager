@@ -74,6 +74,24 @@ func (s *notifyStage) Exec(ctx context.Context, l log.Logger, data interface{}) 
 	_ = level.Debug(l).Log("msg", "Start notify stage", "seq", ctx.Value("seq"))
 
 	input := data.(map[internal.Receiver][]*template.Data)
+	// Give every receiver in this dispatch the same occurrence timestamp. It
+	// remains stable across notifier retries, while a later Alertmanager repeat
+	// gets a new value and can be counted independently by Jev.
+	if jev := s.notifierCtl.GetJevShadow(); jev != nil && jev.Enabled() {
+		dispatchTime := time.Now().UTC()
+		for _, dataList := range input {
+			for _, d := range dataList {
+				for _, alert := range d.Alerts {
+					if alert.NotificationTime.IsZero() {
+						alert.NotificationTime = dispatchTime
+					}
+				}
+				if err := jev.StampDeliveryID(d); err != nil {
+					_ = level.Error(l).Log("msg", "Jev shadow failed to stamp delivery identity", "error", err)
+				}
+			}
+		}
+	}
 	alertMap := make(map[string]*template.Alert)
 	for _, dataList := range input {
 		for _, d := range dataList {

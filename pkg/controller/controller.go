@@ -30,6 +30,7 @@ import (
 	"github.com/kubesphere/notification-manager/apis/v2beta2"
 	"github.com/kubesphere/notification-manager/pkg/constants"
 	"github.com/kubesphere/notification-manager/pkg/internal"
+	"github.com/kubesphere/notification-manager/pkg/jevshadow"
 	"github.com/kubesphere/notification-manager/pkg/template"
 	"github.com/kubesphere/notification-manager/pkg/utils"
 )
@@ -88,6 +89,8 @@ type Controller struct {
 	template  *v2beta2.Template
 	tmpl      *template.Template
 	tmplMutex sync.Mutex
+
+	jevShadow *jevshadow.Service
 }
 
 type task struct {
@@ -95,6 +98,14 @@ type task struct {
 	obj  interface{}
 	run  func(t *task)
 	done chan interface{}
+}
+
+func (c *Controller) SetJevShadow(service *jevshadow.Service) {
+	c.jevShadow = service
+}
+
+func (c *Controller) GetJevShadow() *jevshadow.Service {
+	return c.jevShadow
 }
 
 func New(ctx context.Context, logger log.Logger) (*Controller, error) {

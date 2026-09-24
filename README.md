@@ -169,6 +169,13 @@ make build
 make push
 ```
 
+### Jev shadow card adapter
+
+The Zilliz UAT compatibility branch can mirror successful Feishu application-card
+deliveries to Jev and update the same card through an authenticated internal endpoint.
+The adapter is disabled by default, so an unchanged deployment retains the existing
+notification behavior. See [the adapter configuration](docs/jev-shadow-card-adapter.md).
+
 ## Documentation
 
 - [API documentation](./docs/api/_index.md).

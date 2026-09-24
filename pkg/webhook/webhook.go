@@ -45,6 +45,11 @@ func New(logger log.Logger, notifierCtl *controller.Controller, alerts *store.Al
 	h.router.Get("/configs", h.handler.ListConfigs)
 	h.router.Get("/receiverWithConfig", h.handler.ListReceiverWithConfig)
 	h.router.Post("/api/v2/alerts", h.handler.Alert)
+	if shadow := notifierCtl.GetJevShadow(); shadow != nil && shadow.Enabled() {
+		h.router.Put("/internal/jev/annotations/{messageID}", func(w http.ResponseWriter, r *http.Request) {
+			shadow.HandleAnnotation(w, r, chi.URLParam(r, "messageID"))
+		})
+	}
 	h.router.Post("/api/v2/verify", h.handler.Verify)
 	h.router.Post("/api/v2/notifications", h.handler.Notification)
 	h.router.Get("/metrics", h.handler.ServeMetrics)

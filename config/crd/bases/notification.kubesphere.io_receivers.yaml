@@ -609,6 +609,11 @@ spec:
                     required:
                     - webhook
                     type: object
+                  chatids:
+                    items:
+                      type: string
+                    maxItems: 200
+                    type: array
                   department:
                     items:
                       type: string
@@ -683,7 +688,8 @@ spec:
                     - name
                     type: object
                   tmplType:
-                    description: 'template type: text or post, default type is post'
+                    description: 'template type: text, post or interactive, default
+                      type is interactive'
                     type: string
                   user:
                     items:

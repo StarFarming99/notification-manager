@@ -1,8 +1,7 @@
-ARG GOPROXY="https://proxy.golang.org,direct"
+ARG GOPROXY="https://goproxy.io"
 # Build the manager binary
-FROM golang:1.20 AS builder
+FROM golang:1.20 as builder
 ARG GOPROXY
-ENV GOPROXY=${GOPROXY}
 
 WORKDIR /workspace
 # Copy the Go Modules manifests
@@ -11,7 +10,7 @@ COPY go.sum go.sum
 
 # cache deps before building and copying source so that we don't need to re-download as much
 # and so that source changes don't invalidate our downloaded layer
-RUN go mod download
+RUN GOPROXY=$GOPROXY go mod download
 
 # Copy the go source
 COPY cmd/notification-manager/main.go main.go
