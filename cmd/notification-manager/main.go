@@ -12,6 +12,7 @@ import (
 	"github.com/go-kit/kit/log/level"
 	"github.com/kubesphere/notification-manager/pkg/controller"
 	"github.com/kubesphere/notification-manager/pkg/dispatcher"
+	"github.com/kubesphere/notification-manager/pkg/jevshadow"
 	"github.com/kubesphere/notification-manager/pkg/store"
 	wh "github.com/kubesphere/notification-manager/pkg/webhook"
 	"gopkg.in/alecthomas/kingpin.v2"
@@ -109,6 +110,16 @@ func Main() int {
 	if ctl, err = controller.New(ctlCtx, logger); err != nil {
 		_ = level.Error(logger).Log("msg", "Failed to create notification manager controller")
 		return -1
+	}
+	shadow, err := jevshadow.NewFromEnv(logger)
+	if err != nil {
+		_ = level.Error(logger).Log("msg", "Failed to configure Jev shadow adapter", "error", err)
+		return -1
+	}
+	defer shadow.Close()
+	ctl.SetJevShadow(shadow)
+	if shadow.Enabled() {
+		_ = level.Info(logger).Log("msg", "Jev shadow adapter enabled")
 	}
 	// Sync notification manager config
 	if err := ctl.Run(); err != nil {

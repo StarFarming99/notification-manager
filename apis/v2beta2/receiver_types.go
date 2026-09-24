@@ -306,11 +306,14 @@ type FeishuReceiver struct {
 	// +optional
 	// +kubebuilder:validation:MaxItems=200
 	Department []string       `json:"department,omitempty"`
-	ChatBot    *FeishuChatBot `json:"chatbot,omitempty"`
+	// +optional
+	// +kubebuilder:validation:MaxItems=200
+	ChatIDs []string         `json:"chatids,omitempty"`
+	ChatBot *FeishuChatBot   `json:"chatbot,omitempty"`
 	// The name of the template to generate notification.
 	// If the global template is not set, it will use default.
 	Template *string `json:"template,omitempty"`
-	// template type: text or post, default type is post
+	// template type: text, post or interactive, default type is interactive
 	TmplType *string `json:"tmplType,omitempty"`
 	// Template file.
 	TmplText *ConfigmapKeySelector `json:"tmplText,omitempty"`

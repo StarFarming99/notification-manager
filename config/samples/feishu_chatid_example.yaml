@@ -1,0 +1,76 @@
+# 飞书 ChatID 配置示例
+# 
+# 使用说明：
+# 1. 替换 Secret 中的 appid 和 appsecret 为你的飞书应用凭证
+# 2. 替换 Receiver 中的 chatids 为你要发送消息的群聊 ID
+# 3. 根据需要调整 tmplType（text/post/interactive）和 template
+
+---
+# 步骤 1: 创建 Secret 存储飞书应用凭证
+apiVersion: v1
+kind: Secret
+metadata:
+  name: feishu-config-secret
+  namespace: kubesphere-monitoring-system
+type: Opaque
+stringData:
+  appid: "cli_xxxxxxxxxxxxx"      # TODO: 替换为你的 AppID
+  appsecret: "xxxxxxxxxxxxxxxxxx" # TODO: 替换为你的 AppSecret
+
+---
+# 步骤 2: 创建 Config 资源
+apiVersion: notification.kubesphere.io/v2beta2
+kind: Config
+metadata:
+  name: feishu-config
+  namespace: kubesphere-monitoring-system
+  labels:
+    type: default
+    app: notification-manager
+spec:
+  feishu:
+    appID:
+      valueFrom:
+        secretKeyRef:
+          key: appid
+          name: feishu-config-secret
+          namespace: kubesphere-monitoring-system
+    appSecret:
+      valueFrom:
+        secretKeyRef:
+          key: appsecret
+          name: feishu-config-secret
+          namespace: kubesphere-monitoring-system
+
+---
+# 步骤 3: 创建 Receiver 资源，使用 chatids 发送消息
+apiVersion: notification.kubesphere.io/v2beta2
+kind: Receiver
+metadata:
+  name: feishu-chat-receiver
+  namespace: kubesphere-monitoring-system
+  labels:
+    type: global
+    app: notification-manager
+spec:
+  feishu:
+    enabled: true
+    # 配置 ChatIDs，支持多个群聊
+    # ChatID 格式通常是 oc_ 开头的字符串
+    chatids:
+      - oc_a0553eda9014c201e6969b478895c230  # TODO: 替换为你的群聊 ID
+      # - oc_b0553eda9014c201e6969b478895c231  # 可以添加多个群聊
+    # 选择 Config，通过 label selector 匹配
+    feishuConfigSelector:
+      matchLabels:
+        type: default
+    # 消息模板类型：text, post 或 interactive（默认）
+    tmplType: interactive
+    # 可选：指定模板名称
+    # template: nm.default.interactive
+    # 可选：自定义模板内容
+    # tmplText:
+    #   name: notification-manager-template
+    #   namespace: kubesphere-monitoring-system
+
+

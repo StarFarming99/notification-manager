@@ -169,6 +169,10 @@ spec:
             namespace: kubesphere-monitoring-system  
     department:
       - dev
+    # +optional
+    # ChatIDs - The chat IDs to which notifications will be sent. Messages will be sent to all specified chats.
+    chatids:
+      - oc_a0553eda9014c201e6969b478895c230
     feishuConfigSelector:
       matchLabels:
         type: tenant
@@ -186,12 +190,13 @@ A feishu receiver allows the user to define:
 
 - `alertSelector` - The label selector used to filter notifications. For more information, please refer to [notification filter](#Notification-filter).
 - [chatbot](#Feishu-Chatbot) - The configuration of feishu chatbot.
+- `chatids` - The chat IDs to which notifications will be sent. Messages will be sent to all specified chats. Note that the application must be added to the target chats and have permission to send messages. For more information, please refer to [Feishu ChatID Usage](../feishu-chatid-usage.md).
 - `department` - The department of feishu, all the users in the department will receive the notifications. Note that the notification to the department are sent asynchronously, there will be a delay.
 - `enabled` - Whether to enable receiver.
 - `feishuConfigSelector` - The label selector used to get `Config`. For more information, please refer to [this](#How-to-select-config).
 - `template` - The name of the template that generated notifications. For more information, please refer to [template](../template.md).
 - `tmplText` - The configmap that the template text file be in. For more information, please refer to [template](../template.md).
-- `tmplType` - The type of message sent to feishu, `post` or `text`, default type is `post`.
+- `tmplType` - The type of message sent to feishu, `text`, `post` or `interactive`, default type is `interactive`.
 - `user` - Who will receiver notifications. Note that the notifications to the user sent asynchronously, there will be a delay.
 
 ### Feishu Chatbot

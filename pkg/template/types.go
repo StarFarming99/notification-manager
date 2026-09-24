@@ -15,7 +15,8 @@ var (
 )
 
 type Data struct {
-	Alerts Alerts `json:"alerts"`
+	Alerts     Alerts `json:"alerts"`
+	DeliveryID string `json:"deliveryID,omitempty"`
 
 	GroupLabels       KV `json:"groupLabels"`
 	CommonLabels      KV `json:"commonLabels"`
@@ -78,6 +79,7 @@ func (d *Data) Status() string {
 func (d *Data) Clone() *Data {
 	nd := &Data{
 		Alerts:            nil,
+		DeliveryID:        d.DeliveryID,
 		GroupLabels:       d.GroupLabels.Clone(),
 		CommonLabels:      d.CommonLabels.Clone(),
 		CommonAnnotations: d.CommonAnnotations.Clone(),
