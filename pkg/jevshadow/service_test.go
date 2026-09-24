@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -212,6 +213,7 @@ func TestDisabledConfigIsBackwardCompatible(t *testing.T) {
 
 func TestRenderCompactClassificationWithFeedbackButtons(t *testing.T) {
 	actionReference := "signed-action-reference"
+	detailURL := "https://aiops.example.com/apps/alert-center/traces/J-1"
 	card, err := renderCard(
 		map[string]interface{}{"elements": []interface{}{}},
 		map[string]AnnotationComponent{
@@ -227,8 +229,14 @@ func TestRenderCompactClassificationWithFeedbackButtons(t *testing.T) {
 				RepeatCount:          3,
 				SameKindCount:        1,
 				Recommendation:       "重复告警｜第 3 次｜进入告警池",
-				Footer:               "影子模式：未实际改变告警路由",
-				ActionReference:      &actionReference,
+				EvidenceLines: []string{
+					"上下文：cpu_throttled_periods_pct 48.8%｜恢复线 <20%｜连续恢复 10m：否",
+					"判断：持续/恶化压力 90%｜观察到风险｜延后概率 50%/阈值 80%",
+					"规则：pod_cpu_throttling｜r1｜rb_f26fb212d933…",
+				},
+				Footer:          "影子模式：未实际改变告警路由",
+				ActionReference: &actionReference,
+				DetailURL:       &detailURL,
 			},
 		},
 	)
@@ -236,8 +244,18 @@ func TestRenderCompactClassificationWithFeedbackButtons(t *testing.T) {
 		t.Fatal(err)
 	}
 	elements := card["elements"].([]interface{})
-	if len(elements) != 3 {
-		t.Fatalf("expected divider, summary and feedback actions, got %#v", elements)
+	if len(elements) != 4 {
+		t.Fatalf("expected divider, summary, feedback and detail actions, got %#v", elements)
+	}
+	summary := elements[1].(map[string]interface{})["text"].(map[string]interface{})["content"].(string)
+	for _, expected := range []string{
+		"上下文：cpu_throttled_periods_pct 48.8%",
+		"判断：持续/恶化压力 90%",
+		"规则：pod_cpu_throttling｜r1",
+	} {
+		if !strings.Contains(summary, expected) {
+			t.Fatalf("missing %q in compact summary: %s", expected, summary)
+		}
 	}
 	actions := elements[2].(map[string]interface{})["actions"].([]interface{})
 	if len(actions) != 2 {
@@ -246,6 +264,10 @@ func TestRenderCompactClassificationWithFeedbackButtons(t *testing.T) {
 	value := actions[0].(map[string]interface{})["value"].(map[string]interface{})
 	if value["action"] != "jev_feedback" || value["correct_label"] != "accurate" {
 		t.Fatalf("unexpected feedback value: %#v", value)
+	}
+	detail := elements[3].(map[string]interface{})["actions"].([]interface{})[0].(map[string]interface{})
+	if detail["url"] != detailURL {
+		t.Fatalf("unexpected detail URL: %#v", detail)
 	}
 }
 

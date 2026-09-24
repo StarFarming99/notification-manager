@@ -375,6 +375,9 @@ func renderCard(base map[string]interface{}, annotations map[string]AnnotationCo
 		if component.ActionReference != nil && *component.ActionReference != "" {
 			elements = append(elements, component.feedbackActions())
 		}
+		if component.DetailURL != nil && *component.DetailURL != "" {
+			elements = append(elements, component.detailAction())
+		}
 	}
 	card["elements"] = elements
 	return card, nil
@@ -397,6 +400,7 @@ type AnnotationComponent struct {
 	RelationLine         *string  `json:"relation_line"`
 	Footer               string   `json:"footer"`
 	ActionReference      *string  `json:"action_reference"`
+	DetailURL            *string  `json:"detail_url"`
 }
 
 func (c AnnotationComponent) validate() error {
@@ -407,6 +411,10 @@ func (c AnnotationComponent) validate() error {
 		return ErrInvalidPayload
 	}
 	if len(c.Title) > 200 || len(c.Recommendation) > 2000 || len(c.Footer) > 1000 {
+		return ErrInvalidPayload
+	}
+	if c.DetailURL != nil &&
+		(len(*c.DetailURL) > 2000 || !strings.HasPrefix(*c.DetailURL, "https://")) {
 		return ErrInvalidPayload
 	}
 	if c.Category != "" {
@@ -431,6 +439,9 @@ func (c AnnotationComponent) validate() error {
 func (c AnnotationComponent) markdown() string {
 	if c.Category != "" {
 		lines := []string{"**" + c.Title + "**", c.Recommendation}
+		for _, evidence := range c.EvidenceLines {
+			lines = append(lines, evidence)
+		}
 		if c.Footer != "" {
 			lines = append(lines, c.Footer)
 		}
@@ -475,6 +486,24 @@ func (c AnnotationComponent) feedbackActions() map[string]interface{} {
 		"actions": []interface{}{
 			button("✅ 准确", "accurate", "primary"),
 			button("❌ 不准确", "inaccurate", "default"),
+		},
+	}
+}
+
+func (c AnnotationComponent) detailAction() map[string]interface{} {
+	return map[string]interface{}{
+		"tag":    "action",
+		"layout": "flow",
+		"actions": []interface{}{
+			map[string]interface{}{
+				"tag":  "button",
+				"type": "default",
+				"text": map[string]interface{}{
+					"tag":     "plain_text",
+					"content": "查看 Jev 分析与规则",
+				},
+				"url": *c.DetailURL,
+			},
 		},
 	}
 }
