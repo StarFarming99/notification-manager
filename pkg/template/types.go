@@ -197,10 +197,11 @@ func (kv KV) Clone() KV {
 }
 
 type Alert struct {
-	ID          string `json:"id"`
-	Status      string `json:"status"`
-	Labels      KV     `json:"labels"`
-	Annotations KV     `json:"annotations"`
+	ID           string `json:"id"`
+	Status       string `json:"status"`
+	Labels       KV     `json:"labels"`
+	Annotations  KV     `json:"annotations"`
+	GeneratorURL string `json:"generatorURL,omitempty"`
 
 	StartsAt time.Time `json:"startsAt,omitempty"`
 	EndsAt   time.Time `json:"endsAt,omitempty"`
@@ -274,6 +275,7 @@ func (a *Alert) Clone() *Alert {
 		NotificationTime: a.NotificationTime,
 		Labels:           a.Labels.Clone(),
 		Annotations:      a.Annotations.Clone(),
+		GeneratorURL:     a.GeneratorURL,
 		Receiver:         a.Receiver,
 	}
 }

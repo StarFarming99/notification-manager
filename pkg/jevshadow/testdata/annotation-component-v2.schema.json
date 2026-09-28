@@ -1,0 +1,211 @@
+{
+  "$defs": {
+    "PoolReasonDistributionV2": {
+      "additionalProperties": false,
+      "properties": {
+        "choice": {
+          "enum": [
+            "recurring",
+            "same_incident",
+            "non_urgent",
+            "unclear"
+          ],
+          "title": "Choice",
+          "type": "string"
+        },
+        "probabilities": {
+          "additionalProperties": {
+            "maximum": 1,
+            "minimum": 0,
+            "type": "number"
+          },
+          "propertyNames": {
+            "enum": [
+              "recurring",
+              "same_incident",
+              "non_urgent",
+              "unclear"
+            ]
+          },
+          "title": "Probabilities",
+          "type": "object"
+        }
+      },
+      "required": [
+        "choice",
+        "probabilities"
+      ],
+      "title": "PoolReasonDistributionV2",
+      "type": "object"
+    },
+    "RoutingDistributionV2": {
+      "additionalProperties": false,
+      "properties": {
+        "choice": {
+          "enum": [
+            "oncall",
+            "pool"
+          ],
+          "title": "Choice",
+          "type": "string"
+        },
+        "probabilities": {
+          "additionalProperties": {
+            "maximum": 1,
+            "minimum": 0,
+            "type": "number"
+          },
+          "propertyNames": {
+            "enum": [
+              "oncall",
+              "pool"
+            ]
+          },
+          "title": "Probabilities",
+          "type": "object"
+        }
+      },
+      "required": [
+        "choice",
+        "probabilities"
+      ],
+      "title": "RoutingDistributionV2",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "action_reference": {
+      "anyOf": [
+        {
+          "maxLength": 4096,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Action Reference"
+    },
+    "annotation_revision": {
+      "minimum": 1,
+      "title": "Annotation Revision",
+      "type": "integer"
+    },
+    "execution_mode": {
+      "const": "shadow",
+      "default": "shadow",
+      "title": "Execution Mode",
+      "type": "string"
+    },
+    "expected_base_revision": {
+      "minimum": 1,
+      "title": "Expected Base Revision",
+      "type": "integer"
+    },
+    "judgment_id": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Judgment Id"
+    },
+    "member_event_ids": {
+      "items": {
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 100,
+      "minItems": 1,
+      "title": "Member Event Ids",
+      "type": "array"
+    },
+    "policy_proposal": {
+      "enum": [
+        "oncall",
+        "pool",
+        "original"
+      ],
+      "title": "Policy Proposal",
+      "type": "string"
+    },
+    "policy_reason_code": {
+      "maxLength": 160,
+      "minLength": 1,
+      "title": "Policy Reason Code",
+      "type": "string"
+    },
+    "pool_min_probability": {
+      "anyOf": [
+        {
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Pool Min Probability"
+    },
+    "pool_reason": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PoolReasonDistributionV2"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "routing": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RoutingDistributionV2"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "schema_version": {
+      "const": "2",
+      "default": "2",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "trace_url": {
+      "anyOf": [
+        {
+          "maxLength": 2000,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Trace Url"
+    }
+  },
+  "required": [
+    "member_event_ids",
+    "annotation_revision",
+    "expected_base_revision",
+    "policy_proposal",
+    "policy_reason_code"
+  ],
+  "title": "AnnotationComponentV2",
+  "type": "object"
+}

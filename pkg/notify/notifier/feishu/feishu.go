@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -178,6 +179,44 @@ func NewFeishuNotifier(logger log.Logger, receiver internal.Receiver, notifierCt
 		"chatIDCount", len(n.receiver.ChatIDs))
 
 	return n, nil
+}
+
+// ResolveJevCardPatcher reconstructs the original Feishu application writer
+// from the live controller configuration after a Notification Manager restart.
+// Receiver name alone is not trusted: the destination must identify exactly
+// one enabled Feishu receiver, otherwise recovery fails closed.
+func ResolveJevCardPatcher(
+	logger log.Logger,
+	notifierCtl *controller.Controller,
+	receiverName string,
+	destination string,
+) (jevshadow.CardPatcher, error) {
+	receivers := notifierCtl.RcvsFromName([]string{receiverName}, "", constants.Feishu)
+	candidates := make([]internal.Receiver, 0, len(receivers))
+	for _, receiver := range receivers {
+		feishuReceiver, ok := receiver.(*feishu.Receiver)
+		if !ok || feishuReceiver.Name != receiverName || !utils.StringInList(destination, feishuReceiver.ChatIDs) {
+			continue
+		}
+		candidates = append(candidates, receiver)
+	}
+	if len(candidates) != 1 {
+		return nil, utils.Errorf(
+			"expected one Feishu writer for receiver %q and destination %q, found %d",
+			receiverName,
+			destination,
+			len(candidates),
+		)
+	}
+	resolved, err := NewFeishuNotifier(logger, candidates[0], notifierCtl)
+	if err != nil {
+		return nil, err
+	}
+	feishuNotifier, ok := resolved.(*Notifier)
+	if !ok {
+		return nil, utils.Error("resolved Feishu writer has an unexpected type")
+	}
+	return feishuNotifier.patchInteractiveCard, nil
 }
 
 func (n *Notifier) SetSentSuccessfulHandler(h *func([]*template.Alert)) {
@@ -1139,25 +1178,25 @@ func (n *Notifier) sendToChatInteractive(ctx context.Context, data *template.Dat
 
 func (n *Notifier) patchInteractiveCard(ctx context.Context, messageID string, card map[string]interface{}) error {
 	if n.receiver.Config == nil {
-		return utils.Error("FeishuNotifier: config is nil")
+		return &jevshadow.CardPatchError{Outcome: jevshadow.CardPatchKnownFailed, Err: utils.Error("FeishuNotifier: config is nil")}
 	}
 	accessToken, err := n.getToken(ctx, n.receiver)
 	if err != nil {
-		return err
+		return &jevshadow.CardPatchError{Outcome: jevshadow.CardPatchKnownFailed, Err: err}
 	}
 	if accessToken == "" {
-		return utils.Error("FeishuNotifier: tenant_access_token is empty")
+		return &jevshadow.CardPatchError{Outcome: jevshadow.CardPatchKnownFailed, Err: utils.Error("FeishuNotifier: tenant_access_token is empty")}
 	}
 	cardContent, err := json.Marshal(card)
 	if err != nil {
-		return err
+		return &jevshadow.CardPatchError{Outcome: jevshadow.CardPatchKnownFailed, Err: err}
 	}
 	body := struct {
 		Content string `json:"content"`
 	}{Content: string(cardContent)}
 	var buffer bytes.Buffer
 	if err := utils.JsonEncode(&buffer, body); err != nil {
-		return err
+		return &jevshadow.CardPatchError{Outcome: jevshadow.CardPatchKnownFailed, Err: err}
 	}
 	request, err := http.NewRequestWithContext(
 		ctx,
@@ -1166,20 +1205,39 @@ func (n *Notifier) patchInteractiveCard(ctx context.Context, messageID string, c
 		&buffer,
 	)
 	if err != nil {
-		return err
+		return &jevshadow.CardPatchError{Outcome: jevshadow.CardPatchKnownFailed, Err: err}
 	}
 	request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
 	request.Header.Set("Content-Type", "application/json; charset=utf-8")
-	responseBody, err := utils.DoHttpRequest(ctx, nil, request)
-	if err != nil && len(responseBody) == 0 {
-		return err
+	httpResponse, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return &jevshadow.CardPatchError{Outcome: jevshadow.CardPatchUnknown, Err: err}
+	}
+	defer httpResponse.Body.Close()
+	responseBody, readErr := io.ReadAll(io.LimitReader(httpResponse.Body, 1024*1024))
+	if readErr != nil {
+		return &jevshadow.CardPatchError{Outcome: jevshadow.CardPatchUnknown, Err: readErr}
+	}
+	if httpResponse.StatusCode != http.StatusOK {
+		outcome := jevshadow.CardPatchKnownFailed
+		if httpResponse.StatusCode == http.StatusAccepted || httpResponse.StatusCode == http.StatusRequestTimeout ||
+			httpResponse.StatusCode == http.StatusTooManyRequests || httpResponse.StatusCode >= http.StatusInternalServerError {
+			outcome = jevshadow.CardPatchUnknown
+		}
+		return &jevshadow.CardPatchError{
+			Outcome: outcome,
+			Err:     utils.Errorf("Feishu card update returned HTTP %d", httpResponse.StatusCode),
+		}
 	}
 	var response Response
 	if err := utils.JsonUnmarshal(responseBody, &response); err != nil {
-		return err
+		return &jevshadow.CardPatchError{Outcome: jevshadow.CardPatchUnknown, Err: err}
 	}
 	if response.Code != 0 {
-		return utils.Errorf("Feishu card update failed: %d, %s", response.Code, response.Msg)
+		return &jevshadow.CardPatchError{
+			Outcome: jevshadow.CardPatchKnownFailed,
+			Err:     utils.Errorf("Feishu card update failed: %d, %s", response.Code, response.Msg),
+		}
 	}
 	return nil
 }

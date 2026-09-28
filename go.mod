@@ -25,6 +25,7 @@ require (
 	github.com/spf13/pflag v1.0.5
 	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common v1.0.194
 	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/sms v1.0.194
+	golang.org/x/sys v0.28.0
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
 	k8s.io/api v0.28.0
 	k8s.io/apimachinery v0.28.0
@@ -89,7 +90,6 @@ require (
 	go.uber.org/zap v1.24.0 // indirect
 	golang.org/x/net v0.33.0 // indirect
 	golang.org/x/oauth2 v0.8.0 // indirect
-	golang.org/x/sys v0.28.0 // indirect
 	golang.org/x/term v0.27.0 // indirect
 	golang.org/x/text v0.21.0 // indirect
 	golang.org/x/time v0.3.0 // indirect

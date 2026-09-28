@@ -10,8 +10,8 @@ not provide the same updateable application-message contract.
 
 ## Runtime configuration
 
-The feature is disabled unless `JEV_SHADOW_ENABLED=true`. When enabled, all variables in
-the following table are required.
+The feature is disabled unless `JEV_SHADOW_ENABLED=true`. When enabled, the variables in
+the following table are required except the two storage paths, which have documented defaults.
 
 | Variable | Purpose |
 | --- | --- |
@@ -26,9 +26,30 @@ the following table are required.
 | `JEV_SHADOW_OBSERVATION_RECEIVER` | Name of the parallel Jev webhook receiver used to derive the same delivery ID |
 | `JEV_SHADOW_SENDER_APP` | Non-secret application identity recorded in receipts |
 | `JEV_SHADOW_EXPIRES_AT` | Absolute RFC3339 UAT cutoff; restart does not extend it |
+| `JEV_SHADOW_RECEIPT_OUTBOX_DIR` | Receipt outbox path; mount it on persistent storage to survive pod replacement (default `/tmp/notification-manager/jev-shadow-receipts`) |
+| `JEV_SHADOW_CARD_STATE_DIR` | Base card, binding, component, revision, idempotency, and patch-state path (default `<receipt-outbox>/card-state`) |
+
+The retry policy can be tuned with `JEV_SHADOW_RECEIPT_MAX_ATTEMPTS` (default `12`),
+`JEV_SHADOW_RECEIPT_RETRY_MIN` (default `1s`), `JEV_SHADOW_RECEIPT_RETRY_MAX`
+(default `5m`), and `JEV_SHADOW_RECEIPT_DRAIN_TIMEOUT` (default `5s`). Durations use Go
+duration syntax.
 
 When an allowlisted application-card send succeeds, Notification Manager records the
 returned `message_id`, retains the base card, and asynchronously posts a delivery receipt.
+At the start of each notify-stage fanout, Notification Manager creates one random attempt
+identity and derives each group `deliveryID` from that attempt plus the stable group labels.
+Webhook and Feishu therefore keep the same delivery envelope even when their selectors yield
+different member sets (for example A+B versus A). The receipt still lists only the members
+actually present in the sent card; `(delivery_id, fingerprint, starts_at)` is the immutable
+per-member occurrence identity. Jev must fail closed if a listed member is absent or ambiguous.
+Before returning from the capture hook, the adapter atomically persists the receipt with mode
+`0600`. The sender recovers pending entries after restart, applies exponential backoff, and
+moves exhausted or permanent failures to the `dead-letter` directory instead of discarding
+them. Shutdown makes one bounded drain attempt for each pending entry; anything still pending
+remains on disk for the next process. Receipt endpoint failures remain fail-open for the
+already-successful Feishu notification.
+If the outbox cannot be initialized, the optional Jev adapter disables itself and logs the
+error; Notification Manager continues serving the original notification path.
 Jev submits components to:
 
 ```text
@@ -42,6 +63,22 @@ preserves the original card elements and actions, and uses the same Feishu appli
 credentials to patch the message. Reusing an idempotency key with different content or
 submitting a stale revision is rejected.
 
+Context v2 decoder bounds come from Jev's generated
+`annotation-component-v2.schema.json`. Notification Manager vendors that schema together with
+the generated boundary-case fixture under `pkg/jevshadow/testdata`; tests run those Python-valid
+and Python-invalid payloads through the Go decoder. String limits count Unicode code points, not
+UTF-8 bytes.
+
+The base card, writer identity, annotation components, global annotation revision,
+idempotency records, and confirmed/failed/unknown patch state are atomically persisted. A
+per-message advisory filesystem lock serializes processes sharing the same volume. Before a
+PATCH, the desired rendered card and its hash are persisted as an intent. A confirmed HTTP
+200 plus Feishu `code=0` commits the revision; a confirmed rejection can retry, while a
+timeout, HTTP 202/5xx, broken response, or crash between PATCH and commit remains `unknown`
+and fails closed instead of replaying a stale full card. After restart, Notification Manager
+resolves the original application writer from the live receiver plus destination; missing or
+ambiguous matches return a retryable writer-unavailable response.
+
 The compact classification component appends `准确` and `不准确` buttons. Both use the
 `jev_feedback` action and carry only an overall verdict plus Jev's signed action reference. The
 Feishu callback service must take the verified operator/chat/message identity from the callback
@@ -49,11 +86,20 @@ event and relay it to Jev `POST /v1/feedback`; it must not trust identity fields
 
 ## UAT boundary
 
-Card bindings are bounded and held in memory. A Notification Manager restart therefore
-stops further annotation of cards sent before the restart; it does not affect the original
-alert. This is acceptable for the first time-limited UAT run, but it is not the production
-single-writer design. Production requires persistent card state and coordination with the
-existing callback writer before the feature is enabled beyond an isolated receiver.
+The Jev writer state now survives restart when its configured path survives, and concurrent
+Jev writers sharing that path are serialized. This is still **not the complete production
+single-writer design**: this fork contains no ACK, recovery, silence, or other card-action
+callback writer to route through the same state machine. If another service changes the same
+Feishu message, Notification Manager cannot fetch and merge that newer remote base; a later
+full-card PATCH could otherwise restore stale firing/unacknowledged content. Production and
+any UAT receiver with an active external card-mutating callback must therefore remain blocked
+until that writer is integrated or a verified remote-card reconciliation path is added.
+
+Receipt and card state persist at their configured paths, but a container-local filesystem
+does not survive Kubernetes pod replacement. UAT must mount both paths on the same writable,
+single-writer or advisory-lock-capable persistent volume when pod-level recovery is required.
+Dead-letter entries and card bindings are retained for inspection, so the deployment also
+needs an operator-owned retention policy.
 
 The adapter never enables suppression, silence, PagerDuty changes, or alternate routing.
 Disable it by removing the variables or setting `JEV_SHADOW_ENABLED=false`.

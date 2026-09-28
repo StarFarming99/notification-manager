@@ -13,6 +13,7 @@ import (
 	"github.com/kubesphere/notification-manager/pkg/controller"
 	"github.com/kubesphere/notification-manager/pkg/dispatcher"
 	"github.com/kubesphere/notification-manager/pkg/jevshadow"
+	feishunotifier "github.com/kubesphere/notification-manager/pkg/notify/notifier/feishu"
 	"github.com/kubesphere/notification-manager/pkg/store"
 	wh "github.com/kubesphere/notification-manager/pkg/webhook"
 	"gopkg.in/alecthomas/kingpin.v2"
@@ -126,6 +127,13 @@ func Main() int {
 		_ = level.Error(logger).Log("msg", "Failed to create sync notification manager controller")
 		return -1
 	}
+	shadow.SetCardPatcherResolver(func(
+		_ context.Context,
+		receiver string,
+		destination string,
+	) (jevshadow.CardPatcher, error) {
+		return feishunotifier.ResolveJevCardPatcher(logger, ctl, receiver, destination)
+	})
 
 	alerts := store.NewAlertStore(*storeType)
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +23,12 @@ const (
 	envObservationReceiver  = "JEV_SHADOW_OBSERVATION_RECEIVER"
 	envSenderApp            = "JEV_SHADOW_SENDER_APP"
 	envExpiresAt            = "JEV_SHADOW_EXPIRES_AT"
+	envReceiptOutboxDir     = "JEV_SHADOW_RECEIPT_OUTBOX_DIR"
+	envReceiptMaxAttempts   = "JEV_SHADOW_RECEIPT_MAX_ATTEMPTS"
+	envReceiptRetryMin      = "JEV_SHADOW_RECEIPT_RETRY_MIN"
+	envReceiptRetryMax      = "JEV_SHADOW_RECEIPT_RETRY_MAX"
+	envReceiptDrainTimeout  = "JEV_SHADOW_RECEIPT_DRAIN_TIMEOUT"
+	envCardStateDir         = "JEV_SHADOW_CARD_STATE_DIR"
 )
 
 type Config struct {
@@ -37,7 +44,12 @@ type Config struct {
 	ObservationReceiver  string
 	SenderApp            string
 	ExpiresAt            time.Time
-	ReceiptQueueSize     int
+	ReceiptOutboxDir     string
+	ReceiptMaxAttempts   int
+	ReceiptRetryMin      time.Duration
+	ReceiptRetryMax      time.Duration
+	ReceiptDrainTimeout  time.Duration
+	CardStateDir         string
 	MaxCards             int
 }
 
@@ -46,9 +58,9 @@ func ConfigFromEnv() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("%s must be a boolean: %w", envEnabled, err)
 	}
-	config := Config{Enabled: enabled, ReceiptQueueSize: 256, MaxCards: 2000}
+	config := Config{Enabled: enabled, MaxCards: 2000}
 	if !enabled {
-		return config, nil
+		return config.withReceiptDefaults(), nil
 	}
 
 	config.ReceiptURL = strings.TrimSpace(os.Getenv(envReceiptURL))
@@ -61,6 +73,21 @@ func ConfigFromEnv() (Config, error) {
 	config.PermissionDomain = strings.TrimSpace(os.Getenv(envPermissionDomain))
 	config.ObservationReceiver = strings.TrimSpace(os.Getenv(envObservationReceiver))
 	config.SenderApp = strings.TrimSpace(os.Getenv(envSenderApp))
+	config.ReceiptOutboxDir = strings.TrimSpace(os.Getenv(envReceiptOutboxDir))
+	config.CardStateDir = strings.TrimSpace(os.Getenv(envCardStateDir))
+	config = config.withReceiptDefaults()
+	if config.ReceiptMaxAttempts, err = positiveIntFromEnv(envReceiptMaxAttempts, config.ReceiptMaxAttempts); err != nil {
+		return Config{}, err
+	}
+	if config.ReceiptRetryMin, err = positiveDurationFromEnv(envReceiptRetryMin, config.ReceiptRetryMin); err != nil {
+		return Config{}, err
+	}
+	if config.ReceiptRetryMax, err = positiveDurationFromEnv(envReceiptRetryMax, config.ReceiptRetryMax); err != nil {
+		return Config{}, err
+	}
+	if config.ReceiptDrainTimeout, err = positiveDurationFromEnv(envReceiptDrainTimeout, config.ReceiptDrainTimeout); err != nil {
+		return Config{}, err
+	}
 
 	expiresAt := strings.TrimSpace(os.Getenv(envExpiresAt))
 	if expiresAt == "" {
@@ -108,10 +135,68 @@ func (c Config) validate() error {
 	if c.ExpiresAt.IsZero() {
 		return fmt.Errorf("%s is required when %s=true", envExpiresAt, envEnabled)
 	}
-	if c.ReceiptQueueSize < 1 || c.MaxCards < 1 {
-		return fmt.Errorf("Jev shadow queue and card limits must be positive")
+	if c.MaxCards < 1 {
+		return fmt.Errorf("Jev shadow card limit must be positive")
+	}
+	if strings.TrimSpace(c.ReceiptOutboxDir) == "" {
+		return fmt.Errorf("%s must not be empty", envReceiptOutboxDir)
+	}
+	if strings.TrimSpace(c.CardStateDir) == "" {
+		return fmt.Errorf("%s must not be empty", envCardStateDir)
+	}
+	if c.ReceiptMaxAttempts < 1 || c.ReceiptRetryMin <= 0 || c.ReceiptRetryMax <= 0 || c.ReceiptDrainTimeout <= 0 {
+		return fmt.Errorf("Jev shadow receipt outbox limits must be positive")
+	}
+	if c.ReceiptRetryMax < c.ReceiptRetryMin {
+		return fmt.Errorf("%s must be greater than or equal to %s", envReceiptRetryMax, envReceiptRetryMin)
 	}
 	return nil
+}
+
+func (c Config) withReceiptDefaults() Config {
+	if strings.TrimSpace(c.ReceiptOutboxDir) == "" {
+		c.ReceiptOutboxDir = filepath.Join(os.TempDir(), "notification-manager", "jev-shadow-receipts")
+	}
+	if strings.TrimSpace(c.CardStateDir) == "" {
+		c.CardStateDir = filepath.Join(c.ReceiptOutboxDir, "card-state")
+	}
+	if c.ReceiptMaxAttempts == 0 {
+		c.ReceiptMaxAttempts = 12
+	}
+	if c.ReceiptRetryMin == 0 {
+		c.ReceiptRetryMin = time.Second
+	}
+	if c.ReceiptRetryMax == 0 {
+		c.ReceiptRetryMax = 5 * time.Minute
+	}
+	if c.ReceiptDrainTimeout == 0 {
+		c.ReceiptDrainTimeout = 5 * time.Second
+	}
+	return c
+}
+
+func positiveIntFromEnv(name string, fallback int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1 {
+		return 0, fmt.Errorf("%s must be a positive integer", name)
+	}
+	return value, nil
+}
+
+func positiveDurationFromEnv(name string, fallback time.Duration) (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("%s must be a positive duration", name)
+	}
+	return value, nil
 }
 
 func csvSet(value string) map[string]struct{} {

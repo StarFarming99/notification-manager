@@ -79,6 +79,7 @@ func (s *notifyStage) Exec(ctx context.Context, l log.Logger, data interface{}) 
 	// gets a new value and can be counted independently by Jev.
 	if jev := s.notifierCtl.GetJevShadow(); jev != nil && jev.Enabled() {
 		dispatchTime := time.Now().UTC()
+		attemptID, attemptErr := jev.NewDeliveryAttemptID()
 		for _, dataList := range input {
 			for _, d := range dataList {
 				for _, alert := range d.Alerts {
@@ -86,7 +87,11 @@ func (s *notifyStage) Exec(ctx context.Context, l log.Logger, data interface{}) 
 						alert.NotificationTime = dispatchTime
 					}
 				}
-				if err := jev.StampDeliveryID(d); err != nil {
+				if attemptErr != nil {
+					_ = level.Error(l).Log("msg", "Jev shadow failed to create delivery attempt identity", "error", attemptErr)
+					continue
+				}
+				if err := jev.StampDeliveryIDForAttempt(d, attemptID); err != nil {
 					_ = level.Error(l).Log("msg", "Jev shadow failed to stamp delivery identity", "error", err)
 				}
 			}
