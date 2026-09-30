@@ -95,12 +95,11 @@ func ConfigFromEnv() (Config, error) {
 	}
 
 	expiresAt := strings.TrimSpace(os.Getenv(envExpiresAt))
-	if expiresAt == "" {
-		return Config{}, fmt.Errorf("%s is required when %s=true", envExpiresAt, envEnabled)
-	}
-	config.ExpiresAt, err = time.Parse(time.RFC3339, expiresAt)
-	if err != nil {
-		return Config{}, fmt.Errorf("%s must be RFC3339 with a timezone: %w", envExpiresAt, err)
+	if expiresAt != "" {
+		config.ExpiresAt, err = time.Parse(time.RFC3339, expiresAt)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be RFC3339 with a timezone: %w", envExpiresAt, err)
+		}
 	}
 
 	if err := config.validate(); err != nil {
@@ -142,9 +141,6 @@ func (c Config) validate() error {
 	}
 	if len(c.DestinationAllowlist) == 0 {
 		return fmt.Errorf("%s must contain at least one destination", envDestinationAllowlist)
-	}
-	if c.ExpiresAt.IsZero() {
-		return fmt.Errorf("%s is required when %s=true", envExpiresAt, envEnabled)
 	}
 	if c.MaxCards < 1 {
 		return fmt.Errorf("Jev shadow card limit must be positive")

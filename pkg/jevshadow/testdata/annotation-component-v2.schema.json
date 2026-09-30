@@ -93,6 +93,48 @@
       "title": "Annotation Revision",
       "type": "integer"
     },
+    "capability": {
+      "anyOf": [
+        {
+          "const": "policy-facts-v1",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Capability"
+    },
+    "context_reduced": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Context Reduced"
+    },
+    "decision_source": {
+      "anyOf": [
+        {
+          "enum": [
+            "model_policy",
+            "operator_rule",
+            "model_unavailable"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Decision Source"
+    },
     "execution_mode": {
       "const": "shadow",
       "default": "shadow",
@@ -127,6 +169,35 @@
       "minItems": 1,
       "title": "Member Event Ids",
       "type": "array"
+    },
+    "model_error_code": {
+      "anyOf": [
+        {
+          "maxLength": 160,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Model Error Code"
+    },
+    "model_status": {
+      "anyOf": [
+        {
+          "enum": [
+            "available",
+            "unavailable"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Model Status"
     },
     "policy_proposal": {
       "enum": [
@@ -184,6 +255,35 @@
       "default": "2",
       "title": "Schema Version",
       "type": "string"
+    },
+    "threshold_applied": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Threshold Applied"
+    },
+    "threshold_source": {
+      "anyOf": [
+        {
+          "enum": [
+            "default",
+            "override",
+            "not_applicable"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Threshold Source"
     },
     "trace_url": {
       "anyOf": [

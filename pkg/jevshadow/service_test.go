@@ -443,6 +443,54 @@ func TestRenderV2ExceptionalStatusWithoutFabricatedProbabilities(t *testing.T) {
 	}
 }
 
+func TestPolicyFactsV1AcceptsLowThresholdPoolWithoutChangingModelProbabilities(t *testing.T) {
+	component := validPolicyFactsV1Component()
+	component.Routing = &ChoiceAnswer{
+		Choice:        "oncall",
+		Probabilities: map[string]float64{"pool": 0.20, "oncall": 0.80},
+	}
+	component.PolicyProposal = "pool"
+	component.PolicyReasonCode = "threshold_met"
+	component.PoolMinProbability = floatPointer(0.20)
+	if err := component.validate(); err != nil {
+		t.Fatalf("valid low-threshold Pool policy rejected: %v", err)
+	}
+	markdown := component.markdown()
+	if !strings.Contains(markdown, "**Oncall 80%** · Pool 20%") ||
+		!strings.Contains(markdown, "Policy: Pool · Pool threshold 20%") ||
+		!strings.Contains(markdown, "**Non-urgent**") {
+		t.Fatalf("policy facts were not rendered without altering probabilities:\n%s", markdown)
+	}
+}
+
+func TestPolicyFactsV1AlwaysShowsOperatorRuleWithOrWithoutModel(t *testing.T) {
+	withModel := validPolicyFactsV1Component()
+	withModel.DecisionSource = "operator_rule"
+	withModel.PolicyReasonCode = "manual_override"
+	withModel.PoolMinProbability = nil
+	withModel.ThresholdApplied = boolPointer(false)
+	withModel.ThresholdSource = "not_applicable"
+	if err := withModel.validate(); err != nil {
+		t.Fatalf("operator rule with model result rejected: %v", err)
+	}
+	if got := withModel.markdown(); !strings.Contains(got, "Policy: Pool · Operator rule") {
+		t.Fatalf("operator rule was hidden when model agreed: %s", got)
+	}
+
+	unavailable := withModel
+	unavailable.Routing = nil
+	unavailable.PoolReason = nil
+	unavailable.ModelStatus = "unavailable"
+	unavailable.ModelErrorCode = "minimum_state_budget_exceeded"
+	if err := unavailable.validate(); err != nil {
+		t.Fatalf("operator rule with unavailable model rejected: %v", err)
+	}
+	want := "Jev unavailable · Context budget exceeded\nPolicy: Pool · Operator rule"
+	if got := unavailable.markdown(); got != want {
+		t.Fatalf("unexpected unavailable operator card: %q, want %q", got, want)
+	}
+}
+
 func TestDecodeAnnotationIsStrictPerSchema(t *testing.T) {
 	component := validV2Component()
 	wire := annotationComponentV2{
@@ -786,11 +834,34 @@ func validV2Component() AnnotationComponent {
 	}
 }
 
+func validPolicyFactsV1Component() AnnotationComponent {
+	component := validV2Component()
+	component.Capability = "policy-facts-v1"
+	component.DecisionSource = "model_policy"
+	component.PolicyReasonCode = "threshold_met"
+	component.PoolMinProbability = floatPointer(0.90)
+	component.ThresholdApplied = boolPointer(true)
+	component.ThresholdSource = "override"
+	component.ModelStatus = "available"
+	component.ContextReduced = boolPointer(false)
+	component.PoolReason = &ChoiceAnswer{
+		Choice: "non_urgent",
+		Probabilities: map[string]float64{
+			"recurring": 0.05, "same_incident": 0.05, "non_urgent": 0.85, "unclear": 0.05,
+		},
+	}
+	return component
+}
+
 func stringPointer(value string) *string {
 	return &value
 }
 
 func floatPointer(value float64) *float64 {
+	return &value
+}
+
+func boolPointer(value bool) *bool {
 	return &value
 }
 

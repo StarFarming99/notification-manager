@@ -578,6 +578,13 @@ type AnnotationComponent struct {
 	PolicyProposal     string        `json:"policy_proposal,omitempty"`
 	PolicyReasonCode   string        `json:"policy_reason_code,omitempty"`
 	PoolMinProbability *float64      `json:"pool_min_probability,omitempty"`
+	Capability         string        `json:"capability,omitempty"`
+	DecisionSource     string        `json:"decision_source,omitempty"`
+	ThresholdApplied   *bool         `json:"threshold_applied,omitempty"`
+	ThresholdSource    string        `json:"threshold_source,omitempty"`
+	ModelStatus        string        `json:"model_status,omitempty"`
+	ModelErrorCode     string        `json:"model_error_code,omitempty"`
+	ContextReduced     *bool         `json:"context_reduced,omitempty"`
 	ExecutionMode      string        `json:"execution_mode,omitempty"`
 	TraceURL           *string       `json:"trace_url,omitempty"`
 
@@ -643,6 +650,13 @@ func (c AnnotationComponent) MarshalJSON() ([]byte, error) {
 			PolicyProposal:       c.PolicyProposal,
 			PolicyReasonCode:     c.PolicyReasonCode,
 			PoolMinProbability:   c.PoolMinProbability,
+			Capability:           c.Capability,
+			DecisionSource:       c.DecisionSource,
+			ThresholdApplied:     c.ThresholdApplied,
+			ThresholdSource:      c.ThresholdSource,
+			ModelStatus:          c.ModelStatus,
+			ModelErrorCode:       c.ModelErrorCode,
+			ContextReduced:       c.ContextReduced,
 			ExecutionMode:        c.ExecutionMode,
 			TraceURL:             c.TraceURL,
 			ActionReference:      c.ActionReference,
@@ -686,6 +700,13 @@ type annotationComponentV2 struct {
 	PolicyProposal       string        `json:"policy_proposal"`
 	PolicyReasonCode     string        `json:"policy_reason_code"`
 	PoolMinProbability   *float64      `json:"pool_min_probability,omitempty"`
+	Capability           string        `json:"capability,omitempty"`
+	DecisionSource       string        `json:"decision_source,omitempty"`
+	ThresholdApplied     *bool         `json:"threshold_applied,omitempty"`
+	ThresholdSource      string        `json:"threshold_source,omitempty"`
+	ModelStatus          string        `json:"model_status,omitempty"`
+	ModelErrorCode       string        `json:"model_error_code,omitempty"`
+	ContextReduced       *bool         `json:"context_reduced,omitempty"`
 	ExecutionMode        string        `json:"execution_mode"`
 	TraceURL             *string       `json:"trace_url"`
 	ActionReference      *string       `json:"action_reference,omitempty"`
@@ -703,6 +724,13 @@ func (wire annotationComponentV2) component() AnnotationComponent {
 		PolicyProposal:       wire.PolicyProposal,
 		PolicyReasonCode:     wire.PolicyReasonCode,
 		PoolMinProbability:   wire.PoolMinProbability,
+		Capability:           wire.Capability,
+		DecisionSource:       wire.DecisionSource,
+		ThresholdApplied:     wire.ThresholdApplied,
+		ThresholdSource:      wire.ThresholdSource,
+		ModelStatus:          wire.ModelStatus,
+		ModelErrorCode:       wire.ModelErrorCode,
+		ContextReduced:       wire.ContextReduced,
 		ExecutionMode:        wire.ExecutionMode,
 		TraceURL:             wire.TraceURL,
 		ActionReference:      wire.ActionReference,
@@ -773,6 +801,12 @@ func (c AnnotationComponent) validateV2() error {
 	if c.PolicyReasonCode == "" || !validReasonCode(c.PolicyReasonCode) {
 		return ErrInvalidPayload
 	}
+	if c.Capability != "" {
+		if c.Capability != "policy-facts-v1" {
+			return ErrInvalidPayload
+		}
+		return c.validatePolicyFactsV1()
+	}
 
 	if c.Routing == nil {
 		if c.PoolReason != nil || c.PolicyProposal != "original" || c.PolicyReasonCode == "" ||
@@ -808,6 +842,63 @@ func (c AnnotationComponent) validateV2() error {
 			return ErrInvalidPayload
 		}
 	} else if c.PoolMinProbability != nil {
+		return ErrInvalidPayload
+	}
+	return nil
+}
+
+func (c AnnotationComponent) validatePolicyFactsV1() error {
+	if c.ThresholdApplied == nil || c.ContextReduced == nil ||
+		(c.ThresholdSource != "default" && c.ThresholdSource != "override" &&
+			c.ThresholdSource != "not_applicable") ||
+		utf8.RuneCountInString(c.ModelErrorCode) > maxV2PolicyReasonCharacters {
+		return ErrInvalidPayload
+	}
+	modelAvailable := c.ModelStatus == "available"
+	if !modelAvailable && c.ModelStatus != "unavailable" {
+		return ErrInvalidPayload
+	}
+	if modelAvailable != (c.Routing != nil && c.PoolReason != nil) {
+		return ErrInvalidPayload
+	}
+	if strings.TrimSpace(c.JudgmentID) == "" || c.TraceURL == nil {
+		return ErrInvalidPayload
+	}
+	if modelAvailable {
+		if err := validateChoiceAnswer(c.Routing, []string{"pool", "oncall"}); err != nil {
+			return err
+		}
+		if err := validateChoiceAnswer(
+			c.PoolReason,
+			[]string{"recurring", "same_incident", "non_urgent", "unclear"},
+		); err != nil {
+			return err
+		}
+	}
+	switch c.DecisionSource {
+	case "operator_rule":
+		if c.PolicyProposal != "pool" || *c.ThresholdApplied ||
+			c.PoolMinProbability != nil || c.ThresholdSource != "not_applicable" {
+			return ErrInvalidPayload
+		}
+	case "model_policy":
+		if !modelAvailable || !*c.ThresholdApplied || c.PoolMinProbability == nil ||
+			!validProbability(*c.PoolMinProbability) || c.ThresholdSource == "not_applicable" {
+			return ErrInvalidPayload
+		}
+		expected := "oncall"
+		if c.Routing.Probabilities["pool"] >= *c.PoolMinProbability {
+			expected = "pool"
+		}
+		if c.PolicyProposal != expected {
+			return ErrInvalidPayload
+		}
+	case "model_unavailable":
+		if modelAvailable || c.PolicyProposal != "original" || *c.ThresholdApplied ||
+			c.PoolMinProbability != nil || c.ThresholdSource != "not_applicable" {
+			return ErrInvalidPayload
+		}
+	default:
 		return ErrInvalidPayload
 	}
 	return nil
@@ -914,10 +1005,21 @@ func (c AnnotationComponent) markdownV2(showMemberScope bool) string {
 		if protectedReason(c.PolicyReasonCode) {
 			status = "Protected · Original routing retained"
 		}
-		if showMemberScope {
-			return c.memberScopeLine() + "\n" + status
+		if c.Capability == "policy-facts-v1" && c.ModelErrorCode != "" {
+			status = "Jev unavailable · " + modelErrorLabel(c.ModelErrorCode)
 		}
-		return status
+		lines := make([]string, 0, 4)
+		if showMemberScope {
+			lines = append(lines, c.memberScopeLine())
+		}
+		lines = append(lines, status)
+		if policyLine := c.policyLineV2(); policyLine != "" {
+			lines = append(lines, policyLine)
+		}
+		if c.ContextReduced != nil && *c.ContextReduced {
+			lines = append(lines, "Context reduced · See Trace for omitted evidence")
+		}
+		return strings.Join(lines, "\n")
 	}
 
 	routing := c.Routing.Probabilities
@@ -925,10 +1027,15 @@ func (c AnnotationComponent) markdownV2(showMemberScope bool) string {
 	if showMemberScope {
 		lines = append(lines, c.memberScopeLine())
 	}
-	if c.Routing.Choice == "pool" {
+	if c.Routing.Choice == "pool" ||
+		(c.Capability == "policy-facts-v1" && c.PolicyProposal == "pool") {
 		reasons := c.PoolReason.Probabilities
+		probabilityLine := "**Pool " + formatProbability(routing["pool"]) + "** · Oncall " + formatProbability(routing["oncall"])
+		if c.Routing.Choice == "oncall" {
+			probabilityLine = "**Oncall " + formatProbability(routing["oncall"]) + "** · Pool " + formatProbability(routing["pool"])
+		}
 		lines = append(lines,
-			"**Pool "+formatProbability(routing["pool"])+"** · Oncall "+formatProbability(routing["oncall"]),
+			probabilityLine,
 			"**"+poolReasonLabel(c.PoolReason.Choice)+"**",
 			"Recurring "+formatProbability(reasons["recurring"])+" · Same incident "+formatProbability(reasons["same_incident"]),
 			"Non-urgent "+formatProbability(reasons["non_urgent"])+" · Unclear "+formatProbability(reasons["unclear"]),
@@ -940,6 +1047,9 @@ func (c AnnotationComponent) markdownV2(showMemberScope bool) string {
 	}
 	if policyLine := c.policyLineV2(); policyLine != "" {
 		lines = append(lines, policyLine)
+	}
+	if c.ContextReduced != nil && *c.ContextReduced {
+		lines = append(lines, "Context reduced · See Trace for omitted evidence")
 	}
 	return strings.Join(lines, "\n")
 }
@@ -969,6 +1079,25 @@ func (c AnnotationComponent) memberScopeLine() string {
 }
 
 func (c AnnotationComponent) policyLineV2() string {
+	if c.Capability == "policy-facts-v1" {
+		label := "Oncall"
+		if c.PolicyProposal == "pool" {
+			label = "Pool"
+		} else if c.PolicyProposal == "original" {
+			label = "Original routing retained"
+		}
+		switch c.DecisionSource {
+		case "operator_rule":
+			return "Policy: " + label + " · Operator rule"
+		case "model_policy":
+			if c.PoolMinProbability != nil {
+				return "Policy: " + label + " · Pool threshold " + formatProbability(*c.PoolMinProbability)
+			}
+		case "model_unavailable":
+			return "Policy: " + label + " · Model unavailable"
+		}
+		return "Policy: " + label
+	}
 	if c.Routing == nil || c.PolicyProposal == c.Routing.Choice {
 		return ""
 	}
@@ -983,6 +1112,17 @@ func (c AnnotationComponent) policyLineV2() string {
 		return "Policy: " + label
 	}
 	return "Policy: " + label + " · " + reason
+}
+
+func modelErrorLabel(code string) string {
+	switch code {
+	case "minimum_state_budget_exceeded", "request_body_budget_exceeded", "questions_budget_exceeded":
+		return "Context budget exceeded"
+	case "model_disabled":
+		return "Model disabled"
+	default:
+		return code
+	}
 }
 
 func formatProbability(value float64) string {
