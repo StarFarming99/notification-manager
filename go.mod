@@ -15,6 +15,7 @@ require (
 	github.com/go-logr/logr v1.2.4
 	github.com/golang/glog v1.2.0
 	github.com/json-iterator/go v1.1.12
+	github.com/larksuite/oapi-sdk-go/v3 v3.12.0
 	github.com/mitchellh/hashstructure v1.1.0
 	github.com/modern-go/reflect2 v1.0.2
 	github.com/mwitkow/go-conntrack v0.0.0-20190716064945-2f068394615f
@@ -70,6 +71,7 @@ require (
 	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/google/gofuzz v1.2.0 // indirect
 	github.com/google/uuid v1.3.0 // indirect
+	github.com/gorilla/websocket v1.5.0 // indirect
 	github.com/imdario/mergo v0.3.12 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect

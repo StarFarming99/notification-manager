@@ -219,6 +219,46 @@ func ResolveJevCardPatcher(
 	return feishuNotifier.patchInteractiveCard, nil
 }
 
+// ResolveJevFeedbackAppCredentials returns the application identity that owns
+// the allowlisted card. The same receiver/destination disambiguation as card
+// patch recovery prevents a different Feishu app from consuming UAT feedback.
+func ResolveJevFeedbackAppCredentials(
+	notifierCtl *controller.Controller,
+	receiverName string,
+	destination string,
+) (string, string, error) {
+	receivers := notifierCtl.RcvsFromName([]string{receiverName}, "", constants.Feishu)
+	candidates := make([]*feishu.Receiver, 0, len(receivers))
+	for _, receiver := range receivers {
+		feishuReceiver, ok := receiver.(*feishu.Receiver)
+		if !ok || feishuReceiver.Name != receiverName ||
+			!utils.StringInList(destination, feishuReceiver.ChatIDs) || feishuReceiver.Config == nil {
+			continue
+		}
+		candidates = append(candidates, feishuReceiver)
+	}
+	if len(candidates) != 1 {
+		return "", "", utils.Errorf(
+			"expected one Feishu feedback app for receiver %q and destination %q, found %d",
+			receiverName,
+			destination,
+			len(candidates),
+		)
+	}
+	appID, err := notifierCtl.GetCredential(candidates[0].AppID)
+	if err != nil {
+		return "", "", err
+	}
+	appSecret, err := notifierCtl.GetCredential(candidates[0].AppSecret)
+	if err != nil {
+		return "", "", err
+	}
+	if appID == "" || appSecret == "" {
+		return "", "", utils.Error("resolved Feishu feedback app credentials are empty")
+	}
+	return appID, appSecret, nil
+}
+
 func (n *Notifier) SetSentSuccessfulHandler(h *func([]*template.Alert)) {
 	n.sentSuccessfulHandler = h
 }

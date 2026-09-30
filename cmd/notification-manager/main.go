@@ -134,6 +134,37 @@ func Main() int {
 	) (jevshadow.CardPatcher, error) {
 		return feishunotifier.ResolveJevCardPatcher(logger, ctl, receiver, destination)
 	})
+	var feedbackCh <-chan error
+	var cancelFeedback context.CancelFunc = func() {}
+	if receiver, destination, enabled := shadow.FeedbackTarget(); enabled {
+		appID, appSecret, resolveErr := feishunotifier.ResolveJevFeedbackAppCredentials(
+			ctl,
+			receiver,
+			destination,
+		)
+		if resolveErr != nil {
+			_ = level.Error(logger).Log("msg", "Failed to resolve Jev feedback app", "error", resolveErr)
+			return -1
+		}
+		if validateErr := feishunotifier.ValidateJevFeedbackApp(appID, appSecret); validateErr != nil {
+			_ = level.Error(logger).Log("msg", "Invalid Jev feedback app", "error", validateErr)
+			return -1
+		}
+		feedbackCtx, cancel := context.WithCancel(context.Background())
+		cancelFeedback = cancel
+		feedbackErrors := make(chan error, 1)
+		feedbackCh = feedbackErrors
+		go func() {
+			feedbackErrors <- feishunotifier.StartJevFeedbackListener(
+				feedbackCtx,
+				logger,
+				shadow,
+				appID,
+				appSecret,
+			)
+		}()
+	}
+	defer cancelFeedback()
 
 	alerts := store.NewAlertStore(*storeType)
 
@@ -170,6 +201,12 @@ func Main() int {
 		case <-termCh:
 			_ = level.Info(logger).Log("msg", "Received SIGTERM, exiting gracefully...")
 			cancelHttp()
+			cancelFeedback()
+		case err := <-feedbackCh:
+			if err != nil {
+				_ = level.Error(logger).Log("msg", "Jev feedback listener exited", "error", err)
+				return -1
+			}
 		case err := <-srvCh:
 			if err != nil {
 				_ = level.Error(logger).Log("msg", "Abnormal exit", "error", err.Error())

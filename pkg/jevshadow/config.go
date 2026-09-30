@@ -29,6 +29,7 @@ const (
 	envReceiptRetryMax      = "JEV_SHADOW_RECEIPT_RETRY_MAX"
 	envReceiptDrainTimeout  = "JEV_SHADOW_RECEIPT_DRAIN_TIMEOUT"
 	envCardStateDir         = "JEV_SHADOW_CARD_STATE_DIR"
+	envFeedbackEnabled      = "JEV_SHADOW_FEEDBACK_ENABLED"
 )
 
 type Config struct {
@@ -50,6 +51,7 @@ type Config struct {
 	ReceiptRetryMax      time.Duration
 	ReceiptDrainTimeout  time.Duration
 	CardStateDir         string
+	FeedbackEnabled      bool
 	MaxCards             int
 }
 
@@ -75,6 +77,9 @@ func ConfigFromEnv() (Config, error) {
 	config.SenderApp = strings.TrimSpace(os.Getenv(envSenderApp))
 	config.ReceiptOutboxDir = strings.TrimSpace(os.Getenv(envReceiptOutboxDir))
 	config.CardStateDir = strings.TrimSpace(os.Getenv(envCardStateDir))
+	if config.FeedbackEnabled, err = strconv.ParseBool(valueOrDefault(envFeedbackEnabled, "false")); err != nil {
+		return Config{}, fmt.Errorf("%s must be a boolean: %w", envFeedbackEnabled, err)
+	}
 	config = config.withReceiptDefaults()
 	if config.ReceiptMaxAttempts, err = positiveIntFromEnv(envReceiptMaxAttempts, config.ReceiptMaxAttempts); err != nil {
 		return Config{}, err
@@ -125,6 +130,12 @@ func (c Config) validate() error {
 		if value == "" {
 			return fmt.Errorf("%s is required when %s=true", name, envEnabled)
 		}
+	}
+	if c.FeedbackEnabled && (len(c.ReceiverAllowlist) != 1 || len(c.DestinationAllowlist) != 1) {
+		return fmt.Errorf(
+			"%s requires exactly one receiver and one destination in the UAT allowlists",
+			envFeedbackEnabled,
+		)
 	}
 	if len(c.ReceiverAllowlist) == 0 {
 		return fmt.Errorf("%s must contain at least one receiver", envReceiverAllowlist)

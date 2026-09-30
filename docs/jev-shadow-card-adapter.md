@@ -28,6 +28,7 @@ the following table are required except the two storage paths, which have docume
 | `JEV_SHADOW_EXPIRES_AT` | Absolute RFC3339 UAT cutoff; restart does not extend it |
 | `JEV_SHADOW_RECEIPT_OUTBOX_DIR` | Receipt outbox path; mount it on persistent storage to survive pod replacement (default `/tmp/notification-manager/jev-shadow-receipts`) |
 | `JEV_SHADOW_CARD_STATE_DIR` | Base card, binding, component, revision, idempotency, and patch-state path (default `<receipt-outbox>/card-state`) |
+| `JEV_SHADOW_FEEDBACK_ENABLED` | Explicitly start the allowlisted Feishu application's `card.action.trigger` long-connection consumer and relay verified overall feedback to Jev (default `false`) |
 
 The retry policy can be tuned with `JEV_SHADOW_RECEIPT_MAX_ATTEMPTS` (default `12`),
 `JEV_SHADOW_RECEIPT_RETRY_MIN` (default `1s`), `JEV_SHADOW_RECEIPT_RETRY_MAX`
@@ -80,16 +81,25 @@ resolves the original application writer from the live receiver plus destination
 ambiguous matches return a retryable writer-unavailable response.
 
 The compact classification component appends `准确` and `不准确` buttons. Both use the
-`jev_feedback` action and carry only an overall verdict plus Jev's signed action reference. The
-Feishu callback service must take the verified operator/chat/message identity from the callback
-event and relay it to Jev `POST /v1/feedback`; it must not trust identity fields from the button.
+`jev_feedback` action and carry only an overall verdict plus Jev's signed action reference. When
+feedback is explicitly enabled, Notification Manager connects as the same allowlisted Feishu
+application that sent the card. It takes operator/chat/message identity only from the verified
+`card.action.trigger` event and relays it to Jev `POST /v1/feedback`; identity fields in the button
+are never accepted. Jev deduplicates redelivery by Feishu event ID and treats a later click by the
+same actor as an audited opinion revision.
+
+The Feishu application must use long-connection callback delivery and have
+`card.action.trigger` enabled in the developer console. A successful WebSocket connection alone
+does not prove this console-side subscription; UAT acceptance requires a real user click, a
+success toast, and the matching feedback row in Jev.
 
 ## UAT boundary
 
 The Jev writer state now survives restart when its configured path survives, and concurrent
 Jev writers sharing that path are serialized. This is still **not the complete production
-single-writer design**: this fork contains no ACK, recovery, silence, or other card-action
-callback writer to route through the same state machine. If another service changes the same
+single-writer design**: feedback callbacks only return a toast and do not rewrite the card. This
+fork still contains no ACK, recovery, silence, or other card-action writer routed through the same
+state machine. If another service changes the same
 Feishu message, Notification Manager cannot fetch and merge that newer remote base; a later
 full-card PATCH could otherwise restore stale firing/unacknowledged content. Production and
 any UAT receiver with an active external card-mutating callback must therefore remain blocked
