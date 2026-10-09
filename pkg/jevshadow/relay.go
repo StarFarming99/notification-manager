@@ -37,24 +37,30 @@ type SuccessfulDelivery struct {
 }
 
 type successRelay struct {
-	queue         chan SuccessfulDelivery
-	cancel        context.CancelFunc
-	client        *http.Client
-	endpoint      string
-	token         string
-	accepted      uint64
-	dropped       uint64
-	failed        uint64
-	sequence      uint64
-	gapOverflow   uint64
-	journalErrors uint64
-	gaps          chan RelayGap
-	gapMu         sync.Mutex
-	recent        []RelayGap
-	instance      string
-	journalPath   string
-	logger        log.Logger
-	done          chan struct{}
+	queue              chan SuccessfulDelivery
+	cancel             context.CancelFunc
+	client             *http.Client
+	endpoint           string
+	token              string
+	accepted           uint64
+	dropped            uint64
+	failed             uint64
+	sequence           uint64
+	gapOverflow        uint64
+	journalErrors      uint64
+	gaps               chan RelayGap
+	gapMu              sync.Mutex
+	recent             []RelayGap
+	instance           string
+	journalPath        string
+	logger             log.Logger
+	done               chan struct{}
+	gapDone            chan struct{}
+	closing            uint32
+	offers             int64
+	shutdownIncomplete uint32
+	gapPending         int64
+	processing         uint32
 }
 
 // NewNMFromEnv never initializes a disk store or a feedback listener. The legacy
@@ -102,6 +108,7 @@ func newRelay(logger log.Logger, config Config, endpoint, token string, client *
 		endpoint: endpoint, token: token, client: client}
 	relay.gaps = make(chan RelayGap, 1024)
 	relay.done = make(chan struct{})
+	relay.gapDone = make(chan struct{})
 	relay.instance = strconv.FormatInt(time.Now().UnixNano(), 36)
 	relay.journalPath = os.Getenv("JEV_RELAY_GAP_PATH")
 	if relay.journalPath == "" && filepath.IsAbs(os.Getenv("NM_NOTIFICATION_SPOOL_PATH")) {
@@ -119,6 +126,11 @@ func (s *Service) IsRelay() bool { return s != nil && s.relay != nil }
 // offer is strictly bounded, allocation-free and non-blocking. Do not add logs,
 // goroutines, hashing, marshaling, mutexes, network or persistence to this hook.
 func (r *successRelay) offer(delivery SuccessfulDelivery) {
+	atomic.AddInt64(&r.offers, 1)
+	defer atomic.AddInt64(&r.offers, -1)
+	if atomic.LoadUint32(&r.closing) != 0 {
+		return
+	}
 	sequence := atomic.AddUint64(&r.sequence, 1)
 	select {
 	case r.queue <- delivery:
@@ -129,8 +141,34 @@ func (r *successRelay) offer(delivery SuccessfulDelivery) {
 	}
 }
 
+// shutdown bounds extension cleanup independently of original notification
+// shutdown. Stop admission before cancelling, then join the fsynced gap writer.
+func (r *successRelay) shutdown(budget time.Duration) {
+	atomic.StoreUint32(&r.closing, 1)
+	deadline := time.NewTimer(budget)
+	defer deadline.Stop()
+	for atomic.LoadInt64(&r.offers) != 0 {
+		select {
+		case <-deadline.C:
+			atomic.StoreUint32(&r.shutdownIncomplete, 1)
+			r.cancel()
+			_ = r.logger.Log("msg", "Jev relay shutdown incomplete", "instance", r.instance)
+			return
+		case <-time.After(time.Millisecond):
+		}
+	}
+	r.cancel()
+	select {
+	case <-r.gapDone:
+	case <-deadline.C:
+		atomic.StoreUint32(&r.shutdownIncomplete, 1)
+		_ = r.logger.Log("msg", "Jev relay shutdown incomplete", "instance", r.instance)
+	}
+}
+
 func (r *successRelay) run(ctx context.Context) {
 	defer func() {
+		atomic.StoreUint32(&r.processing, 0)
 		for {
 			select {
 			case delivery := <-r.queue:
@@ -147,10 +185,12 @@ func (r *successRelay) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case delivery := <-r.queue:
+			atomic.StoreUint32(&r.processing, 1)
 			body, err := json.Marshal(delivery)
 			if err != nil || len(body) > maxSuccessBytes {
 				atomic.AddUint64(&r.failed, 1)
 				r.gap(delivery, "serialization_failed", atomic.AddUint64(&r.sequence, 1))
+				atomic.StoreUint32(&r.processing, 0)
 				continue
 			}
 			// Relay loss is observable, never a reason to resend an original card.
@@ -176,6 +216,7 @@ func (r *successRelay) run(ctx context.Context) {
 				atomic.AddUint64(&r.failed, 1)
 				r.gap(delivery, "executor_unavailable_or_rejected", atomic.AddUint64(&r.sequence, 1))
 			}
+			atomic.StoreUint32(&r.processing, 0)
 		}
 	}
 }
@@ -187,7 +228,8 @@ func (s *Service) RelayStatus() map[string]uint64 {
 	return map[string]uint64{"accepted": atomic.LoadUint64(&s.relay.accepted),
 		"dropped": atomic.LoadUint64(&s.relay.dropped), "failed": atomic.LoadUint64(&s.relay.failed),
 		"queued": uint64(len(s.relay.queue)), "gap_overflow": atomic.LoadUint64(&s.relay.gapOverflow),
-		"journal_errors": atomic.LoadUint64(&s.relay.journalErrors), "sequence": atomic.LoadUint64(&s.relay.sequence)}
+		"journal_errors": atomic.LoadUint64(&s.relay.journalErrors), "sequence": atomic.LoadUint64(&s.relay.sequence),
+		"shutdown_incomplete": uint64(atomic.LoadUint32(&s.relay.shutdownIncomplete))}
 }
 
 // HandleSuccessfulDelivery acknowledges only durable card binding plus receipt

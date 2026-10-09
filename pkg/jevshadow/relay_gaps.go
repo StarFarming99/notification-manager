@@ -26,21 +26,24 @@ type RelayGap struct {
 func (r *successRelay) gap(d SuccessfulDelivery, reason string, sequence uint64) {
 	g := RelayGap{Instance: r.instance, Sequence: sequence, Reason: reason, Receiver: d.Receiver,
 		Destination: d.Destination, SenderApp: d.SenderApp, MessageID: d.MessageID}
+	atomic.AddInt64(&r.gapPending, 1)
 	select {
 	case r.gaps <- g:
 	default:
+		atomic.AddInt64(&r.gapPending, -1)
 		atomic.AddUint64(&r.gapOverflow, 1)
 	}
 }
 
 func (r *successRelay) runGaps(ctx context.Context) {
+	defer close(r.gapDone)
 	for {
 		select {
 		case g := <-r.gaps:
 			r.recordGap(g)
 		case <-ctx.Done():
 			<-r.done
-			// Drain the bounded channel without ever delaying original notification shutdown.
+			// Service.Close joins this drain only within the extension shutdown budget.
 			for {
 				select {
 				case g := <-r.gaps:
@@ -54,6 +57,7 @@ func (r *successRelay) runGaps(ctx context.Context) {
 }
 
 func (r *successRelay) recordGap(g RelayGap) {
+	defer atomic.AddInt64(&r.gapPending, -1)
 	g.RecordedAt = time.Now().UTC()
 	r.gapMu.Lock()
 	if len(r.recent) == 256 {
@@ -118,7 +122,19 @@ func (s *Service) RelaySnapshot() map[string]interface{} {
 	r.gapMu.Lock()
 	gaps := append([]RelayGap(nil), r.recent...)
 	r.gapMu.Unlock()
+	drained := false
+	select {
+	case <-r.gapDone:
+		drained = true
+	default:
+	}
 	return map[string]interface{}{"enabled": true, "instance": r.instance, "counts": s.RelayStatus(),
 		"recent_gaps": gaps, "gap_records_queued": len(r.gaps), "journal_enabled": r.journalPath != "",
-		"journal_retention_bytes": 64 << 20, "reconciliation_complete": r.journalPath != "" && atomic.LoadUint64(&r.gapOverflow) == 0 && atomic.LoadUint64(&r.journalErrors) == 0}
+		"journal_retention_bytes": 64 << 20,
+		"reconciliation_scope":    "current_instance_shutdown_gaps",
+		"reconciliation_complete": drained && r.journalPath != "" &&
+			atomic.LoadUint64(&r.gapOverflow) == 0 && atomic.LoadUint64(&r.journalErrors) == 0 &&
+			atomic.LoadInt64(&r.gapPending) == 0 && len(r.queue) == 0 &&
+			atomic.LoadUint32(&r.processing) == 0 &&
+			atomic.LoadUint32(&r.shutdownIncomplete) == 0}
 }

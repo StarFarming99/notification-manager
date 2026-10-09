@@ -18,15 +18,16 @@ import (
 )
 
 type StaticConfiguration struct {
-	Routers     []v2beta2.Router   `json:"routers"`
-	Silences    []v2beta2.Silence  `json:"silences"`
-	Environment string             `json:"environment"`
-	Cluster     string             `json:"cluster"`
-	Template    string             `json:"template"`
-	Receivers   []v2beta2.Receiver `json:"receivers"`
-	Configs     []v2beta2.Config   `json:"configs"`
-	Options     *v2beta2.Options   `json:"options"`
-	GroupLabels []string           `json:"group_labels"`
+	Routers     []v2beta2.Router         `json:"routers"`
+	Silences    []v2beta2.Silence        `json:"silences"`
+	Environment string                   `json:"environment"`
+	Cluster     string                   `json:"cluster"`
+	Template    string                   `json:"template"`
+	Receivers   []v2beta2.Receiver       `json:"receivers"`
+	Configs     []v2beta2.Config         `json:"configs"`
+	Options     *v2beta2.Options         `json:"options"`
+	History     *v2beta2.HistoryReceiver `json:"history,omitempty"`
+	GroupLabels []string                 `json:"group_labels"`
 }
 
 // NewStatic is deliberately disjoint from the CR-backed controller. It never
@@ -51,7 +52,7 @@ func NewStatic(ctx context.Context, logger log.Logger, config StaticConfiguratio
 	if tmpl, err = tmpl.ParserText(config.Template); err != nil {
 		return nil, err
 	}
-	c := &Controller{logger: logger, ctx: ctx, staticIsolated: true, staticCluster: config.Cluster, staticRouters: config.Routers, staticSilences: config.Silences,
+	c := &Controller{logger: logger, ctx: ctx, history: config.History, staticIsolated: true, staticCluster: config.Cluster, staticRouters: config.Routers, staticSilences: config.Silences,
 		receivers: make(map[string]map[string]internal.Receiver), configs: make(map[string]map[string]internal.Config),
 		ch: make(chan *task, ChannelCapacity), tenantKey: defaultTenantKey, ReceiverOpts: config.Options,
 		batchMaxSize: 100, batchMaxWait: metav1.Duration{Duration: time.Second}, groupLabels: config.GroupLabels, tmpl: tmpl}

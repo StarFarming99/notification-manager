@@ -227,7 +227,7 @@ func (s *Service) Close() {
 	}
 	s.close.Do(func() {
 		if s.relay != nil {
-			s.relay.cancel()
+			s.relay.shutdown(2 * time.Second)
 		}
 		if s.outbox != nil {
 			s.outbox.Close()

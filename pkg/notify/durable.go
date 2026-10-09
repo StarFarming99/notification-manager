@@ -230,6 +230,13 @@ func SendFrozen(ctx context.Context, logger log.Logger, ctl *controller.Controll
 // separately and waits for a confirmed original delivery of that alert.
 func FreezeHistory(logger log.Logger, ctl *controller.Controller, primary []spool.Target) ([]spool.Target, error) {
 	receivers := ctl.GetHistoryReceivers()
+	// History has no public Receiver CR name. Bind only the frozen copy to a
+	// reserved ledger identity; legacy memory notification rendering is unchanged.
+	for i, receiver := range receivers {
+		r := receiver.Clone().(*webhooktype.Receiver)
+		r.Name = "__nm_internal_history_webhook__"
+		receivers[i] = r
+	}
 	if len(receivers) == 0 {
 		return nil, nil
 	}

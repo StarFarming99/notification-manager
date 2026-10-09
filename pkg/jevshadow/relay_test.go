@@ -10,11 +10,56 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-kit/kit/log"
 )
+
+func TestCloseFsyncsEveryAcceptedRelayGapBeforeReturn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gaps.jsonl")
+	t.Setenv("JEV_RELAY_GAP_PATH", path)
+	transport := blockedRelayTransport{entered: make(chan struct{}, 1)}
+	s := newRelay(log.NewNopLogger(), testConfig("http://jev.invalid"), "http://executor.invalid", "synthetic", &http.Client{Transport: transport})
+	s.CaptureSuccessfulDelivery(persistentCardTestData(), "jev-shadow-feishu-uat", "oc_test", "first", persistentCardBase(), nil)
+	select {
+	case <-transport.entered:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not start")
+	}
+	for i := 0; i < 100; i++ {
+		s.CaptureSuccessfulDelivery(persistentCardTestData(), "jev-shadow-feishu-uat", "oc_test", "queued", persistentCardBase(), nil)
+	}
+	s.Close()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if records := len(strings.Split(strings.TrimSpace(string(raw)), "\n")); records != 101 {
+		t.Fatalf("Close returned before fsync: records=%d", records)
+	}
+	if s.RelayStatus()["failed"] != 101 || !s.RelaySnapshot()["reconciliation_complete"].(bool) {
+		t.Fatal(s.RelaySnapshot())
+	}
+	s.CaptureSuccessfulDelivery(persistentCardTestData(), "jev-shadow-feishu-uat", "oc_test", "after-close", persistentCardBase(), nil)
+	if s.RelayStatus()["accepted"] != 101 {
+		t.Fatal("accepted after shutdown")
+	}
+}
+
+func TestRelayShutdownBudgetMarksIncompleteReconciliation(t *testing.T) {
+	r := &successRelay{queue: make(chan SuccessfulDelivery), gaps: make(chan RelayGap), gapDone: make(chan struct{}), cancel: func() {}, logger: log.NewNopLogger(), journalPath: "/synthetic/not-written"}
+	s := &Service{relay: r}
+	start := time.Now()
+	r.shutdown(20 * time.Millisecond)
+	if time.Since(start) > time.Second {
+		t.Fatal("extension delayed original shutdown")
+	}
+	if s.RelayStatus()["shutdown_incomplete"] != 1 || s.RelaySnapshot()["reconciliation_complete"].(bool) {
+		t.Fatal("shutdown timeout reported complete")
+	}
+}
 
 type blockedRelayTransport struct{ entered chan struct{} }
 

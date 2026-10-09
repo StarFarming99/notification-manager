@@ -367,7 +367,8 @@ func (h *HttpHandler) acceptDurable(parent context.Context, alerts template.Aler
 	}
 	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
 	defer cancel()
-	var input interface{} = alerts
+	// Pipeline stages consume the unnamed slice, including the silence stage.
+	var input interface{} = []*template.Alert(alerts)
 	pipeline := stage.MultiStage{}
 	if receivers == nil {
 		pipeline = append(pipeline, silence.NewStage(h.notifierCtl), route.NewStage(h.notifierCtl), filter.NewStage(h.notifierCtl))
