@@ -142,3 +142,15 @@ Fixed NM/executor/recovery image (linux/amd64):
 harbor.op.zillizcloud.com/devops/notification-manager@sha256:8bdc7d032e49d8a2e8e237b6fba4f7179a3eb10279e6e60af61369d347ce2368
 Build revision: b7df11e3b00a5e7fa987fd4e05ca9d45c3839df5.
 Previous runtime digest remains historical evidence, not this repair candidate.
+
+
+## Latest human review decision (2026-10-09)
+
+The user accepts the discussed phase-one NM/Feishu failure and delivery-delay risk,
+with existing direct PD, and requests a fresh review before sidechannel launch.
+No new AM binary is selected; no deployment or formal promotion has occurred.
+See deployment REVIEW_DELIVERY.md. This does not waive missing named-production
+configuration/test-formal profile, callback owner or full runtime implementation.
+Do not create a second cluster-scoped NM CR that can reconfigure the original
+controller. PD's independence must be checked against the actual proposed overlay,
+not merely the old live config. Risk acceptance is not evidence of passed A01-A17.
