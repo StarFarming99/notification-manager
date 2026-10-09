@@ -132,9 +132,10 @@ ownership or duplicate/repeat gates, and nothing has been deployed.
 Stock AM's short-interval fault fixture delayed the next resolved delivery because
 Fanout waits for retries, but the single-instance 60s production-timer fixture did
 not show extra latency. The 9.75s number is not measured production impact. The
-user retained reuse-AM and asked to eliminate the effect before rollout. A local
+user initially retained reuse-AM and asked to eliminate the effect before rollout;
+the latest human decision below supersedes that zero-delay requirement. A local
 optional AM binary study isolates side aggregation while preserving primary keys;
-it is not yet a production choice. Three-replica HA, contents/counts and resource
+it is not selected for phase one. Three-replica HA, contents/counts and resource
 cost remain unverified. See deployment REPAIR_HANDOFF.md and business
 infra/jev-alert-shadow/deploy/production/alertmanager-study/README.md.
 
