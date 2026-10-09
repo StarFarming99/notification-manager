@@ -112,3 +112,29 @@ Codex tests/builds/pushes NM/executor, Jev and Console as linux/amd64 immutable
 index digests to harbor.op.zillizcloud.com. The user builds AIOps. Required runtime
 changes need new tested images before their manifests can be enabled. No cluster,
 production DB or real chat is modified by this PR. A01–A17 remain pending.
+
+
+## 2026-10-09 acceptance repairs and AM research correction
+
+The durable AM handler now passes the pipeline's unnamed alert slice. Frozen
+History receives a stable internal ledger identity without changing legacy memory
+History rendering; full HTTP/atomic-plan/dependency tests cover both paths.
+Relay Close stops admission and joins cancelled deliveries and fsynced gap records
+within a two-second budget. Timeout is explicitly incomplete, and reconciliation
+scope is the current process's shutdown gaps. Immediate-exit reproduction journals
+all 101 accepted receipts. These repairs do not close pending profile/config/card
+ownership or duplicate/repeat gates, and nothing has been deployed.
+
+Stock AM's short-interval fault fixture delayed the next resolved delivery because
+Fanout waits for retries, but the single-instance 60s production-timer fixture did
+not show extra latency. The 9.75s number is not measured production impact. The
+user retained reuse-AM and asked to eliminate the effect before rollout. A local
+optional AM binary study isolates side aggregation while preserving primary keys;
+it is not yet a production choice. Three-replica HA, contents/counts and resource
+cost remain unverified. See deployment REPAIR_HANDOFF.md and business
+infra/jev-alert-shadow/deploy/production/alertmanager-study/README.md.
+
+Fixed NM/executor/recovery image (linux/amd64):
+harbor.op.zillizcloud.com/devops/notification-manager@sha256:8bdc7d032e49d8a2e8e237b6fba4f7179a3eb10279e6e60af61369d347ce2368
+Build revision: b7df11e3b00a5e7fa987fd4e05ca9d45c3839df5.
+Previous runtime digest remains historical evidence, not this repair candidate.
