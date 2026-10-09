@@ -10,13 +10,30 @@ Deployment design: [vdc-deploy-prod #2360](https://github.com/zilliztech/vdc-dep
 
 ## Required runtime
 
-The region's complete producer stream must independently reach its existing AM
-and a separate AM. The existing AM/NM/PD/Vector routes keep their behavior during
-parallel validation. The separate AM drives a persistent Observer and this new
-NM; the same infra-alerts application sends new NM cards only to the approved test
-chat `oc_fbb2c50fed6ea3bd0f0777bea6f35358`. Current AM routes include PD-only
-branches, so an old-NM success relay alone cannot prove complete regional intake.
-Inventory and prove every producer's target/retry isolation before enabling it.
+The latest user decision is to **reuse the existing AM, not deploy another AM**.
+Keep source notifier targets and the existing route tree, receiver names, grouping,
+repeat timing, muting, continue behavior, original integration indices and formal
+outputs. Append Observer then test-NM webhooks with send_resolved=true to every
+reachable receiver, including PD-only and root fallback. This requires a reviewed
+AM config/auth-mount overlay, not an assertion that all AM configuration stays
+unchanged. The same infra-alerts app keeps old NM production groups and sends new
+NM cards only to test chat `oc_fbb2c50fed6ea3bd0f0777bea6f35358`.
+
+AM v0.23 uses per-integration dedup/retry/success logs, but its concurrent Fanout
+waits for branches and shares resources/group deadlines. Prove original NM/PD
+behavior with local mock 503/timeout/outage/reload tests before rollout. Appending
+integrations preserves original indices; do not insert or reorder original ones.
+Cross-receiver duplicates, legitimate AM repeat, request retries and Observer vs
+success-receipt intake need explicit reconciliation, not a permanent fingerprint
+plus startsAt dedupe claim. AM does not generally supply an Idempotency-Key.
+
+Notification webhooks do not guarantee all silenced/inhibited/short-lived raw
+events. Full raw regional coverage requires a persistent event outlet before
+muting/grouping, separately wired to Observer per source. This is missing runtime
+implementation. Do not call sampled snapshots or old NM success receipts complete
+raw event capture. Notification and raw-event coverage are separate gates.
+References: [v0.23 notification pipeline](https://github.com/prometheus/alertmanager/blob/v0.23.0/notify/notify.go)
+and [group dispatch](https://github.com/prometheus/alertmanager/blob/v0.23.0/dispatch/dispatch.go).
 
 The new NM must begin with the production-compatible durable sender, independent
 single-writer PVC, original template/channel/filter/silence/batching semantics,
@@ -45,27 +62,36 @@ It does **not** implement or validate all of the following promotion requirement
   start two competing WebSocket consumers. Original card state and old callbacks
   must remain supported after the old sender stops, requiring a verified owner
   handoff or legacy-handler mode rather than discarding their state.
-- Complete live regional source wiring and outage/short-alert coverage.
+- Actual all-receiver AM overlay and v0.23 failure/reload evidence, cross-receiver
+  duplicate/retry/repeat reconciliation and pre-mute/pre-group raw event wiring.
 
 The deployment PR has retired its memory/static snapshot runtime and rejects
 all attempts to enable it. These requirements are development/deployment gates,
 not a boolean approval switch or evidence from earlier static fixture tests.
+Validation session instructions: deployment PR
+`jev-alert-center-sidechannel/VERIFICATION_HANDOFF.md`. Report code regression,
+design consistency and deployment readiness separately; A01-A17 remain pending.
 
 ## Promotion of the same NM
 
 After full-region dual-group acceptance and separate user approval:
 
-1. Stop parallel AM's test sending to the new NM while Observer intake continues.
-   Drain/reconcile the test queue, retain unknown/dead-letter and frozen test plans.
+1. Remove appended test-NM webhooks from all receivers on the same AM, retaining
+   Observer and all original integration slots. Check reload/in-flight outcomes,
+   stop test intake, drain/reconcile and retain frozen test/unknown/dead-letter plans.
 2. Pause the existing AM-to-old-NM handoff safely with upstream retry retained;
    verify old sender drain, unknown outcomes and in-flight cards. Stop it through
    authoritative CR/Operator/GitOps so reconciliation cannot restart a second sender.
-3. Change the **same** new NM to the formal destination profile and direct the
-   existing AM NM webhook to it. Keep its verified image, PVC, card_owner,
+   Verify the first rc7 drain method; do not assume candidate recovery flags exist
+   in the old binary.
+3. Change the **same** new NM to the formal destination profile and change the
+   original AM NM webhook URL in its original integration slot to it. Keep its verified image, PVC, card_owner,
    execution_domain, source identities and Jev episodes. Preserve all production
    receivers, not just the infra critical chat. PD/Vector remain on the existing AM.
 4. Verify sole formal sender, endpoint, original receiver/card parity, callback
    ownership and precise request/receipt reconciliation across the handoff.
+   Old AM success logs are historical facts, not new NM receipts; prove handover
+   of existing firing notifications and old-card actions. Observer stays active.
 
 This is a sender/profile/intake ownership handoff, not merely a chat ID edit or
 another rebuilt NM. Existing cards cannot receive cross-chat updates. Rollback
