@@ -76,27 +76,31 @@ design consistency and deployment readiness separately; A01-A17 remain pending.
 
 After full-region dual-group acceptance and separate user approval:
 
-1. Remove appended test-NM webhooks from all receivers on the same AM, retaining
-   Observer and all original integration slots. Check reload/in-flight outcomes,
-   stop test intake, drain/reconcile and retain frozen test/unknown/dead-letter plans.
-2. Pause the existing AM-to-old-NM handoff safely with upstream retry retained;
-   verify old sender drain, unknown outcomes and in-flight cards. Stop it through
-   authoritative CR/Operator/GitOps so reconciliation cannot restart a second sender.
-   Verify the first rc7 drain method; do not assume candidate recovery flags exist
-   in the old binary.
-3. Change the **same** new NM to the formal destination profile and change the
-   original AM NM webhook URL in its original integration slot to it. Keep its verified image, PVC, card_owner,
-   execution_domain, source identities and Jev episodes. Preserve all production
-   receivers, not just the infra critical chat. PD/Vector remain on the existing AM.
-4. Verify sole formal sender, endpoint, original receiver/card parity, callback
-   ownership and precise request/receipt reconciliation across the handoff.
-   Old AM success logs are historical facts, not new NM receipts; prove handover
-   of existing firing notifications and old-card actions. Observer stays active.
+1. Remove test-NM webhooks while retaining Observer/original slots. Stop only test
+   intake and drain/reconcile frozen test plans while old NM serves production.
+2. Ready and verify the same new NM's formal endpoint/profile, credentials and
+   callback ownership. Keep image/PVC/identities and all formal receivers.
+3. Switch the original AM NM URL in its existing slot to the verified new formal
+   endpoint. Verify new intake and that old NM receives no new work; do not stop
+   the old endpoint or pause the original notification path before this switch.
+4. Drain/reconcile old accepted/in-flight/unknown work, then stop old sender via
+   authoritative CR/Operator/GitOps. Verify rc7 drain capability in advance. HA
+   reload is not an atomic cluster-wide switch: target ownership and retry
+   reconciliation across both ledgers are required before approval. During drain,
+   old sender only finishes work accepted before intake cutover.
+5. Verify receipts, original receiver/card parity and old-card callbacks. PD/Vector
+   and Observer continue. Old AM logs never become fabricated new NM receipts;
+   frozen test plans remain test sends and existing cards cannot cross chats.
 
-This is a sender/profile/intake ownership handoff, not merely a chat ID edit or
-another rebuilt NM. Existing cards cannot receive cross-chat updates. Rollback
-first stops and drains the new formal sender, then restores the old intake/owner;
-never activate both formal senders or replay the whole spool.
+Rollback follows the same safe order: ready/verify the previous formal endpoint,
+switch the AM URL back, verify intake, then drain/reconcile/stop the outgoing
+sender. Never point AM at a stopped endpoint or replay the entire spool. Each
+notification target must retain one owner across the handoff.
+
+Named configuration isolation is a hard precondition, not optional follow-up.
+Do not create another cluster-scoped NM CR until implementation and evidence
+prove the original controller cannot be reconfigured by it. That review blocker
+remains open; the disabled chart does not count as implementing isolation.
 
 ## Provenance and release ownership
 
