@@ -18,6 +18,8 @@ package controllers
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	"github.com/go-logr/logr"
 	"github.com/kubesphere/notification-manager/apis/v2beta2"
@@ -82,6 +84,17 @@ func (r *NotificationManagerReconciler) Reconcile(ctx context.Context, req ctrl.
 	var err error
 	result := controllerutil.OperationResultNone
 
+	handoff, err := handoffIntent(&nm)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// Rollback readies the original deployment before changing the stable Service.
+	if handoff != nil && handoff.Phase == "rollback" {
+		deploy := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: nm.Name + "-deployment", Namespace: r.Namespace}}
+		if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, deploy, r.mutateDeployment(deploy, &nm)); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	// Create deployment service
 	if err = r.createDeploymentSvc(ctx, &nm); err != nil {
 		log.Error(err, "Failed to create svc")
@@ -103,6 +116,15 @@ func (r *NotificationManagerReconciler) Reconcile(ctx context.Context, req ctrl.
 }
 
 func (r *NotificationManagerReconciler) createDeploymentSvc(ctx context.Context, nm *v2beta2.NotificationManager) error {
+	if handoff, err := handoffIntent(nm); err != nil {
+		return err
+	} else if handoff != nil {
+		return r.createManagedHandoffService(ctx, nm, handoff)
+	}
+	var existing corev1.Service
+	if err := r.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: nm.Name + "-svc"}, &existing); err == nil && existing.Annotations[SenderHandoffAnnotation] != "" && !strings.HasSuffix(existing.Annotations[SenderHandoffAnnotation], ":rollback") {
+		return fmt.Errorf("managed sender handoff must be rolled back explicitly before removing its intent")
+	}
 	nm = nm.DeepCopy()
 	if utils.StringIsNil(nm.Spec.PortName) {
 		nm.Spec.PortName = defaultPortName
@@ -164,6 +186,12 @@ func (r *NotificationManagerReconciler) mutateDeployment(deploy *appsv1.Deployme
 		}
 
 		deploy.Spec.Replicas = nm.Spec.Replicas
+		if handoff, err := handoffIntent(nm); err != nil {
+			return err
+		} else if handoff != nil && handoff.Phase == "retired" {
+			zero := int32(0)
+			deploy.Spec.Replicas = &zero
+		}
 		podLabels := *r.makeCommonLabels(nm)
 		for k, v := range nm.Spec.Labels {
 			podLabels[k] = v
@@ -329,5 +357,6 @@ func (r *NotificationManagerReconciler) SetupWithManager(mgr ctrl.Manager) error
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v2beta2.NotificationManager{}).
 		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.Service{}).
 		Complete(r)
 }

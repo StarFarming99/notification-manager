@@ -11,8 +11,10 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/kubesphere/notification-manager/pkg/controller"
+	"github.com/kubesphere/notification-manager/pkg/deliveryprofiles"
 	"github.com/kubesphere/notification-manager/pkg/dispatcher"
 	"github.com/kubesphere/notification-manager/pkg/jevshadow"
+	feishunotifier "github.com/kubesphere/notification-manager/pkg/notify/notifier/feishu"
 	"github.com/kubesphere/notification-manager/pkg/store"
 	wh "github.com/kubesphere/notification-manager/pkg/webhook"
 	"gopkg.in/alecthomas/kingpin.v2"
@@ -111,10 +113,10 @@ func Main() int {
 		_ = level.Error(logger).Log("msg", "Failed to create notification manager controller")
 		return -1
 	}
-	shadow, err := jevshadow.NewFromEnv(logger)
+	shadow, err := jevshadow.NewNMFromEnv(logger)
 	if err != nil {
-		_ = level.Error(logger).Log("msg", "Failed to configure Jev shadow adapter", "error", err)
-		return -1
+		_ = level.Error(logger).Log("msg", "Jev extension disabled: configuration invalid; original notifications continue")
+		shadow, _ = jevshadow.New(logger, jevshadow.Config{Enabled: false}, nil)
 	}
 	defer shadow.Close()
 	ctl.SetJevShadow(shadow)
@@ -126,8 +128,56 @@ func Main() int {
 		_ = level.Error(logger).Log("msg", "Failed to create sync notification manager controller")
 		return -1
 	}
+	shadow.SetCardPatcherResolver(func(
+		_ context.Context,
+		receiver string,
+		destination string,
+	) (jevshadow.CardPatcher, error) {
+		return feishunotifier.ResolveJevCardPatcher(logger, ctl, receiver, destination)
+	})
+	var feedbackCh <-chan error
+	var cancelFeedback context.CancelFunc = func() {}
+	if receiver, destination, enabled := shadow.FeedbackTarget(); enabled {
+		appID, appSecret, resolveErr := feishunotifier.ResolveJevFeedbackAppCredentials(
+			ctl,
+			receiver,
+			destination,
+		)
+		if resolveErr != nil {
+			_ = level.Error(logger).Log("msg", "Jev feedback disabled: app resolution failed")
+		}
+		if validateErr := feishunotifier.ValidateJevFeedbackApp(appID, appSecret); validateErr != nil {
+			_ = level.Error(logger).Log("msg", "Jev feedback disabled: invalid app credentials")
+		}
+		if resolveErr == nil && feishunotifier.ValidateJevFeedbackApp(appID, appSecret) == nil {
+			feedbackCtx, cancel := context.WithCancel(context.Background())
+			cancelFeedback = cancel
+			feedbackErrors := make(chan error, 1)
+			feedbackCh = feedbackErrors
+			go func() {
+				feedbackErrors <- feishunotifier.StartJevFeedbackListener(
+					feedbackCtx,
+					logger,
+					shadow,
+					appID,
+					appSecret,
+				)
+			}()
+		}
+	}
+	defer cancelFeedback()
 
-	alerts := store.NewAlertStore(*storeType)
+	alerts, storeErr := store.NewCheckedAlertStore(*storeType)
+	if storeErr != nil {
+		_ = level.Error(logger).Log("msg", "Original notification store failed to open", "error", storeErr)
+		return 1
+	}
+	defer alerts.FinalClose()
+	ctl.DeliveryProfiles, err = deliveryprofiles.FromEnv(alerts.Durable)
+	if err != nil {
+		_ = level.Error(logger).Log("msg", "Delivery profiles failed to initialize", "error", err)
+		return 1
+	}
 
 	// Setup webhook to receive alert/notification msg
 	webhook := wh.New(
@@ -135,11 +185,17 @@ func Main() int {
 		ctl,
 		alerts,
 		&wh.Options{
-			ListenAddress:  *listenAddress,
-			WebhookTimeout: *webhookTimeout,
-			WorkerTimeout:  *wkrTimeout,
+			ListenAddress:             *listenAddress,
+			WebhookTimeout:            *webhookTimeout,
+			WorkerTimeout:             *wkrTimeout,
+			FormalCompatListenAddress: os.Getenv("NM_FORMAL_COMPAT_LISTEN_ADDRESS"),
+			FormalCompatSourceCIDRs:   splitNonempty(os.Getenv("NM_FORMAL_COMPAT_SOURCE_CIDRS")),
 		})
 
+	if err := webhook.PrepareInitialProfiles(ctlCtx); err != nil {
+		_ = level.Error(logger).Log("msg", "Initial delivery profile failed readiness validation", "error", err)
+		return 1
+	}
 	ctxHttp, cancelHttp := context.WithCancel(context.Background())
 	defer cancelHttp()
 
@@ -161,7 +217,14 @@ func Main() int {
 		select {
 		case <-termCh:
 			_ = level.Info(logger).Log("msg", "Received SIGTERM, exiting gracefully...")
+			_ = alerts.Close()
 			cancelHttp()
+			cancelFeedback()
+		case err := <-feedbackCh:
+			if err != nil {
+				_ = level.Error(logger).Log("msg", "Jev feedback listener exited", "error", err)
+			}
+			feedbackCh = nil
 		case err := <-srvCh:
 			if err != nil {
 				_ = level.Error(logger).Log("msg", "Abnormal exit", "error", err.Error())
@@ -177,4 +240,14 @@ func Main() int {
 
 func main() {
 	os.Exit(Main())
+}
+
+func splitNonempty(raw string) []string {
+	var result []string
+	for _, v := range strings.Split(raw, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			result = append(result, v)
+		}
+	}
+	return result
 }

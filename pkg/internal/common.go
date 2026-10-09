@@ -20,6 +20,7 @@ type Template struct {
 }
 
 type Common struct {
+	Frozen          bool                   `json:"frozen,omitempty"`
 	Name            string                 `json:"name,omitempty"`
 	ResourceVersion uint64                 `json:"resourceVersion,omitempty"`
 	Type            string                 `json:"type,omitempty"`
@@ -92,14 +93,16 @@ func (c *Common) GetHash() string {
 func (c *Common) Clone() *Common {
 
 	return &Common{
-		Name:           c.Name,
-		Type:           c.Type,
-		TenantID:       c.TenantID,
-		Labels:         c.Labels,
-		Enable:         c.Enable,
-		AlertSelector:  c.AlertSelector,
-		ConfigSelector: c.ConfigSelector,
-		Hash:           c.Hash,
+		Frozen:          c.Frozen,
+		ResourceVersion: c.ResourceVersion,
+		Name:            c.Name,
+		Type:            c.Type,
+		TenantID:        c.TenantID,
+		Labels:          c.Labels,
+		Enable:          c.Enable,
+		AlertSelector:   c.AlertSelector,
+		ConfigSelector:  c.ConfigSelector,
+		Hash:            c.Hash,
 		Template: Template{
 			TmplName:      c.TmplName,
 			TitleTmplName: c.TitleTmplName,

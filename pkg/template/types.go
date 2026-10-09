@@ -15,8 +15,13 @@ var (
 )
 
 type Data struct {
-	Alerts     Alerts `json:"alerts"`
-	DeliveryID string `json:"deliveryID,omitempty"`
+	ProfileID           string  `json:"profile_id,omitempty"`
+	ProfileVersion      string  `json:"profile_version,omitempty"`
+	CardOwnerID         string  `json:"card_owner_id,omitempty"`
+	OriginalDestination string  `json:"original_destination,omitempty"`
+	FrozenContent       *string `json:"-"`
+	Alerts              Alerts  `json:"alerts"`
+	DeliveryID          string  `json:"deliveryID,omitempty"`
 
 	GroupLabels       KV `json:"groupLabels"`
 	CommonLabels      KV `json:"commonLabels"`
@@ -78,8 +83,10 @@ func (d *Data) Status() string {
 
 func (d *Data) Clone() *Data {
 	nd := &Data{
-		Alerts:            nil,
+		Alerts:    nil,
+		ProfileID: d.ProfileID, ProfileVersion: d.ProfileVersion, CardOwnerID: d.CardOwnerID, OriginalDestination: d.OriginalDestination,
 		DeliveryID:        d.DeliveryID,
+		FrozenContent:     d.FrozenContent,
 		GroupLabels:       d.GroupLabels.Clone(),
 		CommonLabels:      d.CommonLabels.Clone(),
 		CommonAnnotations: d.CommonAnnotations.Clone(),
@@ -197,10 +204,11 @@ func (kv KV) Clone() KV {
 }
 
 type Alert struct {
-	ID          string `json:"id"`
-	Status      string `json:"status"`
-	Labels      KV     `json:"labels"`
-	Annotations KV     `json:"annotations"`
+	ID           string `json:"id"`
+	Status       string `json:"status"`
+	Labels       KV     `json:"labels"`
+	Annotations  KV     `json:"annotations"`
+	GeneratorURL string `json:"generatorURL,omitempty"`
 
 	StartsAt time.Time `json:"startsAt,omitempty"`
 	EndsAt   time.Time `json:"endsAt,omitempty"`
@@ -274,6 +282,7 @@ func (a *Alert) Clone() *Alert {
 		NotificationTime: a.NotificationTime,
 		Labels:           a.Labels.Clone(),
 		Annotations:      a.Annotations.Clone(),
+		GeneratorURL:     a.GeneratorURL,
 		Receiver:         a.Receiver,
 	}
 }

@@ -135,8 +135,17 @@ func (r *Receiver) GetChannels() (string, interface{}) {
 
 type Config struct {
 	*internal.Common
-	AppID     *v2beta2.Credential `json:"appID,omitempty"`
-	AppSecret *v2beta2.Credential `json:"appSecret,omitempty"`
+	AppID               *v2beta2.Credential  `json:"appID,omitempty"`
+	AppSecret           *v2beta2.Credential  `json:"appSecret,omitempty"`
+	CredentialConfigRef *CredentialConfigRef `json:"credential_config_ref,omitempty"`
+}
+
+// CredentialConfigRef permits existing Config CRs with literal credentials to
+// remain read-only without persisting their secret in the notification ledger.
+type CredentialConfigRef struct {
+	Name  string `json:"config_name"`
+	UID   string `json:"config_uid"`
+	AppID string `json:"app_id"`
 }
 
 func NewConfig(obj *v2beta2.Config) internal.Config {
@@ -176,8 +185,9 @@ func (c *Config) Validate() error {
 func (c *Config) Clone() internal.Config {
 
 	return &Config{
-		Common:    c.Common.Clone(),
-		AppSecret: c.AppSecret,
-		AppID:     c.AppID,
+		Common:              c.Common.Clone(),
+		AppSecret:           c.AppSecret,
+		AppID:               c.AppID,
+		CredentialConfigRef: c.CredentialConfigRef,
 	}
 }

@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/go-kit/kit/log"
@@ -20,9 +21,11 @@ import (
 )
 
 type Dispatcher struct {
-	l           log.Logger
-	notifierCtl *controller.Controller
-	alerts      *store.AlertStore
+	sendBudgetMu sync.Mutex
+	nextSend     time.Time
+	l            log.Logger
+	notifierCtl  *controller.Controller
+	alerts       *store.AlertStore
 
 	scheduleTimeout time.Duration
 	wkrTimeout      time.Duration
@@ -44,6 +47,9 @@ func New(l log.Logger, notifierCtl *controller.Controller, alerts *store.AlertSt
 }
 
 func (d *Dispatcher) Run() error {
+	if d.alerts.Durable != nil {
+		return d.runDurable()
+	}
 
 	for {
 		// err is not nil means the store had closed, dispatcher should process remaining alerts, then exit.

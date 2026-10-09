@@ -1,6 +1,6 @@
 ARG GOPROXY="https://goproxy.io"
 # Build the manager binary
-FROM golang:1.20 as builder
+FROM golang:1.23.12 AS builder
 ARG GOPROXY
 
 WORKDIR /workspace

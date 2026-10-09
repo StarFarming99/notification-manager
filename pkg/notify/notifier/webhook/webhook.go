@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
+	"github.com/kubesphere/notification-manager/apis/v2beta2"
 	"github.com/kubesphere/notification-manager/pkg/constants"
 	"github.com/kubesphere/notification-manager/pkg/controller"
 	"github.com/kubesphere/notification-manager/pkg/internal"
@@ -67,7 +68,9 @@ func NewWebhookNotifier(logger log.Logger, receiver internal.Receiver, notifierC
 	}
 
 	var err error
-	n.tmpl, err = notifierCtl.GetReceiverTmpl(n.receiver.TmplText)
+	if !n.receiver.Frozen {
+		n.tmpl, err = notifierCtl.GetReceiverTmpl(n.receiver.TmplText)
+	}
 	if err != nil {
 		_ = level.Error(n.logger).Log("msg", "WebhookNotifier: create receiver template error", "error", err.Error())
 		return nil, err
@@ -87,22 +90,12 @@ func (n *Notifier) Notify(ctx context.Context, data *template.Data) error {
 		_ = level.Debug(n.logger).Log("msg", "WebhookNotifier: send message", "used", time.Since(start).String())
 	}()
 
-	var buf bytes.Buffer
-	if n.tmpl.Transform(n.receiver.TmplName) == constants.DefaultWebhookTemplate ||
-		n.tmpl.Transform(n.receiver.TmplName) == constants.DefaultHistoryTemplate {
-		if err := utils.JsonEncode(&buf, data); err != nil {
-			_ = level.Error(n.logger).Log("msg", "WebhookNotifier: encode message error", "error", err.Error())
-			return err
-		}
-	} else {
-		msg, err := n.tmpl.Text(n.receiver.TmplName, data)
-		if err != nil {
-			_ = level.Error(n.logger).Log("msg", "WebhookNotifier: generate message error", "error", err.Error())
-			return err
-		}
-
-		buf.WriteString(msg)
+	content, err := n.RenderForDurable(data)
+	if err != nil {
+		return err
 	}
+	var buf bytes.Buffer
+	buf.WriteString(content)
 
 	request, err := http.NewRequest(http.MethodPost, n.receiver.URL, &buf)
 	if err != nil {
@@ -234,4 +227,28 @@ func (n *Notifier) getTransport(r *webhook.Receiver) (http.RoundTripper, error) 
 	}
 
 	return transport, nil
+}
+
+func (n *Notifier) RenderForDurable(data *template.Data) (string, error) {
+	if data.FrozenContent != nil {
+		return *data.FrozenContent, nil
+	}
+	if n.tmpl == nil {
+		return "", utils.Error("frozen notification has no rendered content")
+	}
+	var buf bytes.Buffer
+	if n.tmpl.Transform(n.receiver.TmplName) == constants.DefaultWebhookTemplate || n.tmpl.Transform(n.receiver.TmplName) == constants.DefaultHistoryTemplate {
+		if err := utils.JsonEncode(&buf, data); err != nil {
+			return "", err
+		}
+		return buf.String(), nil
+	}
+	return n.tmpl.Text(n.receiver.TmplName, data)
+}
+
+func (n *Notifier) ConfigureFrozen(opts *v2beta2.Options) {
+	n.timeout = DefaultSendTimeout
+	if opts != nil && opts.Webhook != nil && opts.Webhook.NotificationTimeout != nil {
+		n.timeout = time.Duration(*opts.Webhook.NotificationTimeout) * time.Second
+	}
 }

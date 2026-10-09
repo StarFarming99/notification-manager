@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/go-kit/kit/log/level"
 	json "github.com/json-iterator/go"
 
+	"github.com/kubesphere/notification-manager/apis/v2beta2"
 	"github.com/kubesphere/notification-manager/pkg/async"
 	"github.com/kubesphere/notification-manager/pkg/constants"
 	"github.com/kubesphere/notification-manager/pkg/controller"
@@ -166,7 +168,9 @@ func NewFeishuNotifier(logger log.Logger, receiver internal.Receiver, notifierCt
 		"tmplType", n.receiver.TmplType, "tmplName", n.receiver.TmplName)
 
 	var err error
-	n.tmpl, err = notifierCtl.GetReceiverTmpl(n.receiver.TmplText)
+	if !n.receiver.Frozen {
+		n.tmpl, err = notifierCtl.GetReceiverTmpl(n.receiver.TmplText)
+	}
 	if err != nil {
 		_ = level.Error(logger).Log("msg", "FeishuNotifier: create receiver template error", "error", err.Error())
 		return nil, err
@@ -180,6 +184,84 @@ func NewFeishuNotifier(logger log.Logger, receiver internal.Receiver, notifierCt
 	return n, nil
 }
 
+// ResolveJevCardPatcher reconstructs the original Feishu application writer
+// from the live controller configuration after a Notification Manager restart.
+// Receiver name alone is not trusted: the destination must identify exactly
+// one enabled Feishu receiver, otherwise recovery fails closed.
+func ResolveJevCardPatcher(
+	logger log.Logger,
+	notifierCtl *controller.Controller,
+	receiverName string,
+	destination string,
+) (jevshadow.CardPatcher, error) {
+	receivers := notifierCtl.RcvsFromName([]string{receiverName}, "", constants.Feishu)
+	candidates := make([]internal.Receiver, 0, len(receivers))
+	for _, receiver := range receivers {
+		feishuReceiver, ok := receiver.(*feishu.Receiver)
+		if !ok || feishuReceiver.Name != receiverName || !utils.StringInList(destination, feishuReceiver.ChatIDs) {
+			continue
+		}
+		candidates = append(candidates, receiver)
+	}
+	if len(candidates) != 1 {
+		return nil, utils.Errorf(
+			"expected one Feishu writer for receiver %q and destination %q, found %d",
+			receiverName,
+			destination,
+			len(candidates),
+		)
+	}
+	resolved, err := NewFeishuNotifier(logger, candidates[0], notifierCtl)
+	if err != nil {
+		return nil, err
+	}
+	feishuNotifier, ok := resolved.(*Notifier)
+	if !ok {
+		return nil, utils.Error("resolved Feishu writer has an unexpected type")
+	}
+	return feishuNotifier.patchInteractiveCard, nil
+}
+
+// ResolveJevFeedbackAppCredentials returns the application identity that owns
+// the allowlisted card. The same receiver/destination disambiguation as card
+// patch recovery prevents a different Feishu app from consuming UAT feedback.
+func ResolveJevFeedbackAppCredentials(
+	notifierCtl *controller.Controller,
+	receiverName string,
+	destination string,
+) (string, string, error) {
+	receivers := notifierCtl.RcvsFromName([]string{receiverName}, "", constants.Feishu)
+	candidates := make([]*feishu.Receiver, 0, len(receivers))
+	for _, receiver := range receivers {
+		feishuReceiver, ok := receiver.(*feishu.Receiver)
+		if !ok || feishuReceiver.Name != receiverName ||
+			!utils.StringInList(destination, feishuReceiver.ChatIDs) || feishuReceiver.Config == nil {
+			continue
+		}
+		candidates = append(candidates, feishuReceiver)
+	}
+	if len(candidates) != 1 {
+		return "", "", utils.Errorf(
+			"expected one Feishu feedback app for receiver %q and destination %q, found %d",
+			receiverName,
+			destination,
+			len(candidates),
+		)
+	}
+	appID, err := notifierCtl.GetCredential(candidates[0].AppID)
+	if err != nil {
+		return "", "", err
+	}
+	appSecret, err := notifierCtl.GetCredential(candidates[0].AppSecret)
+	if err != nil {
+		return "", "", err
+	}
+	if appID == "" || appSecret == "" {
+		return "", "", utils.Error("resolved Feishu feedback app credentials are empty")
+	}
+	return appID, appSecret, nil
+}
+
 func (n *Notifier) SetSentSuccessfulHandler(h *func([]*template.Alert)) {
 	n.sentSuccessfulHandler = h
 }
@@ -188,7 +270,7 @@ func (n *Notifier) Notify(ctx context.Context, data *template.Data) error {
 	_ = level.Info(n.logger).Log("msg", "FeishuNotifier: starting notification",
 		"alertCount", len(data.Alerts), "tmplType", n.receiver.TmplType, "tmplName", n.receiver.TmplName)
 
-	content, err := n.tmpl.Text(n.receiver.TmplName, data)
+	content, err := n.RenderForDurable(data)
 	if err != nil {
 		_ = level.Error(n.logger).Log("msg", "FeishuNotifier: generate message error", "error", err.Error())
 		return err
@@ -347,7 +429,7 @@ func (n *Notifier) sendToChatBot(ctx context.Context, content string) error {
 		request.Header.Set("Content-Type", "application/json; charset=utf-8")
 
 		respBody, err := utils.DoHttpRequest(ctx, nil, request)
-		if err != nil && len(respBody) == 0 {
+		if err != nil && (n.receiver.Frozen || len(respBody) == 0) {
 			_ = level.Error(n.logger).Log("msg", "FeishuNotifier: HTTP request failed", "error", err.Error())
 			return false, err
 		}
@@ -376,7 +458,7 @@ func (n *Notifier) sendToChatBot(ctx context.Context, content string) error {
 		}
 		// 打印请求参数到日志
 		_ = level.Error(n.logger).Log("msg", "FeishuNotifier: chatbot message failed", "code", resp.Code, "msg", resp.Msg)
-		return false, utils.Errorf("%d, %s", resp.Code, resp.Msg)
+		return false, &utils.PlatformRejection{Code: resp.Code}
 	}
 
 	retry := 0
@@ -389,6 +471,9 @@ func (n *Notifier) sendToChatBot(ctx context.Context, content string) error {
 			_ = level.Error(n.logger).Log("msg", "FeishuNotifier: send notification to chatbot error", "error", err.Error(), "retry", retry)
 		}
 		if needRetry {
+			if n.receiver.Frozen {
+				return &utils.HTTPStatusError{Status: http.StatusTooManyRequests}
+			}
 			retry = retry + 1
 			_ = level.Info(n.logger).Log("msg", "FeishuNotifier: retry to send notification to chatbot", "retry", retry)
 			time.Sleep(time.Second)
@@ -495,7 +580,7 @@ func (n *Notifier) batchSend(ctx context.Context, content string) error {
 
 		// 打印请求参数到日志
 		_ = level.Error(n.logger).Log("msg", "FeishuNotifier: batch message failed", "code", resp.Code, "msg", resp.Msg, "retry", retry)
-		return false, utils.Errorf("%d, %s", resp.Code, resp.Msg)
+		return false, &utils.PlatformRejection{Code: resp.Code}
 	}
 
 	retry := 0
@@ -508,6 +593,9 @@ func (n *Notifier) batchSend(ctx context.Context, content string) error {
 			_ = level.Error(n.logger).Log("msg", "FeishuNotifier: send notification error", "error", err, "retry", retry)
 		}
 		if needRetry {
+			if n.receiver.Frozen {
+				return &utils.HTTPStatusError{Status: http.StatusTooManyRequests}
+			}
 			retry = retry + 1
 			_ = level.Info(n.logger).Log("msg", "FeishuNotifier: retry to send notification", "retry", retry)
 			time.Sleep(time.Second)
@@ -520,6 +608,7 @@ func (n *Notifier) batchSend(ctx context.Context, content string) error {
 }
 
 func (n *Notifier) getToken(ctx context.Context, r *feishu.Receiver) (string, error) {
+	ctx = utils.CredentialContext(ctx)
 	appID, err := n.notifierCtl.GetCredential(r.AppID)
 	if err != nil {
 		_ = level.Error(n.logger).Log("msg", "FeishuNotifier: get appID credential failed", "error", err.Error())
@@ -757,7 +846,7 @@ func (n *Notifier) batchSendInteractive(ctx context.Context, content string) err
 		}
 
 		_ = level.Error(n.logger).Log("msg", "FeishuNotifier: interactive batch message failed", "code", resp.Code, "msg", resp.Msg, "retry", retry)
-		return false, utils.Errorf("%d, %s", resp.Code, resp.Msg)
+		return false, &utils.PlatformRejection{Code: resp.Code}
 	}
 
 	retry := 0
@@ -770,6 +859,9 @@ func (n *Notifier) batchSendInteractive(ctx context.Context, content string) err
 			_ = level.Error(n.logger).Log("msg", "FeishuNotifier: send interactive notification error", "error", err, "retry", retry)
 		}
 		if needRetry {
+			if n.receiver.Frozen {
+				return &utils.HTTPStatusError{Status: http.StatusTooManyRequests}
+			}
 			retry = retry + 1
 			_ = level.Info(n.logger).Log("msg", "FeishuNotifier: retry to send interactive notification", "retry", retry)
 			time.Sleep(time.Second)
@@ -837,7 +929,7 @@ func (n *Notifier) sendToChatBotInteractive(ctx context.Context, content string)
 		request.Header.Set("Content-Type", "application/json; charset=utf-8")
 
 		respBody, err := utils.DoHttpRequest(ctx, nil, request)
-		if err != nil && len(respBody) == 0 {
+		if err != nil && (n.receiver.Frozen || len(respBody) == 0) {
 			_ = level.Error(n.logger).Log("msg", "FeishuNotifier: HTTP request failed for interactive message", "error", err.Error())
 			return false, err
 		}
@@ -866,7 +958,7 @@ func (n *Notifier) sendToChatBotInteractive(ctx context.Context, content string)
 		}
 
 		_ = level.Error(n.logger).Log("msg", "FeishuNotifier: interactive chatbot message failed", "code", resp.Code, "msg", resp.Msg)
-		return false, utils.Errorf("%d, %s", resp.Code, resp.Msg)
+		return false, &utils.PlatformRejection{Code: resp.Code}
 	}
 
 	retry := 0
@@ -879,6 +971,9 @@ func (n *Notifier) sendToChatBotInteractive(ctx context.Context, content string)
 			_ = level.Error(n.logger).Log("msg", "FeishuNotifier: send interactive notification to chatbot error", "error", err.Error(), "retry", retry)
 		}
 		if needRetry {
+			if n.receiver.Frozen {
+				return &utils.HTTPStatusError{Status: http.StatusTooManyRequests}
+			}
 			retry = retry + 1
 			_ = level.Info(n.logger).Log("msg", "FeishuNotifier: retry to send interactive notification to chatbot", "retry", retry)
 			time.Sleep(time.Second)
@@ -977,7 +1072,7 @@ func (n *Notifier) sendToChat(ctx context.Context, data *template.Data, content 
 
 		// 打印请求参数到日志
 		_ = level.Error(n.logger).Log("msg", "FeishuNotifier: chat message failed", "code", resp.Code, "msg", resp.Msg, "retry", retry, "chatID", chatID)
-		return false, utils.Errorf("%d, %s", resp.Code, resp.Msg)
+		return false, &utils.PlatformRejection{Code: resp.Code}
 	}
 
 	group := async.NewGroup(ctx)
@@ -994,6 +1089,10 @@ func (n *Notifier) sendToChat(ctx context.Context, data *template.Data, content 
 					_ = level.Error(n.logger).Log("msg", "FeishuNotifier: send notification to chat error", "error", err, "retry", retry, "chatID", id)
 				}
 				if needRetry {
+					if n.receiver.Frozen {
+						stopCh <- &utils.HTTPStatusError{Status: http.StatusTooManyRequests}
+						return
+					}
 					retry = retry + 1
 					_ = level.Info(n.logger).Log("msg", "FeishuNotifier: retry to send notification to chat", "retry", retry, "chatID", id)
 					time.Sleep(time.Second)
@@ -1104,7 +1203,7 @@ func (n *Notifier) sendToChatInteractive(ctx context.Context, data *template.Dat
 		}
 
 		_ = level.Error(n.logger).Log("msg", "FeishuNotifier: interactive chat message failed", "code", resp.Code, "msg", resp.Msg, "retry", retry, "chatID", chatID)
-		return false, utils.Errorf("%d, %s", resp.Code, resp.Msg)
+		return false, &utils.PlatformRejection{Code: resp.Code}
 	}
 
 	group := async.NewGroup(ctx)
@@ -1121,6 +1220,10 @@ func (n *Notifier) sendToChatInteractive(ctx context.Context, data *template.Dat
 					_ = level.Error(n.logger).Log("msg", "FeishuNotifier: send interactive notification to chat error", "error", err, "retry", retry, "chatID", id)
 				}
 				if needRetry {
+					if n.receiver.Frozen {
+						stopCh <- &utils.HTTPStatusError{Status: http.StatusTooManyRequests}
+						return
+					}
 					retry = retry + 1
 					_ = level.Info(n.logger).Log("msg", "FeishuNotifier: retry to send interactive notification to chat", "retry", retry, "chatID", id)
 					time.Sleep(time.Second)
@@ -1139,25 +1242,25 @@ func (n *Notifier) sendToChatInteractive(ctx context.Context, data *template.Dat
 
 func (n *Notifier) patchInteractiveCard(ctx context.Context, messageID string, card map[string]interface{}) error {
 	if n.receiver.Config == nil {
-		return utils.Error("FeishuNotifier: config is nil")
+		return &jevshadow.CardPatchError{Outcome: jevshadow.CardPatchKnownFailed, Err: utils.Error("FeishuNotifier: config is nil")}
 	}
 	accessToken, err := n.getToken(ctx, n.receiver)
 	if err != nil {
-		return err
+		return &jevshadow.CardPatchError{Outcome: jevshadow.CardPatchKnownFailed, Err: err}
 	}
 	if accessToken == "" {
-		return utils.Error("FeishuNotifier: tenant_access_token is empty")
+		return &jevshadow.CardPatchError{Outcome: jevshadow.CardPatchKnownFailed, Err: utils.Error("FeishuNotifier: tenant_access_token is empty")}
 	}
 	cardContent, err := json.Marshal(card)
 	if err != nil {
-		return err
+		return &jevshadow.CardPatchError{Outcome: jevshadow.CardPatchKnownFailed, Err: err}
 	}
 	body := struct {
 		Content string `json:"content"`
 	}{Content: string(cardContent)}
 	var buffer bytes.Buffer
 	if err := utils.JsonEncode(&buffer, body); err != nil {
-		return err
+		return &jevshadow.CardPatchError{Outcome: jevshadow.CardPatchKnownFailed, Err: err}
 	}
 	request, err := http.NewRequestWithContext(
 		ctx,
@@ -1166,20 +1269,87 @@ func (n *Notifier) patchInteractiveCard(ctx context.Context, messageID string, c
 		&buffer,
 	)
 	if err != nil {
-		return err
+		return &jevshadow.CardPatchError{Outcome: jevshadow.CardPatchKnownFailed, Err: err}
 	}
 	request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
 	request.Header.Set("Content-Type", "application/json; charset=utf-8")
-	responseBody, err := utils.DoHttpRequest(ctx, nil, request)
-	if err != nil && len(responseBody) == 0 {
-		return err
+	httpResponse, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return &jevshadow.CardPatchError{Outcome: jevshadow.CardPatchUnknown, Err: err}
+	}
+	defer httpResponse.Body.Close()
+	responseBody, readErr := io.ReadAll(io.LimitReader(httpResponse.Body, 1024*1024))
+	if readErr != nil {
+		return &jevshadow.CardPatchError{Outcome: jevshadow.CardPatchUnknown, Err: readErr}
+	}
+	if httpResponse.StatusCode != http.StatusOK {
+		outcome := jevshadow.CardPatchKnownFailed
+		if httpResponse.StatusCode == http.StatusAccepted || httpResponse.StatusCode == http.StatusRequestTimeout ||
+			httpResponse.StatusCode == http.StatusTooManyRequests || httpResponse.StatusCode >= http.StatusInternalServerError {
+			outcome = jevshadow.CardPatchUnknown
+		}
+		return &jevshadow.CardPatchError{
+			Outcome: outcome,
+			Err:     utils.Errorf("Feishu card update returned HTTP %d", httpResponse.StatusCode),
+		}
 	}
 	var response Response
 	if err := utils.JsonUnmarshal(responseBody, &response); err != nil {
-		return err
+		return &jevshadow.CardPatchError{Outcome: jevshadow.CardPatchUnknown, Err: err}
 	}
 	if response.Code != 0 {
-		return utils.Errorf("Feishu card update failed: %d, %s", response.Code, response.Msg)
+		return &jevshadow.CardPatchError{
+			Outcome: jevshadow.CardPatchKnownFailed,
+			Err:     utils.Errorf("Feishu card update failed: %d, %s", response.Code, response.Msg),
+		}
 	}
 	return nil
+}
+
+// StaticCardPatcher uses only the executor's injected application credential.
+// It creates no Kubernetes client, CR watcher, original sender or callback writer.
+func StaticCardPatcher(logger log.Logger, appID, appSecret string) (jevshadow.CardPatcher, error) {
+	if err := ValidateJevFeedbackApp(appID, appSecret); err != nil {
+		return nil, err
+	}
+	n := &Notifier{logger: logger, notifierCtl: &controller.Controller{},
+		receiver: &feishu.Receiver{Config: &feishu.Config{
+			AppID:     &v2beta2.Credential{Value: appID},
+			AppSecret: &v2beta2.Credential{Value: appSecret}}},
+		ats: notifier.GetAccessTokenService(), tokenExpires: DefaultExpires}
+	return n.patchInteractiveCard, nil
+}
+
+// RenderForDurable freezes the original template before intake is acknowledged.
+func (n *Notifier) RenderForDurable(data *template.Data) (string, error) {
+	if data.FrozenContent != nil {
+		return *data.FrozenContent, nil
+	}
+	if n.tmpl == nil {
+		return "", utils.Error("frozen notification has no rendered content")
+	}
+	content, err := n.tmpl.Text(n.receiver.TmplName, data)
+	if err != nil {
+		return "", err
+	}
+	if n.receiver.TmplType == constants.Interactive {
+		card := map[string]interface{}{}
+		if err := json.Unmarshal(sanitizeJSONControlChars([]byte(content)), &card); err != nil {
+			return "", err
+		}
+		setCardUpdateMulti(card)
+		raw, err := json.Marshal(card)
+		if err != nil {
+			return "", err
+		}
+		return string(raw), nil
+	}
+	return content, nil
+}
+
+func (n *Notifier) ConfigureFrozen(opts *v2beta2.Options) {
+	n.timeout = DefaultSendTimeout
+	if opts != nil && opts.Feishu != nil && opts.Feishu.NotificationTimeout != nil {
+		n.timeout = time.Duration(*opts.Feishu.NotificationTimeout) * time.Second
+	}
 }

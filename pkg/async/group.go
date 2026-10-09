@@ -2,10 +2,7 @@ package async
 
 import (
 	"context"
-	"fmt"
-	"strings"
-
-	"github.com/kubesphere/notification-manager/pkg/utils"
+	"errors"
 )
 
 // Group has several workers, and the group can execute these workers concurrently,
@@ -45,7 +42,7 @@ func (g *Group) Wait() error {
 	for {
 		select {
 		case <-g.ctx.Done():
-			return utils.Error("timeout")
+			return g.ctx.Err()
 		case val := <-g.stopCh:
 			switch val.(type) {
 			case error:
@@ -61,11 +58,7 @@ func (g *Group) Wait() error {
 					return nil
 				}
 
-				s := ""
-				for _, err := range errs {
-					s = fmt.Sprintf("%s%s,", s, err.Error())
-				}
-				return utils.Error(strings.TrimSuffix(s, ","))
+				return errors.Join(errs...)
 			}
 		}
 	}
