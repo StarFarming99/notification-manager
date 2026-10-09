@@ -53,9 +53,13 @@ var (
 )
 
 type Controller struct {
-	logger log.Logger
-	ctx    context.Context
-	cache  cache.Cache
+	staticRouters  []v2beta2.Router
+	staticSilences []v2beta2.Silence
+	staticIsolated bool
+	staticCluster  string
+	logger         log.Logger
+	ctx            context.Context
+	cache          cache.Cache
 	// Default config selector
 	defaultConfigSelector *metav1.LabelSelector
 	// Label key used to distinguish different user
@@ -109,6 +113,12 @@ func (c *Controller) GetJevShadow() *jevshadow.Service {
 }
 
 func New(ctx context.Context, logger log.Logger) (*Controller, error) {
+	if os.Getenv("NM_CONFIG_MODE") == "static-isolated" {
+		return staticFromFile(ctx, logger)
+	}
+	if mode := os.Getenv("NM_CONFIG_MODE"); mode != "" && mode != "dynamic-cr" {
+		return nil, fmt.Errorf("unknown NM_CONFIG_MODE")
+	}
 	scheme := runtime.NewScheme()
 	_ = v2beta2.AddToScheme(scheme)
 	_ = v1.AddToScheme(scheme)
@@ -164,6 +174,9 @@ func (c *Controller) Run() error {
 			}
 		}
 	}(c.ctx)
+	if c.staticIsolated {
+		return nil
+	}
 	go func() {
 		_ = c.cache.Start(c.ctx)
 	}()
@@ -597,7 +610,7 @@ func (c *Controller) RcvsFromNs(cluster string, namespace *string) []internal.Re
 
 	// Global receiver should receive all notifications.
 	tenants := []string{globalTenantID}
-	if namespace != nil && len(*namespace) > 0 {
+	if !c.staticIsolated && namespace != nil && len(*namespace) > 0 {
 		// Get all tenants which need to receive the notifications in this namespace.
 		tenantIDs, err := c.tenantIDFromNs(cluster, *namespace)
 		if err != nil {
@@ -869,6 +882,9 @@ func (c *Controller) GetCredential(credential *v2beta2.Credential) (string, erro
 		return credential.Value, nil
 	}
 
+	if c.staticIsolated {
+		return "", utils.Error("cluster credentials are forbidden in static-isolated mode")
+	}
 	if credential.ValueFrom != nil {
 		if credential.ValueFrom.SecretKeyRef != nil {
 			ns := credential.ValueFrom.SecretKeyRef.Namespace
@@ -969,6 +985,9 @@ func (c *Controller) GetBatchMaxWait() time.Duration {
 }
 
 func (c *Controller) GetActiveSilences(ctx context.Context, tenant string) ([]v2beta2.Silence, error) {
+	if c.staticIsolated {
+		return c.staticSilences, nil
+	}
 
 	var selector *metav1.LabelSelector
 	// Get global silence.
@@ -996,6 +1015,9 @@ func (c *Controller) GetActiveSilences(ctx context.Context, tenant string) ([]v2
 }
 
 func (c *Controller) GetActiveRouters(ctx context.Context) ([]v2beta2.Router, error) {
+	if c.staticIsolated {
+		return c.staticRouters, nil
+	}
 
 	list := &v2beta2.RouterList{}
 	if err := c.cache.List(ctx, list); err != nil {
@@ -1028,6 +1050,9 @@ func (c *Controller) GetConfigmap(configmaps ...*v2beta2.ConfigmapKeySelector) (
 			continue
 		}
 
+		if c.staticIsolated {
+			return nil, utils.Error("cluster configmaps are forbidden in static-isolated mode")
+		}
 		ns := configmap.Namespace
 		if len(ns) == 0 {
 			ns = c.namespace
@@ -1134,6 +1159,9 @@ type multiCluster struct {
 // from the configmap kubesphere-config.
 // Otherwise, the default cluster name "default" will be returned.
 func (c *Controller) GetCluster() string {
+	if c.staticIsolated {
+		return c.staticCluster
+	}
 	if c.ReceiverOpts != nil && c.ReceiverOpts.Global != nil && !utils.StringIsNil(c.ReceiverOpts.Global.Cluster) {
 		return c.ReceiverOpts.Global.Cluster
 	}

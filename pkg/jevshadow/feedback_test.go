@@ -1,0 +1,92 @@
+package jevshadow
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
+
+func TestRelayCardFeedbackUsesVerifiedCallbackIdentity(t *testing.T) {
+	var received map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/feedback" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("unexpected authorization %q", got)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"id":"feedback-1","duplicate":false}`))
+	}))
+	defer server.Close()
+
+	service := &Service{
+		config: Config{
+			Enabled:              true,
+			FeedbackEnabled:      true,
+			ReceiptURL:           server.URL + "/v1/delivery-receipts",
+			Token:                "test-token",
+			ReceiverAllowlist:    map[string]struct{}{"jev-shadow-uat-receiver": {}},
+			DestinationAllowlist: map[string]struct{}{"oc_uat": {}},
+			ExpiresAt:            time.Now().Add(time.Hour),
+		},
+		client: server.Client(),
+	}
+	result, err := service.RelayCardFeedback(context.Background(), CardFeedback{
+		SourceEventID:   "event-1",
+		ActorID:         "ou_operator",
+		ChatID:          "oc_uat",
+		MessageID:       "om_message",
+		ActionReference: "signed-action-reference",
+		CorrectLabel:    "accurate",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ID != "feedback-1" || result.Duplicate {
+		t.Fatalf("unexpected result %#v", result)
+	}
+	for key, want := range map[string]interface{}{
+		"source_event_id": "event-1",
+		"actor_id":        "ou_operator",
+		"chat_id":         "oc_uat",
+		"message_id":      "om_message",
+		"dimension":       "overall",
+		"correct_label":   "accurate",
+	} {
+		if got := received[key]; got != want {
+			t.Fatalf("%s=%#v, want %#v", key, got, want)
+		}
+	}
+}
+
+func TestRelayCardFeedbackRejectsUntrustedValues(t *testing.T) {
+	service := &Service{
+		config: Config{
+			Enabled:              true,
+			FeedbackEnabled:      true,
+			ReceiptURL:           "http://example.invalid/v1/delivery-receipts",
+			Token:                "test-token",
+			ReceiverAllowlist:    map[string]struct{}{"receiver": {}},
+			DestinationAllowlist: map[string]struct{}{"oc_uat": {}},
+			ExpiresAt:            time.Now().Add(time.Hour),
+		},
+		client: http.DefaultClient,
+	}
+	for name, feedback := range map[string]CardFeedback{
+		"wrong chat":  {SourceEventID: "event", ActorID: "ou", ChatID: "oc_other", MessageID: "om", ActionReference: "signed", CorrectLabel: "accurate"},
+		"wrong label": {SourceEventID: "event", ActorID: "ou", ChatID: "oc_uat", MessageID: "om", ActionReference: "signed", CorrectLabel: "oncall"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := service.RelayCardFeedback(context.Background(), feedback); err == nil {
+				t.Fatal("expected rejection")
+			}
+		})
+	}
+}

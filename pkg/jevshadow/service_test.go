@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -109,6 +110,7 @@ func TestReceiptAndAnnotationAreFailOpenAndIdempotent(t *testing.T) {
 	defer receiptServer.Close()
 
 	config := testConfig(receiptServer.URL)
+	config.ReceiptOutboxDir = t.TempDir()
 	service, err := New(log.NewNopLogger(), config, receiptServer.Client())
 	if err != nil {
 		t.Fatal(err)
@@ -212,6 +214,7 @@ func TestDisabledConfigIsBackwardCompatible(t *testing.T) {
 
 func TestRenderCompactClassificationWithFeedbackButtons(t *testing.T) {
 	actionReference := "signed-action-reference"
+	detailURL := "https://aiops.example.com/apps/alert-center/traces/J-1"
 	card, err := renderCard(
 		map[string]interface{}{"elements": []interface{}{}},
 		map[string]AnnotationComponent{
@@ -227,8 +230,12 @@ func TestRenderCompactClassificationWithFeedbackButtons(t *testing.T) {
 				RepeatCount:          3,
 				SameKindCount:        1,
 				Recommendation:       "重复告警｜第 3 次｜进入告警池",
-				Footer:               "影子模式：未实际改变告警路由",
-				ActionReference:      &actionReference,
+				EvidenceLines: []string{
+					"重复概率：**同次重复通知 90%**｜新问题 7%｜不确定 2%｜同问题复发 1%",
+				},
+				Footer:          "影子模式：未实际改变告警路由",
+				ActionReference: &actionReference,
+				DetailURL:       &detailURL,
 			},
 		},
 	)
@@ -236,8 +243,18 @@ func TestRenderCompactClassificationWithFeedbackButtons(t *testing.T) {
 		t.Fatal(err)
 	}
 	elements := card["elements"].([]interface{})
-	if len(elements) != 3 {
-		t.Fatalf("expected divider, summary and feedback actions, got %#v", elements)
+	if len(elements) != 4 {
+		t.Fatalf("expected divider, summary, feedback and detail actions, got %#v", elements)
+	}
+	summary := elements[1].(map[string]interface{})["text"].(map[string]interface{})["content"].(string)
+	for _, expected := range []string{
+		"Jev 告警分类（Shadow）",
+		"结论：重复告警｜第 3 次｜进入告警池",
+		"重复概率：**同次重复通知 90%**｜新问题 7%",
+	} {
+		if !strings.Contains(summary, expected) {
+			t.Fatalf("missing %q in compact summary: %s", expected, summary)
+		}
 	}
 	actions := elements[2].(map[string]interface{})["actions"].([]interface{})
 	if len(actions) != 2 {
@@ -247,6 +264,605 @@ func TestRenderCompactClassificationWithFeedbackButtons(t *testing.T) {
 	if value["action"] != "jev_feedback" || value["correct_label"] != "accurate" {
 		t.Fatalf("unexpected feedback value: %#v", value)
 	}
+	detail := elements[3].(map[string]interface{})["actions"].([]interface{})[0].(map[string]interface{})
+	if detail["url"] != detailURL {
+		t.Fatalf("unexpected detail URL: %#v", detail)
+	}
+	if detail["text"].(map[string]interface{})["content"] != "查看判断详情" {
+		t.Fatalf("unexpected detail label: %#v", detail)
+	}
+}
+
+func TestRenderV2PoolClassificationExactlyAtCardBottom(t *testing.T) {
+	component := validV2Component()
+	card, err := renderCard(
+		map[string]interface{}{
+			"header": map[string]interface{}{"title": "original title"},
+			"elements": []interface{}{
+				map[string]interface{}{"tag": "action", "name": "original actions"},
+			},
+		},
+		map[string]AnnotationComponent{"event-1": component},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if card["header"].(map[string]interface{})["title"] != "original title" {
+		t.Fatalf("original header changed: %#v", card)
+	}
+	elements := card["elements"].([]interface{})
+	if len(elements) != 5 || elements[0].(map[string]interface{})["name"] != "original actions" {
+		t.Fatalf("v2 annotation did not append after the original elements: %#v", elements)
+	}
+	summary := elements[2].(map[string]interface{})["text"].(map[string]interface{})["content"].(string)
+	want := "**Pool 92%** · Oncall 8%\n" +
+		"**Recurring**\n" +
+		"Recurring 80% · Same incident 12%\n" +
+		"Non-urgent 6% · Unclear 2%"
+	if summary != want {
+		t.Fatalf("unexpected v2 pool summary:\n%s\nwant:\n%s", summary, want)
+	}
+	actions := elements[3].(map[string]interface{})["actions"].([]interface{})
+	if got := actions[0].(map[string]interface{})["value"].(map[string]interface{})["action_reference"]; got != *component.ActionReference {
+		t.Fatalf("feedback reference changed: %#v", got)
+	}
+	detail := elements[4].(map[string]interface{})["actions"].([]interface{})[0].(map[string]interface{})
+	if detail["url"] != *component.TraceURL {
+		t.Fatalf("unexpected trace URL: %#v", detail)
+	}
+}
+
+func TestRenderV2OncallHidesHypotheticalPoolReason(t *testing.T) {
+	component := validV2Component()
+	component.Routing = &ChoiceAnswer{
+		Choice:        "oncall",
+		Probabilities: map[string]float64{"pool": 0.07, "oncall": 0.93},
+	}
+	component.PolicyProposal = "oncall"
+	component.PolicyReasonCode = "routing_oncall"
+
+	want := "**Oncall 93%** · Pool 7%"
+	if got := component.markdown(); got != want {
+		t.Fatalf("unexpected v2 oncall summary: %q, want %q", got, want)
+	}
+}
+
+func TestRenderV2PolicyOverrideReason(t *testing.T) {
+	tests := []struct {
+		name       string
+		reasonCode string
+		threshold  *float64
+		wantLine   string
+	}{
+		{
+			name:       "threshold",
+			reasonCode: "pool_probability_below_threshold",
+			threshold:  floatPointer(0.95),
+			wantLine:   "Policy: Oncall · Pool threshold 95%",
+		},
+		{
+			name:       "first notification",
+			reasonCode: "first_notification_unconfirmed",
+			wantLine:   "Policy: Oncall · First notification unconfirmed",
+		},
+		{
+			name:       "routing tie",
+			reasonCode: "routing_tie",
+			wantLine:   "Policy: Oncall · Routing tie",
+		},
+		{
+			name:       "model selected oncall",
+			reasonCode: "model_selected_oncall",
+			wantLine:   "Policy: Oncall · Model selected Oncall",
+		},
+		{
+			name:       "pool reason unclear",
+			reasonCode: "pool_reason_unclear",
+			wantLine:   "Policy: Oncall · Pool reason unclear",
+		},
+		{
+			name:       "pool reason tie",
+			reasonCode: "pool_reason_tie",
+			wantLine:   "Policy: Oncall · Pool reason tie",
+		},
+		{
+			name:       "critical evidence missing",
+			reasonCode: "critical_evidence_missing",
+			wantLine:   "Policy: Oncall · Critical evidence missing",
+		},
+		{
+			name:       "material risk present",
+			reasonCode: "material_risk_present",
+			wantLine:   "Policy: Oncall · Material risk present",
+		},
+		{
+			name:       "recurring episode unverified",
+			reasonCode: "recurring_episode_unverified",
+			wantLine:   "Policy: Oncall · Recurring episode unverified",
+		},
+		{
+			name:       "incident binding unconfirmed",
+			reasonCode: "incident_binding_unconfirmed",
+			wantLine:   "Policy: Oncall · Incident binding unconfirmed",
+		},
+		{
+			name:       "safe unknown-code fallback",
+			reasonCode: "future_policy_reason",
+			wantLine:   "Policy: Oncall",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			component := validV2Component()
+			component.PolicyProposal = "oncall"
+			component.PolicyReasonCode = test.reasonCode
+			component.PoolMinProbability = test.threshold
+			if err := component.validate(); err != nil {
+				t.Fatalf("valid policy override rejected: %v", err)
+			}
+			lines := strings.Split(component.markdown(), "\n")
+			if got := lines[len(lines)-1]; got != test.wantLine {
+				t.Fatalf("unexpected policy line %q, want %q", got, test.wantLine)
+			}
+		})
+	}
+}
+
+func TestRenderV2ExceptionalStatusWithoutFabricatedProbabilities(t *testing.T) {
+	tests := []struct {
+		reason string
+		want   string
+	}{
+		{reason: "protected_scope", want: "Protected · Original routing retained"},
+		{reason: "invalid_response", want: "Jev unavailable · Original routing retained"},
+	}
+	for _, test := range tests {
+		t.Run(test.reason, func(t *testing.T) {
+			component := validV2Component()
+			component.JudgmentID = ""
+			component.Routing = nil
+			component.PoolReason = nil
+			component.PolicyProposal = "original"
+			component.PolicyReasonCode = test.reason
+			component.TraceURL = nil
+			if err := component.validate(); err != nil {
+				t.Fatalf("valid exceptional component rejected: %v", err)
+			}
+			encoded, err := json.Marshal(component)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := decodeAnnotation(bytes.NewReader(encoded))
+			if err != nil {
+				t.Fatalf("strict decoder rejected explicit null exceptional answers: %v", err)
+			}
+			if got := decoded.markdown(); got != test.want || strings.Contains(got, "%") {
+				t.Fatalf("unexpected exceptional summary: %q", got)
+			}
+		})
+	}
+}
+
+func TestPolicyFactsV1AcceptsLowThresholdPoolWithoutChangingModelProbabilities(t *testing.T) {
+	component := validPolicyFactsV1Component()
+	component.Routing = &ChoiceAnswer{
+		Choice:        "oncall",
+		Probabilities: map[string]float64{"pool": 0.20, "oncall": 0.80},
+	}
+	component.PolicyProposal = "pool"
+	component.PolicyReasonCode = "threshold_met"
+	component.PoolMinProbability = floatPointer(0.20)
+	if err := component.validate(); err != nil {
+		t.Fatalf("valid low-threshold Pool policy rejected: %v", err)
+	}
+	markdown := component.markdown()
+	if !strings.Contains(markdown, "**Oncall 80%** · Pool 20%") ||
+		!strings.Contains(markdown, "Policy: Pool · Pool threshold 20%") ||
+		!strings.Contains(markdown, "**Non-urgent**") {
+		t.Fatalf("policy facts were not rendered without altering probabilities:\n%s", markdown)
+	}
+}
+
+func TestPolicyFactsV1AlwaysShowsOperatorRuleWithOrWithoutModel(t *testing.T) {
+	withModel := validPolicyFactsV1Component()
+	withModel.DecisionSource = "operator_rule"
+	withModel.PolicyReasonCode = "manual_override"
+	withModel.PoolMinProbability = nil
+	withModel.ThresholdApplied = boolPointer(false)
+	withModel.ThresholdSource = "not_applicable"
+	if err := withModel.validate(); err != nil {
+		t.Fatalf("operator rule with model result rejected: %v", err)
+	}
+	if got := withModel.markdown(); !strings.Contains(got, "Policy: Pool · Operator rule") {
+		t.Fatalf("operator rule was hidden when model agreed: %s", got)
+	}
+
+	unavailable := withModel
+	unavailable.Routing = nil
+	unavailable.PoolReason = nil
+	unavailable.ModelStatus = "unavailable"
+	unavailable.ModelErrorCode = "minimum_state_budget_exceeded"
+	if err := unavailable.validate(); err != nil {
+		t.Fatalf("operator rule with unavailable model rejected: %v", err)
+	}
+	want := "Jev unavailable · Context budget exceeded\nPolicy: Pool · Operator rule"
+	if got := unavailable.markdown(); got != want {
+		t.Fatalf("unexpected unavailable operator card: %q, want %q", got, want)
+	}
+}
+
+func TestDecodeAnnotationIsStrictPerSchema(t *testing.T) {
+	component := validV2Component()
+	wire := annotationComponentV2{
+		SchemaVersion:        component.SchemaVersion,
+		JudgmentID:           component.JudgmentID,
+		MemberEventIDs:       component.MemberEventIDs,
+		AnnotationRevision:   component.AnnotationRevision,
+		ExpectedBaseRevision: component.ExpectedBaseRevision,
+		Routing:              component.Routing,
+		PoolReason:           component.PoolReason,
+		PolicyProposal:       component.PolicyProposal,
+		PolicyReasonCode:     component.PolicyReasonCode,
+		ExecutionMode:        component.ExecutionMode,
+		TraceURL:             component.TraceURL,
+		ActionReference:      component.ActionReference,
+	}
+	encoded, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeAnnotation(bytes.NewReader(encoded)); err != nil {
+		t.Fatalf("valid v2 component rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(map[string]interface{})
+	}{
+		{
+			name: "v1 field in v2",
+			mutate: func(payload map[string]interface{}) {
+				payload["recommendation"] = "must be rejected"
+			},
+		},
+		{
+			name: "unknown nested field",
+			mutate: func(payload map[string]interface{}) {
+				payload["routing"].(map[string]interface{})["confidence"] = 0.99
+			},
+		},
+		{
+			name: "missing required field",
+			mutate: func(payload map[string]interface{}) {
+				delete(payload, "policy_reason_code")
+			},
+		},
+		{
+			name: "incomplete fixed options",
+			mutate: func(payload map[string]interface{}) {
+				delete(payload["routing"].(map[string]interface{})["probabilities"].(map[string]interface{}), "oncall")
+			},
+		},
+		{
+			name: "invalid probability sum",
+			mutate: func(payload map[string]interface{}) {
+				probabilities := payload["routing"].(map[string]interface{})["probabilities"].(map[string]interface{})
+				probabilities["pool"] = 0.70
+				probabilities["oncall"] = 0.10
+			},
+		},
+		{
+			name: "choice is not a highest-probability option",
+			mutate: func(payload map[string]interface{}) {
+				probabilities := payload["routing"].(map[string]interface{})["probabilities"].(map[string]interface{})
+				probabilities["pool"] = 0.40
+				probabilities["oncall"] = 0.60
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var payload map[string]interface{}
+			if err := json.Unmarshal(encoded, &payload); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(payload)
+			invalid, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := decodeAnnotation(bytes.NewReader(invalid)); err == nil {
+				t.Fatal("invalid cross-schema or incomplete payload was accepted")
+			}
+		})
+	}
+
+	v1 := AnnotationComponent{
+		SchemaVersion:        "1",
+		AnnotationRevision:   1,
+		ExpectedBaseRevision: 1,
+		JudgmentRefs:         []string{"J-1"},
+		MemberEventIDs:       []string{"event-1"},
+		Title:                "Jev",
+		Category:             "repeat",
+		Route:                "pool",
+		RepeatCount:          2,
+		SameKindCount:        1,
+		Recommendation:       "legacy",
+		EvidenceLines:        []string{"legacy evidence"},
+		Footer:               "shadow",
+	}
+	v1Encoded, err := json.Marshal(v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v1Payload map[string]interface{}
+	if err := json.Unmarshal(v1Encoded, &v1Payload); err != nil {
+		t.Fatal(err)
+	}
+	v1Payload["judgment_id"] = "v2-field"
+	v1Encoded, err = json.Marshal(v1Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeAnnotation(bytes.NewReader(v1Encoded)); err == nil {
+		t.Fatal("v1 payload with a v2-only field was accepted")
+	}
+}
+
+func TestDecodeAnnotationPreservesBoundedRoundingWithoutNormalization(t *testing.T) {
+	component := validV2Component()
+	component.Routing.Probabilities = map[string]float64{"pool": 0.93, "oncall": 0.08}
+	component.PoolReason.Probabilities = map[string]float64{
+		"recurring": 0.79, "same_incident": 0.12, "non_urgent": 0.06, "unclear": 0.02,
+	}
+	wire := annotationComponentV2{
+		SchemaVersion:        component.SchemaVersion,
+		JudgmentID:           component.JudgmentID,
+		MemberEventIDs:       component.MemberEventIDs,
+		AnnotationRevision:   component.AnnotationRevision,
+		ExpectedBaseRevision: component.ExpectedBaseRevision,
+		Routing:              component.Routing,
+		PoolReason:           component.PoolReason,
+		PolicyProposal:       component.PolicyProposal,
+		PolicyReasonCode:     component.PolicyReasonCode,
+		ExecutionMode:        component.ExecutionMode,
+		TraceURL:             component.TraceURL,
+	}
+	encoded, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := decodeAnnotation(bytes.NewReader(encoded))
+	if err != nil {
+		t.Fatalf("bounded two-decimal rounding was rejected: %v", err)
+	}
+	if decoded.Routing.Probabilities["pool"] != 0.93 || decoded.Routing.Probabilities["oncall"] != 0.08 {
+		t.Fatalf("probabilities were normalized: %#v", decoded.Routing.Probabilities)
+	}
+}
+
+func TestV2UpdateStablyReplacesSameMemberComponent(t *testing.T) {
+	var patchedCards []map[string]interface{}
+	service := &Service{
+		cards: map[string]*cardBinding{
+			"om-v2": {
+				baseCard: map[string]interface{}{
+					"elements": []interface{}{map[string]interface{}{"tag": "div", "original": true}},
+				},
+				baseRevision: 1,
+				annotations:  make(map[string]AnnotationComponent),
+				appliedKeys:  make(map[string]appliedRequest),
+				patcher: func(_ context.Context, _ string, card map[string]interface{}) error {
+					patchedCards = append(patchedCards, card)
+					return nil
+				},
+			},
+		},
+	}
+	first := validV2Component()
+	first.MemberEventIDs = []string{"event-b", "event-a"}
+	if _, err := service.applyAnnotation(context.Background(), "om-v2", "idem-v2-first", first); err != nil {
+		t.Fatal(err)
+	}
+	second := validV2Component()
+	second.MemberEventIDs = []string{"event-a", "event-b"}
+	second.AnnotationRevision = 2
+	second.Routing = &ChoiceAnswer{
+		Choice:        "pool",
+		Probabilities: map[string]float64{"pool": 0.96, "oncall": 0.04},
+	}
+	if _, err := service.applyAnnotation(context.Background(), "om-v2", "idem-v2-second", second); err != nil {
+		t.Fatal(err)
+	}
+	if len(patchedCards) != 2 {
+		t.Fatalf("expected two revisions to patch twice, got %d", len(patchedCards))
+	}
+	elements := patchedCards[1]["elements"].([]interface{})
+	if len(elements) != 5 {
+		t.Fatalf("same member set appended a second component: %#v", elements)
+	}
+	summary := elements[2].(map[string]interface{})["text"].(map[string]interface{})["content"].(string)
+	if !strings.Contains(summary, "Pool 96%") || strings.Contains(summary, "Pool 92%") {
+		t.Fatalf("latest component did not replace the prior revision: %s", summary)
+	}
+}
+
+func TestAnnotationRevisionGapIsRetryableAndDoesNotSkip(t *testing.T) {
+	var patchCalls atomic.Int32
+	service := &Service{
+		config: Config{Enabled: true, Token: "test-token"},
+		cards: map[string]*cardBinding{
+			"om-v2": {
+				baseCard: map[string]interface{}{
+					"elements": []interface{}{map[string]interface{}{"tag": "div", "original": true}},
+				},
+				baseRevision: 1,
+				annotations:  make(map[string]AnnotationComponent),
+				appliedKeys:  make(map[string]appliedRequest),
+				patcher: func(_ context.Context, _ string, _ map[string]interface{}) error {
+					patchCalls.Add(1)
+					return nil
+				},
+			},
+		},
+	}
+	request := func(component AnnotationComponent, idempotencyKey string) *httptest.ResponseRecorder {
+		body, err := json.Marshal(component)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(
+			http.MethodPut,
+			"/internal/jev/annotations/om-v2",
+			bytes.NewReader(body),
+		)
+		req.Header.Set("Authorization", "Bearer test-token")
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+		response := httptest.NewRecorder()
+		service.HandleAnnotation(response, req, "om-v2")
+		return response
+	}
+
+	first := validV2Component()
+	if response := request(first, "revision-1"); response.Code != http.StatusOK {
+		t.Fatalf("revision 1 failed: %d %s", response.Code, response.Body.String())
+	}
+
+	third := validV2Component()
+	third.AnnotationRevision = 3
+	response := request(third, "revision-3")
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("revision gap returned %d, want 429: %s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("Retry-After") != "1" {
+		t.Fatalf("revision gap did not advertise an immediate retry: %#v", response.Header())
+	}
+	var conflict struct {
+		Retryable                  bool `json:"retryable"`
+		ExpectedAnnotationRevision int  `json:"expected_annotation_revision"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &conflict); err != nil {
+		t.Fatal(err)
+	}
+	if !conflict.Retryable || conflict.ExpectedAnnotationRevision != 2 {
+		t.Fatalf("unexpected revision conflict response: %+v", conflict)
+	}
+	if got := patchCalls.Load(); got != 1 {
+		t.Fatalf("out-of-order revision patched the card %d times", got)
+	}
+
+	second := validV2Component()
+	second.AnnotationRevision = 2
+	if response := request(second, "revision-2"); response.Code != http.StatusOK {
+		t.Fatalf("revision 2 failed after rejected revision 3: %d %s", response.Code, response.Body.String())
+	}
+	if got := patchCalls.Load(); got != 2 {
+		t.Fatalf("expected revisions 1 and 2 to patch exactly twice, got %d", got)
+	}
+}
+
+func TestRenderV2GroupAttributesDifferentJudgmentsToRedactedMembers(t *testing.T) {
+	pool := validV2Component()
+	pool.MemberEventIDs = []string{"event-sensitive-alpha"}
+	oncall := validV2Component()
+	oncall.MemberEventIDs = []string{"event-sensitive-beta"}
+	oncall.Routing = &ChoiceAnswer{
+		Choice:        "oncall",
+		Probabilities: map[string]float64{"pool": 0.09, "oncall": 0.91},
+	}
+	oncall.PolicyProposal = "oncall"
+	oncall.PolicyReasonCode = "routing_oncall"
+
+	card, err := renderCard(
+		map[string]interface{}{"elements": []interface{}{}},
+		map[string]AnnotationComponent{"a-pool": pool, "b-oncall": oncall},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elements := card["elements"].([]interface{})
+	poolSummary := elements[1].(map[string]interface{})["text"].(map[string]interface{})["content"].(string)
+	oncallSummary := elements[5].(map[string]interface{})["text"].(map[string]interface{})["content"].(string)
+	if !strings.Contains(poolSummary, "Member: m-5f3c41c5eb85") ||
+		!strings.Contains(poolSummary, "**Pool 92%**") {
+		t.Fatalf("pool judgment lost its member attribution: %s", poolSummary)
+	}
+	if !strings.Contains(oncallSummary, "Member: m-f71a3243ce0f") ||
+		!strings.Contains(oncallSummary, "**Oncall 91%**") {
+		t.Fatalf("oncall judgment lost its member attribution: %s", oncallSummary)
+	}
+	for _, summary := range []string{poolSummary, oncallSummary} {
+		if strings.Contains(summary, "event-sensitive-alpha") ||
+			strings.Contains(summary, "event-sensitive-beta") {
+			t.Fatalf("raw member identifier leaked into card text: %s", summary)
+		}
+	}
+}
+
+func TestV2MemberAttributionIsBounded(t *testing.T) {
+	component := validV2Component()
+	component.MemberEventIDs = []string{"event-a", "event-b", "event-c", "event-d"}
+	want := "Members: m-acbf3e162e0d · m-d4fd80fd2778 · m-38dbf366343b · +1 more"
+	if got := component.memberScopeLine(); got != want {
+		t.Fatalf("unexpected bounded member attribution: %q, want %q", got, want)
+	}
+}
+
+func validV2Component() AnnotationComponent {
+	return AnnotationComponent{
+		SchemaVersion:        "2",
+		JudgmentID:           "J-v2-1",
+		MemberEventIDs:       []string{"event-1"},
+		AnnotationRevision:   1,
+		ExpectedBaseRevision: 1,
+		Routing: &ChoiceAnswer{
+			Choice:        "pool",
+			Probabilities: map[string]float64{"pool": 0.92, "oncall": 0.08},
+		},
+		PoolReason: &ChoiceAnswer{
+			Choice: "recurring",
+			Probabilities: map[string]float64{
+				"recurring": 0.80, "same_incident": 0.12, "non_urgent": 0.06, "unclear": 0.02,
+			},
+		},
+		PolicyProposal:   "pool",
+		PolicyReasonCode: "pool_allowed",
+		ExecutionMode:    "shadow",
+		TraceURL:         stringPointer("https://aiops.example.com/apps/alert-center/traces/J-v2-1"),
+		ActionReference:  stringPointer("signed-action-reference"),
+	}
+}
+
+func validPolicyFactsV1Component() AnnotationComponent {
+	component := validV2Component()
+	component.Capability = "policy-facts-v1"
+	component.DecisionSource = "model_policy"
+	component.PolicyReasonCode = "threshold_met"
+	component.PoolMinProbability = floatPointer(0.90)
+	component.ThresholdApplied = boolPointer(true)
+	component.ThresholdSource = "override"
+	component.ModelStatus = "available"
+	component.ContextReduced = boolPointer(false)
+	component.PoolReason = &ChoiceAnswer{
+		Choice: "non_urgent",
+		Probabilities: map[string]float64{
+			"recurring": 0.05, "same_incident": 0.05, "non_urgent": 0.85, "unclear": 0.05,
+		},
+	}
+	return component
+}
+
+func stringPointer(value string) *string {
+	return &value
+}
+
+func floatPointer(value float64) *float64 {
+	return &value
+}
+
+func boolPointer(value bool) *bool {
+	return &value
 }
 
 func testConfig(receiptURL string) Config {
@@ -263,7 +879,6 @@ func testConfig(receiptURL string) Config {
 		ObservationReceiver:  "jev-shadow-uat",
 		SenderApp:            "infra-alerts",
 		ExpiresAt:            time.Now().Add(time.Hour),
-		ReceiptQueueSize:     8,
 		MaxCards:             8,
 	}
 }

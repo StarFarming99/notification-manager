@@ -2,46 +2,57 @@ package jevshadow
 
 import (
 	"bytes"
-	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/go-kit/kit/log/level"
 	"github.com/kubesphere/notification-manager/pkg/template"
 )
 
 type deliveryReceipt struct {
-	SchemaVersion        string          `json:"schema_version"`
-	LogicalSource        string          `json:"logical_source"`
-	Environment          string          `json:"environment"`
-	SourceRegion         string          `json:"source_region"`
-	PermissionDomain     string          `json:"permission_domain"`
-	Receiver             string          `json:"receiver"`
-	DeliveryID           string          `json:"delivery_id"`
-	Destination          string          `json:"destination"`
-	SenderApp            string          `json:"sender_app"`
-	MessageID            string          `json:"message_id"`
-	SendState            string          `json:"send_state"`
-	SentAt               time.Time       `json:"sent_at"`
-	BaseCardRevision     int             `json:"base_card_revision"`
-	BaseCardSnapshotHash string          `json:"base_card_snapshot_hash"`
-	Members              []receiptMember `json:"members"`
+	CardOwnerID          string           `json:"card_owner_id,omitempty"`
+	ExecutionDomain      string           `json:"execution_domain,omitempty"`
+	SchemaVersion        string           `json:"schema_version"`
+	LogicalSource        string           `json:"logical_source"`
+	Environment          string           `json:"environment"`
+	SourceRegion         string           `json:"source_region"`
+	PermissionDomain     string           `json:"permission_domain"`
+	Receiver             string           `json:"receiver"`
+	DeliveryID           string           `json:"delivery_id"`
+	Destination          string           `json:"destination"`
+	SenderApp            string           `json:"sender_app"`
+	MessageID            string           `json:"message_id"`
+	SendState            string           `json:"send_state"`
+	SentAt               time.Time        `json:"sent_at"`
+	BaseCardRevision     int              `json:"base_card_revision"`
+	BaseCardSnapshotHash string           `json:"base_card_snapshot_hash"`
+	Members              []receiptMember  `json:"members"`
+	Observation          *observationWire `json:"observation,omitempty"`
 }
 
 type receiptMember struct {
+	EventID     string    `json:"event_id,omitempty"`
 	Fingerprint string    `json:"fingerprint"`
 	StartsAt    time.Time `json:"starts_at"`
 }
 
 func (s *Service) buildReceipt(data *template.Data, receiver, destination, messageID, cardHash string) (deliveryReceipt, error) {
+	if s.config.Environment == "production" {
+		var err error
+		data, err = s.canonicalData(data)
+		if err != nil {
+			return deliveryReceipt{}, err
+		}
+	}
 	deliveryID := strings.TrimSpace(data.DeliveryID)
+	if deliveryID == "" && s.config.Environment == "production" {
+		deliveryID = "nm_" + framedDigest("sent-notification-v2", s.config.LogicalSource, receiver, destination, messageID)[:32]
+	}
 	if deliveryID == "" {
 		var err error
 		deliveryID, err = deriveDeliveryID(data, s.config.ObservationReceiver)
@@ -61,7 +72,15 @@ func (s *Service) buildReceipt(data *template.Data, receiver, destination, messa
 			digest := sha256.Sum256(encoded)
 			fingerprint = hex.EncodeToString(digest[:])
 		}
-		members = append(members, receiptMember{Fingerprint: fingerprint, StartsAt: alert.StartsAt.UTC()})
+		member := receiptMember{Fingerprint: fingerprint, StartsAt: alert.StartsAt.UTC()}
+		if s.config.Environment == "production" {
+			ep, err := episodeV2(s.config.LogicalSource, s.config.Environment, s.config.PermissionDomain, fingerprint, alert.StartsAt)
+			if err != nil {
+				return deliveryReceipt{}, err
+			}
+			member.EventID = occurrenceV2(ep, alert)
+		}
+		members = append(members, member)
 	}
 	sort.Slice(members, func(i, j int) bool {
 		if members[i].Fingerprint == members[j].Fingerprint {
@@ -69,7 +88,8 @@ func (s *Service) buildReceipt(data *template.Data, receiver, destination, messa
 		}
 		return members[i].Fingerprint < members[j].Fingerprint
 	})
-	return deliveryReceipt{
+	receipt := deliveryReceipt{
+		CardOwnerID: s.config.CardOwnerID, ExecutionDomain: s.config.ExecutionDomain,
 		SchemaVersion:        "1",
 		LogicalSource:        s.config.LogicalSource,
 		Environment:          s.config.Environment,
@@ -85,12 +105,16 @@ func (s *Service) buildReceipt(data *template.Data, receiver, destination, messa
 		BaseCardRevision:     1,
 		BaseCardSnapshotHash: cardHash,
 		Members:              members,
-	}, nil
+	}
+	if s.config.Environment == "production" {
+		receipt.Observation = s.observation(data, receipt)
+	}
+	return receipt, nil
 }
 
-// StampDeliveryID records the occurrence identity before notifier-specific
-// clones or templates can change the channel payload. The webhook observation
-// and every delivery receipt then carry the exact same identifier.
+// StampDeliveryID keeps the original member-derived identity available for
+// callers outside the normal notify-stage fanout. Runtime fanout uses
+// StampDeliveryIDForAttempt so differing channel member sets still correlate.
 func (s *Service) StampDeliveryID(data *template.Data) error {
 	deliveryID, err := deriveDeliveryID(data, s.config.ObservationReceiver)
 	if err != nil {
@@ -98,6 +122,50 @@ func (s *Service) StampDeliveryID(data *template.Data) error {
 	}
 	data.DeliveryID = deliveryID
 	return nil
+}
+
+// NewDeliveryAttemptID creates the immutable parent identity for one notify-stage
+// fanout. The same value must be used for every channel in that fanout; a later
+// Alertmanager repeat gets a new value even when its members and content are
+// unchanged.
+func (s *Service) NewDeliveryAttemptID() (string, error) {
+	value := make([]byte, 16)
+	if _, err := rand.Read(value); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value), nil
+}
+
+// StampDeliveryIDForAttempt derives a channel-independent delivery envelope.
+// Channel selectors may turn the same group into A+B for the observation
+// webhook and A for Feishu, so members must not participate in this ID. The
+// receipt's members remain the authoritative scope and are matched by their
+// immutable (delivery_id, fingerprint, starts_at) occurrence identity.
+func (s *Service) StampDeliveryIDForAttempt(data *template.Data, attemptID string) error {
+	deliveryID, err := deriveAttemptDeliveryID(data, s.config.ObservationReceiver, attemptID)
+	if err != nil {
+		return err
+	}
+	data.DeliveryID = deliveryID
+	return nil
+}
+
+func deriveAttemptDeliveryID(data *template.Data, observationReceiver, attemptID string) (string, error) {
+	if strings.TrimSpace(attemptID) == "" {
+		return "", fmt.Errorf("delivery attempt ID is required")
+	}
+	canonical := map[string]interface{}{
+		"identity_version": 2,
+		"attempt_id":       attemptID,
+		"receiver":         observationReceiver,
+		"group_labels":     map[string]string(data.GroupLabels),
+	}
+	encoded, err := canonicalJSON(canonical)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return "nm_" + hex.EncodeToString(digest[:16]), nil
 }
 
 func deriveDeliveryID(data *template.Data, observationReceiver string) (string, error) {
@@ -167,7 +235,7 @@ func pythonISOTime(value time.Time) string {
 	if value.Nanosecond() == 0 {
 		return value.Format("2006-01-02T15:04:05+00:00")
 	}
-	return value.Format("2006-01-02T15:04:05.999999+00:00")
+	return value.Format("2006-01-02T15:04:05.000000+00:00")
 }
 
 func canonicalJSON(value interface{}) ([]byte, error) {
@@ -178,54 +246,4 @@ func canonicalJSON(value interface{}) ([]byte, error) {
 		return nil, err
 	}
 	return bytes.TrimSuffix(buffer.Bytes(), []byte("\n")), nil
-}
-
-func (s *Service) runReceiptWorker() {
-	defer close(s.done)
-	for {
-		select {
-		case <-s.stop:
-			return
-		case receipt := <-s.receipts:
-			s.deliverReceipt(receipt)
-		}
-	}
-}
-
-func (s *Service) deliverReceipt(receipt deliveryReceipt) {
-	for attempt := 1; attempt <= 3; attempt++ {
-		if s.expired() {
-			return
-		}
-		body, err := newRequestBody(receipt)
-		if err != nil {
-			_ = level.Error(s.logger).Log("msg", "Jev shadow failed to encode delivery receipt", "error", err)
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		request, err := http.NewRequestWithContext(ctx, http.MethodPost, s.config.ReceiptURL, body)
-		if err == nil {
-			request.Header.Set("Authorization", "Bearer "+s.config.Token)
-			request.Header.Set("Content-Type", "application/json")
-			request.Header.Set("Idempotency-Key", receipt.DeliveryID+":"+receipt.MessageID)
-			var response *http.Response
-			response, err = s.client.Do(request)
-			if response != nil {
-				_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
-				_ = response.Body.Close()
-				if response.StatusCode == http.StatusAccepted || response.StatusCode == http.StatusOK {
-					cancel()
-					return
-				}
-				err = fmt.Errorf("receipt endpoint returned %d", response.StatusCode)
-			}
-		}
-		cancel()
-		if attempt < 3 {
-			time.Sleep(time.Duration(attempt) * 250 * time.Millisecond)
-		}
-		if attempt == 3 {
-			_ = level.Error(s.logger).Log("msg", "Jev shadow delivery receipt failed", "deliveryID", receipt.DeliveryID, "error", err)
-		}
-	}
 }

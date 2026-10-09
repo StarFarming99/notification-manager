@@ -1,0 +1,387 @@
+{
+  "cases": [
+    {
+      "name": "policy_reason_129_valid",
+      "payload": {
+        "action_reference": "signed-action-reference",
+        "annotation_revision": 1,
+        "execution_mode": "shadow",
+        "expected_base_revision": 1,
+        "judgment_id": "judgment-v2",
+        "member_event_ids": [
+          "event-v2"
+        ],
+        "policy_proposal": "pool",
+        "policy_reason_code": "RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR",
+        "pool_reason": {
+          "choice": "recurring",
+          "probabilities": {
+            "non_urgent": 0.06,
+            "recurring": 0.8,
+            "same_incident": 0.12,
+            "unclear": 0.02
+          }
+        },
+        "routing": {
+          "choice": "pool",
+          "probabilities": {
+            "oncall": 0.08,
+            "pool": 0.92
+          }
+        },
+        "schema_version": "2",
+        "trace_url": "https://aiops.example.invalid/apps/alert-center/traces/judgment-v2"
+      },
+      "valid": true
+    },
+    {
+      "name": "policy_reason_160_unicode_valid",
+      "payload": {
+        "action_reference": "signed-action-reference",
+        "annotation_revision": 1,
+        "execution_mode": "shadow",
+        "expected_base_revision": 1,
+        "judgment_id": "judgment-v2",
+        "member_event_ids": [
+          "event-v2"
+        ],
+        "policy_proposal": "pool",
+        "policy_reason_code": "因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因",
+        "pool_reason": {
+          "choice": "recurring",
+          "probabilities": {
+            "non_urgent": 0.06,
+            "recurring": 0.8,
+            "same_incident": 0.12,
+            "unclear": 0.02
+          }
+        },
+        "routing": {
+          "choice": "pool",
+          "probabilities": {
+            "oncall": 0.08,
+            "pool": 0.92
+          }
+        },
+        "schema_version": "2",
+        "trace_url": "https://aiops.example.invalid/apps/alert-center/traces/judgment-v2"
+      },
+      "valid": true
+    },
+    {
+      "name": "policy_reason_161_unicode_invalid",
+      "payload": {
+        "action_reference": "signed-action-reference",
+        "annotation_revision": 1,
+        "execution_mode": "shadow",
+        "expected_base_revision": 1,
+        "judgment_id": "judgment-v2",
+        "member_event_ids": [
+          "event-v2"
+        ],
+        "policy_proposal": "pool",
+        "policy_reason_code": "因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因因",
+        "pool_reason": {
+          "choice": "recurring",
+          "probabilities": {
+            "non_urgent": 0.06,
+            "recurring": 0.8,
+            "same_incident": 0.12,
+            "unclear": 0.02
+          }
+        },
+        "routing": {
+          "choice": "pool",
+          "probabilities": {
+            "oncall": 0.08,
+            "pool": 0.92
+          }
+        },
+        "schema_version": "2",
+        "trace_url": "https://aiops.example.invalid/apps/alert-center/traces/judgment-v2"
+      },
+      "valid": false
+    },
+    {
+      "name": "judgment_id_64_unicode_valid",
+      "payload": {
+        "action_reference": "signed-action-reference",
+        "annotation_revision": 1,
+        "execution_mode": "shadow",
+        "expected_base_revision": 1,
+        "judgment_id": "判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判",
+        "member_event_ids": [
+          "event-v2"
+        ],
+        "policy_proposal": "pool",
+        "policy_reason_code": "pool_allowed",
+        "pool_reason": {
+          "choice": "recurring",
+          "probabilities": {
+            "non_urgent": 0.06,
+            "recurring": 0.8,
+            "same_incident": 0.12,
+            "unclear": 0.02
+          }
+        },
+        "routing": {
+          "choice": "pool",
+          "probabilities": {
+            "oncall": 0.08,
+            "pool": 0.92
+          }
+        },
+        "schema_version": "2",
+        "trace_url": "https://aiops.example.invalid/apps/alert-center/traces/judgment-v2"
+      },
+      "valid": true
+    },
+    {
+      "name": "judgment_id_65_unicode_invalid",
+      "payload": {
+        "action_reference": "signed-action-reference",
+        "annotation_revision": 1,
+        "execution_mode": "shadow",
+        "expected_base_revision": 1,
+        "judgment_id": "判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判判",
+        "member_event_ids": [
+          "event-v2"
+        ],
+        "policy_proposal": "pool",
+        "policy_reason_code": "pool_allowed",
+        "pool_reason": {
+          "choice": "recurring",
+          "probabilities": {
+            "non_urgent": 0.06,
+            "recurring": 0.8,
+            "same_incident": 0.12,
+            "unclear": 0.02
+          }
+        },
+        "routing": {
+          "choice": "pool",
+          "probabilities": {
+            "oncall": 0.08,
+            "pool": 0.92
+          }
+        },
+        "schema_version": "2",
+        "trace_url": "https://aiops.example.invalid/apps/alert-center/traces/judgment-v2"
+      },
+      "valid": false
+    },
+    {
+      "name": "member_event_id_64_unicode_valid",
+      "payload": {
+        "action_reference": "signed-action-reference",
+        "annotation_revision": 1,
+        "execution_mode": "shadow",
+        "expected_base_revision": 1,
+        "judgment_id": "judgment-v2",
+        "member_event_ids": [
+          "员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员"
+        ],
+        "policy_proposal": "pool",
+        "policy_reason_code": "pool_allowed",
+        "pool_reason": {
+          "choice": "recurring",
+          "probabilities": {
+            "non_urgent": 0.06,
+            "recurring": 0.8,
+            "same_incident": 0.12,
+            "unclear": 0.02
+          }
+        },
+        "routing": {
+          "choice": "pool",
+          "probabilities": {
+            "oncall": 0.08,
+            "pool": 0.92
+          }
+        },
+        "schema_version": "2",
+        "trace_url": "https://aiops.example.invalid/apps/alert-center/traces/judgment-v2"
+      },
+      "valid": true
+    },
+    {
+      "name": "member_event_id_65_unicode_invalid",
+      "payload": {
+        "action_reference": "signed-action-reference",
+        "annotation_revision": 1,
+        "execution_mode": "shadow",
+        "expected_base_revision": 1,
+        "judgment_id": "judgment-v2",
+        "member_event_ids": [
+          "员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员员"
+        ],
+        "policy_proposal": "pool",
+        "policy_reason_code": "pool_allowed",
+        "pool_reason": {
+          "choice": "recurring",
+          "probabilities": {
+            "non_urgent": 0.06,
+            "recurring": 0.8,
+            "same_incident": 0.12,
+            "unclear": 0.02
+          }
+        },
+        "routing": {
+          "choice": "pool",
+          "probabilities": {
+            "oncall": 0.08,
+            "pool": 0.92
+          }
+        },
+        "schema_version": "2",
+        "trace_url": "https://aiops.example.invalid/apps/alert-center/traces/judgment-v2"
+      },
+      "valid": false
+    },
+    {
+      "name": "empty_action_reference_valid",
+      "payload": {
+        "action_reference": "",
+        "annotation_revision": 1,
+        "execution_mode": "shadow",
+        "expected_base_revision": 1,
+        "judgment_id": "judgment-v2",
+        "member_event_ids": [
+          "event-v2"
+        ],
+        "policy_proposal": "pool",
+        "policy_reason_code": "pool_allowed",
+        "pool_reason": {
+          "choice": "recurring",
+          "probabilities": {
+            "non_urgent": 0.06,
+            "recurring": 0.8,
+            "same_incident": 0.12,
+            "unclear": 0.02
+          }
+        },
+        "routing": {
+          "choice": "pool",
+          "probabilities": {
+            "oncall": 0.08,
+            "pool": 0.92
+          }
+        },
+        "schema_version": "2",
+        "trace_url": "https://aiops.example.invalid/apps/alert-center/traces/judgment-v2"
+      },
+      "valid": true
+    },
+    {
+      "name": "policy_facts_low_threshold_valid",
+      "payload": {
+        "action_reference": "signed-action-reference",
+        "annotation_revision": 1,
+        "capability": "policy-facts-v1",
+        "context_reduced": false,
+        "decision_source": "model_policy",
+        "execution_mode": "shadow",
+        "expected_base_revision": 1,
+        "judgment_id": "judgment-v2",
+        "member_event_ids": [
+          "event-v2"
+        ],
+        "model_status": "available",
+        "policy_proposal": "pool",
+        "policy_reason_code": "threshold_met",
+        "pool_min_probability": 0.2,
+        "pool_reason": {
+          "choice": "recurring",
+          "probabilities": {
+            "non_urgent": 0.06,
+            "recurring": 0.8,
+            "same_incident": 0.12,
+            "unclear": 0.02
+          }
+        },
+        "routing": {
+          "choice": "oncall",
+          "probabilities": {
+            "oncall": 0.8,
+            "pool": 0.2
+          }
+        },
+        "schema_version": "2",
+        "threshold_applied": true,
+        "threshold_source": "override",
+        "trace_url": "https://aiops.example.invalid/apps/alert-center/traces/judgment-v2"
+      },
+      "valid": true
+    },
+    {
+      "name": "policy_facts_operator_unavailable_valid",
+      "payload": {
+        "action_reference": "signed-action-reference",
+        "annotation_revision": 1,
+        "capability": "policy-facts-v1",
+        "context_reduced": true,
+        "decision_source": "operator_rule",
+        "execution_mode": "shadow",
+        "expected_base_revision": 1,
+        "judgment_id": "judgment-v2",
+        "member_event_ids": [
+          "event-v2"
+        ],
+        "model_error_code": "minimum_state_budget_exceeded",
+        "model_status": "unavailable",
+        "policy_proposal": "pool",
+        "policy_reason_code": "manual_override",
+        "pool_reason": null,
+        "routing": null,
+        "schema_version": "2",
+        "threshold_applied": false,
+        "threshold_source": "not_applicable",
+        "trace_url": "https://aiops.example.invalid/apps/alert-center/traces/judgment-v2"
+      },
+      "valid": true
+    },
+    {
+      "name": "policy_facts_threshold_mismatch_invalid",
+      "payload": {
+        "action_reference": "signed-action-reference",
+        "annotation_revision": 1,
+        "capability": "policy-facts-v1",
+        "context_reduced": false,
+        "decision_source": "model_policy",
+        "execution_mode": "shadow",
+        "expected_base_revision": 1,
+        "judgment_id": "judgment-v2",
+        "member_event_ids": [
+          "event-v2"
+        ],
+        "model_status": "available",
+        "policy_proposal": "pool",
+        "policy_reason_code": "threshold_met",
+        "pool_min_probability": 0.3,
+        "pool_reason": {
+          "choice": "recurring",
+          "probabilities": {
+            "non_urgent": 0.06,
+            "recurring": 0.8,
+            "same_incident": 0.12,
+            "unclear": 0.02
+          }
+        },
+        "routing": {
+          "choice": "oncall",
+          "probabilities": {
+            "oncall": 0.8,
+            "pool": 0.2
+          }
+        },
+        "schema_version": "2",
+        "threshold_applied": true,
+        "threshold_source": "override",
+        "trace_url": "https://aiops.example.invalid/apps/alert-center/traces/judgment-v2"
+      },
+      "valid": false
+    }
+  ],
+  "contract": "annotation-component-v2.schema.json",
+  "description": "Golden boundary payloads consumed by Python and Notification Manager."
+}

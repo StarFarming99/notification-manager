@@ -39,9 +39,10 @@ func UrlWithParameters(u string, parameters map[string]string) (string, error) {
 func DoHttpRequest(ctx context.Context, client *http.Client, request *http.Request) ([]byte, error) {
 
 	if client == nil {
-		client = &http.Client{}
+		client = &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 	}
 
+	markDelivery(ctx)
 	resp, err := client.Do(request.WithContext(ctx))
 	if err != nil {
 		return nil, err
@@ -52,18 +53,24 @@ func DoHttpRequest(ctx context.Context, client *http.Client, request *http.Reque
 		_ = resp.Body.Close()
 	}()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := ioutil.ReadAll(io.LimitReader(resp.Body, (2<<20)+1))
+	if len(body) > 2<<20 {
+		return nil, fmt.Errorf("notification response exceeds 2 MiB")
+	}
 	if err != nil {
 		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		msg := ""
-		if len(body) > 0 {
-			msg = string(body)
-		}
-		return body, fmt.Errorf("%d, %s", resp.StatusCode, msg)
+		return body, &HTTPStatusError{Status: resp.StatusCode}
 	}
 
 	return body, nil
+}
+
+// HTTPStatusError avoids leaking webhook response bodies into logs.
+type HTTPStatusError struct{ Status int }
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("notification platform HTTP %d", e.Status)
 }

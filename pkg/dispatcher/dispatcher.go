@@ -44,6 +44,9 @@ func New(l log.Logger, notifierCtl *controller.Controller, alerts *store.AlertSt
 }
 
 func (d *Dispatcher) Run() error {
+	if d.alerts.Durable != nil {
+		return d.runDurable()
+	}
 
 	for {
 		// err is not nil means the store had closed, dispatcher should process remaining alerts, then exit.

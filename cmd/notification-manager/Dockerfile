@@ -1,6 +1,6 @@
 ARG GOPROXY="https://goproxy.io"
 # Build the manager binary
-FROM golang:1.20 as builder
+FROM golang:1.23.12 AS builder
 ARG GOPROXY
 
 WORKDIR /workspace
@@ -14,17 +14,23 @@ RUN GOPROXY=$GOPROXY go mod download
 
 # Copy the go source
 COPY cmd/notification-manager/main.go main.go
+COPY cmd/jev-annotation-executor/ cmd/jev-annotation-executor/
+COPY cmd/notification-spool-recovery/ cmd/notification-spool-recovery/
 COPY pkg/ pkg/
 COPY apis/ apis/
 
 # Build
-RUN CGO_ENABLED=0 GO111MODULE=on go build -a -o notification-manager main.go
+RUN CGO_ENABLED=0 GO111MODULE=on go build -trimpath -o notification-manager main.go \
+ && CGO_ENABLED=0 GO111MODULE=on go build -trimpath -o jev-annotation-executor ./cmd/jev-annotation-executor \
+ && CGO_ENABLED=0 GO111MODULE=on go build -trimpath -o notification-spool-recovery ./cmd/notification-spool-recovery
 
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
 FROM kubesphere/distroless-static:nonroot
 WORKDIR /
 COPY --from=builder /workspace/notification-manager .
+COPY --from=builder /workspace/jev-annotation-executor .
+COPY --from=builder /workspace/notification-spool-recovery .
 USER nonroot:nonroot
 
 ENTRYPOINT ["/notification-manager"]

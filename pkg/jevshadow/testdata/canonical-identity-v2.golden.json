@@ -1,0 +1,106 @@
+{
+  "version": "canonical-identity-v2",
+  "cases": [
+    {
+      "name": "base",
+      "labels": {
+        "alertname": "DiskFull",
+        "cluster": "fixture",
+        "instance": "node-a",
+        "tenant_id": "tenant-a",
+        "receiver": "chat-one"
+      },
+      "logical_source": "source-a",
+      "environment": "production",
+      "permission_domain": "sre-production",
+      "excluded_labels": [],
+      "starts_at": "2026-10-08T01:02:03Z",
+      "fingerprint": "fp2_a6fe1abd92a208b7e5c60b7056ddc7bd2a927cd73f3ae0b850926e40b2af75af",
+      "episode_id": "ep2_4d2994e5fa3a9804f03b0c99436737607f463b36612cf75d"
+    },
+    {
+      "name": "transport-ha",
+      "labels": {
+        "alertname": "DiskFull",
+        "cluster": "fixture",
+        "instance": "node-a",
+        "tenant_id": "tenant-a",
+        "receiver": "chat-two",
+        "am_replica": "second"
+      },
+      "logical_source": "source-a",
+      "environment": "production",
+      "permission_domain": "sre-production",
+      "excluded_labels": [
+        "am_replica"
+      ],
+      "starts_at": "2026-10-08T09:02:03+08:00",
+      "fingerprint": "fp2_a6fe1abd92a208b7e5c60b7056ddc7bd2a927cd73f3ae0b850926e40b2af75af",
+      "episode_id": "ep2_4d2994e5fa3a9804f03b0c99436737607f463b36612cf75d"
+    },
+    {
+      "name": "resource",
+      "labels": {
+        "alertname": "DiskFull",
+        "cluster": "fixture",
+        "instance": "node-b",
+        "tenant_id": "tenant-a"
+      },
+      "logical_source": "source-a",
+      "environment": "production",
+      "permission_domain": "sre-production",
+      "excluded_labels": [],
+      "starts_at": "2026-10-08T01:02:03Z",
+      "fingerprint": "fp2_35dfcab36ef06865a280e5116506b8d6803493e00333e8d06c1712a23c56ef21",
+      "episode_id": "ep2_75e1e2c68b4253624b38caefbbb041961abf096a7234c98d"
+    },
+    {
+      "name": "tenant",
+      "labels": {
+        "alertname": "DiskFull",
+        "cluster": "fixture",
+        "instance": "node-a",
+        "tenant_id": "tenant-b"
+      },
+      "logical_source": "source-a",
+      "environment": "production",
+      "permission_domain": "sre-production",
+      "excluded_labels": [],
+      "starts_at": "2026-10-08T01:02:03Z",
+      "fingerprint": "fp2_bb2aa00525d4da2ef795ab275be8ad598dc9b6193c62a672f8939ca137347438",
+      "episode_id": "ep2_e90c09dcb3640ba7803c03c324a70cceff4377e1cd8f9d3c"
+    },
+    {
+      "name": "source",
+      "labels": {
+        "alertname": "DiskFull",
+        "cluster": "fixture",
+        "instance": "node-a",
+        "tenant_id": "tenant-a"
+      },
+      "logical_source": "source-b",
+      "environment": "production",
+      "permission_domain": "sre-production",
+      "excluded_labels": [],
+      "starts_at": "2026-10-08T01:02:03Z",
+      "fingerprint": "fp2_ad96f68b084c96dc57fd62e91c46351b75d5f7ec05e02fe48d33c274c8ecfb32",
+      "episode_id": "ep2_2d4dc666e0327be0059c5d7540edc085a81da86e125982d1"
+    },
+    {
+      "name": "unicode",
+      "labels": {
+        "alertname": "磁盘 <满>",
+        "cluster": "fixture",
+        "instance": "node-雪 ",
+        "tenant_id": "租户"
+      },
+      "logical_source": "source-a",
+      "environment": "production",
+      "permission_domain": "sre-production",
+      "excluded_labels": [],
+      "starts_at": "2026-10-08T01:02:03.100000Z",
+      "fingerprint": "fp2_c1c3d4c329536655877983b6c6d2469fc328d2471bda3d068971492cfc1742d1",
+      "episode_id": "ep2_12eb09c9a344a73f32bc78e204f1acddfb1928663574d789"
+    }
+  ]
+}

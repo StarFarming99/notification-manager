@@ -45,7 +45,7 @@ func New(logger log.Logger, notifierCtl *controller.Controller, alerts *store.Al
 	h.router.Get("/configs", h.handler.ListConfigs)
 	h.router.Get("/receiverWithConfig", h.handler.ListReceiverWithConfig)
 	h.router.Post("/api/v2/alerts", h.handler.Alert)
-	if shadow := notifierCtl.GetJevShadow(); shadow != nil && shadow.Enabled() {
+	if shadow := notifierCtl.GetJevShadow(); shadow != nil && shadow.Enabled() && !shadow.IsRelay() {
 		h.router.Put("/internal/jev/annotations/{messageID}", func(w http.ResponseWriter, r *http.Request) {
 			shadow.HandleAnnotation(w, r, chi.URLParam(r, "messageID"))
 		})
@@ -54,26 +54,34 @@ func New(logger log.Logger, notifierCtl *controller.Controller, alerts *store.Al
 	h.router.Post("/api/v2/notifications", h.handler.Notification)
 	h.router.Get("/metrics", h.handler.ServeMetrics)
 	h.router.Get("/-/reload", h.handler.ServeReload)
-	h.router.Get("/-/ready", h.handler.ServeHealthCheck)
-	h.router.Get("/-/live", h.handler.ServeReadinessCheck)
+	h.router.Get("/-/ready", h.handler.ServeReadinessCheck)
+	h.router.Get("/-/live", h.handler.ServeHealthCheck)
 	h.router.Get("/status", h.handler.ServeStatus)
 
 	return h
 }
 
 func (h *Webhook) Run(ctx context.Context) error {
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
 	var err error
 	httpSrv := &http.Server{
-		Addr:    h.ListenAddress,
-		Handler: h.router,
+		Addr:              h.ListenAddress,
+		Handler:           h.router,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      35 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	srvClosed := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			// We received an interrupt signal, shut down.
-			if err := httpSrv.Shutdown(ctx); err != nil {
+			// Shutdown needs a fresh bounded context; ctx is already cancelled.
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 				// Error from closing listeners, or context timeout:
 				_ = level.Error(h.logger).Log("msg", "Shutdown HTTP server", "err", err)
 			}
@@ -88,7 +96,10 @@ func (h *Webhook) Run(ctx context.Context) error {
 	}
 
 	_ = level.Error(h.logger).Log("msg", "HTTP server exit", "err", err)
+	stop()
 	<-srvClosed
-
+	if err == http.ErrServerClosed {
+		return nil
+	}
 	return err
 }
