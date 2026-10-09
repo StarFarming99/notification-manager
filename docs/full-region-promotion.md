@@ -20,8 +20,11 @@ routing, filtering, aggregation and template pipeline, then applies its local
 copy overlay. Original action buttons and explicit card config remain intact.
 
 This change does not guarantee all raw regional events before AM grouping or
-muting. Stock AM Fanout may wait for failing test integrations; PD remains the
-existing direct branch. The final two-peer real-AM/rc7/new-NM fault matrix must
+muting. The test sibling has its own stock-AM aggregation group and receiver, so its
+failure/retry does not join the original bot receiver Fanout. The earlier design
+that appended a test integration inside the original bot receiver had that coupling
+and is withdrawn. PD remains the existing direct branch. Shared AM resources and
+infra-app quotas still require the measured fault and live capacity checks. The final two-peer real-AM/rc7/new-NM fault matrix must
 pass before a live test route is enabled. Live wiring, quota, permissions,
 feedback and real PD receipt are separate acceptance gates. User approval is
 required for deployment; no cluster or real Feishu write is part of code tests.
