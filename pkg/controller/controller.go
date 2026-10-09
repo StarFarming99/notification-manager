@@ -29,6 +29,7 @@ import (
 
 	"github.com/kubesphere/notification-manager/apis/v2beta2"
 	"github.com/kubesphere/notification-manager/pkg/constants"
+	"github.com/kubesphere/notification-manager/pkg/deliveryprofiles"
 	"github.com/kubesphere/notification-manager/pkg/internal"
 	"github.com/kubesphere/notification-manager/pkg/jevshadow"
 	"github.com/kubesphere/notification-manager/pkg/template"
@@ -53,13 +54,15 @@ var (
 )
 
 type Controller struct {
-	staticRouters  []v2beta2.Router
-	staticSilences []v2beta2.Silence
-	staticIsolated bool
-	staticCluster  string
-	logger         log.Logger
-	ctx            context.Context
-	cache          cache.Cache
+	configurationName string
+	DeliveryProfiles  *deliveryprofiles.Manager
+	staticRouters     []v2beta2.Router
+	staticSilences    []v2beta2.Silence
+	staticIsolated    bool
+	staticCluster     string
+	logger            log.Logger
+	ctx               context.Context
+	cache             cache.Cache
 	// Default config selector
 	defaultConfigSelector *metav1.LabelSelector
 	// Label key used to distinguish different user
@@ -130,21 +133,23 @@ func New(ctx context.Context, logger log.Logger) (*Controller, error) {
 		return nil, err
 	}
 
-	informerCache, err := cache.New(cfg, cache.Options{
-		Scheme: scheme,
-	})
+	ns := os.Getenv(nsEnvironment)
+	if len(ns) == 0 {
+		return nil, fmt.Errorf("namespace is empty")
+	}
+	cacheOptions := cache.Options{Scheme: scheme}
+	if os.Getenv("NM_CONFIGURATION_NAME") != "" {
+		cacheOptions.Namespaces = []string{ns}
+	}
+	informerCache, err := cache.New(cfg, cacheOptions)
 
 	if err != nil {
 		_ = level.Error(logger).Log("msg", "Failed to create cache", "err", err)
 		return nil, err
 	}
 
-	ns := os.Getenv(nsEnvironment)
-	if len(ns) == 0 {
-		return nil, level.Error(logger).Log("msg", "namespace is empty")
-	}
-
 	return &Controller{
+		configurationName:      os.Getenv("NM_CONFIGURATION_NAME"),
 		ctx:                    ctx,
 		logger:                 logger,
 		cache:                  informerCache,
@@ -253,6 +258,16 @@ func (c *Controller) onResourceChange(obj interface{}, op string, run func(t *ta
 }
 
 func (c *Controller) nmChange(t *task) {
+	obj := t.obj
+	if tombstone, ok := obj.(kcache.DeletedFinalStateUnknown); ok {
+		obj = tombstone.Obj
+		t.obj = obj
+	}
+	nm, ok := obj.(*v2beta2.NotificationManager)
+	if !ok || (c.configurationName != "" && nm.Name != c.configurationName) {
+		close(t.done)
+		return
+	}
 	defer func() {
 		_ = level.Info(c.logger).Log("msg", "notification manager changed", "op", t.op)
 		close(t.done)

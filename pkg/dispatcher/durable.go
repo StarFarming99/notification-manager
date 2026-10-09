@@ -14,6 +14,22 @@ import (
 
 func (d *Dispatcher) runDurable() error {
 	var wg sync.WaitGroup
+	maintenanceCtx, stopMaintenance := context.WithCancel(context.Background())
+	defer stopMaintenance()
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-maintenanceCtx.Done():
+				return
+			case now := <-ticker.C:
+				if _, err := d.alerts.Durable.CleanupCompleted(48*time.Hour, 200, now); err != nil {
+					_ = level.Error(d.l).Log("msg", "Completed notification maintenance failed")
+				}
+			}
+		}
+	}()
 	workers := cap(d.semCh)
 	if workers < 1 {
 		workers = 1
@@ -65,7 +81,12 @@ func (d *Dispatcher) sendClaim(claim spool.Claim) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	err := notify.SendFrozen(ctx, d.l, d.notifierCtl, claim.Target)
+	err := d.waitSendBudget(ctx)
+	if err != nil {
+		err = &utils.PreSendError{Err: err}
+	} else {
+		err = notify.SendFrozen(ctx, d.l, d.notifierCtl, claim.Target)
+	}
 	state, outcome := utils.DeliveryOutcome(err)
 	evidence := "attempt:" + claim.AttemptID
 	if err := d.alerts.Durable.Finish(claim, state, outcome, evidence, time.Now().Add(5*time.Second)); err != nil {
@@ -75,4 +96,33 @@ func (d *Dispatcher) sendClaim(claim spool.Claim) {
 		return
 	}
 	_ = level.Info(d.l).Log("msg", "Original notification target completed", "target_id", claim.Target.ID, "attempt_id", claim.AttemptID, "state", state)
+}
+
+// One reservation clock bounds automatic sends across all workers and retries.
+// The legacy memory pipeline retains its existing notification behavior.
+func (d *Dispatcher) waitSendBudget(ctx context.Context) error {
+	profiles := d.notifierCtl.DeliveryProfiles
+	if profiles == nil || profiles.SendInterval <= 0 {
+		return nil
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		d.sendBudgetMu.Lock()
+		wait := time.Until(d.nextSend)
+		if wait <= 0 {
+			d.nextSend = time.Now().Add(profiles.SendInterval)
+			d.sendBudgetMu.Unlock()
+			return nil
+		}
+		d.sendBudgetMu.Unlock()
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }

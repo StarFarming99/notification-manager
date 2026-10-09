@@ -26,6 +26,7 @@ require (
 	github.com/spf13/pflag v1.0.6
 	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common v1.0.194
 	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/sms v1.0.194
+	go.etcd.io/bbolt v1.4.3
 	golang.org/x/sys v0.29.0
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
 	k8s.io/api v0.28.0
@@ -56,6 +57,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/emicklei/go-restful/v3 v3.9.0 // indirect
+	github.com/evanphx/json-patch v5.6.0+incompatible // indirect
 	github.com/evanphx/json-patch/v5 v5.6.0 // indirect
 	github.com/fsnotify/fsnotify v1.6.0 // indirect
 	github.com/go-logfmt/logfmt v0.5.1 // indirect
@@ -87,7 +89,6 @@ require (
 	github.com/prometheus/common v0.44.0 // indirect
 	github.com/prometheus/procfs v0.10.1 // indirect
 	github.com/tjfoc/gmsm v1.3.2 // indirect
-	go.etcd.io/bbolt v1.4.3 // indirect
 	go.uber.org/atomic v1.10.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.24.0 // indirect

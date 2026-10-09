@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-kit/kit/log"
@@ -16,6 +17,7 @@ import (
 	"github.com/kubesphere/notification-manager/pkg/aggregation"
 	"github.com/kubesphere/notification-manager/pkg/constants"
 	"github.com/kubesphere/notification-manager/pkg/controller"
+	"github.com/kubesphere/notification-manager/pkg/deliveryprofiles"
 	"github.com/kubesphere/notification-manager/pkg/filter"
 	"github.com/kubesphere/notification-manager/pkg/internal"
 	spool "github.com/kubesphere/notification-manager/pkg/notification_spool"
@@ -108,7 +110,23 @@ func (h *HttpHandler) Alert(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.alerts.Durable != nil {
-		intake, err := h.acceptDurable(r.Context(), data.Alerts, nil, r.Header.Get("Idempotency-Key"), spool.Hash(raw))
+		requestHash := spool.Hash(raw)
+		key := r.Header.Get("Idempotency-Key")
+		if snap, ok := deliveryprofiles.Snapshot(r.Context()); ok {
+			if key == "" {
+				var err error
+				requestHash, err = CanonicalAMIntent(raw)
+				if err != nil {
+					h.handle(w, &response{http.StatusBadRequest, "invalid AM intent"})
+					return
+				}
+				key = "am:" + requestHash
+			} else {
+				key = "explicit:" + key
+			}
+			key = snap.ID + ":" + snap.Version + ":" + key
+		}
+		intake, err := h.acceptDurable(r.Context(), data.Alerts, nil, key, requestHash)
 		if err != nil {
 			w.Header().Set("Retry-After", "1")
 			h.handle(w, &response{http.StatusServiceUnavailable, "Notification frozen plan could not be persisted"})
@@ -121,6 +139,19 @@ func (h *HttpHandler) Alert(w http.ResponseWriter, r *http.Request) {
 
 func (h *HttpHandler) ServeMetrics(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	if h.alerts.Durable != nil {
+		if status, err := h.alerts.Durable.Status(); err == nil {
+			counts := status["counts"].(map[string]int)
+			for _, state := range []string{spool.Pending, spool.Sending, spool.Delivered, spool.Retryable, spool.Unknown, spool.DeadLetter} {
+				_, _ = fmt.Fprintf(w, "nm_notification_spool_targets{state=%q} %d\n", state, counts[state])
+			}
+			_, _ = fmt.Fprintf(w, "nm_notification_spool_active_targets %v\nnm_notification_spool_active_target_limit %v\nnm_notification_spool_stored_bytes %v\nnm_notification_spool_storage_byte_limit %v\n", status["active_targets"], status["active_target_limit"], status["stored_bytes"], status["storage_byte_limit"])
+			_, _ = fmt.Fprintf(w, "nm_notification_spool_storage_write_failures_total %v\n", status["storage_write_failures"])
+			if class, _ := status["last_storage_error"].(string); class != "" {
+				_, _ = fmt.Fprintf(w, "nm_notification_spool_storage_write_failed{class=%q} 1\n", class)
+			}
+		}
+	}
 	if shadow := h.notifierCtl.GetJevShadow(); shadow != nil {
 		for name, value := range shadow.RelayStatus() {
 			_, _ = fmt.Fprintf(w, "nm_jev_relay_%s %d\n", name, value)
@@ -140,6 +171,17 @@ func (h *HttpHandler) ServeReadinessCheck(w http.ResponseWriter, _ *http.Request
 	if !h.alerts.Accepting() {
 		h.handle(w, &response{http.StatusServiceUnavailable, "Original notification intake stopping"})
 		return
+	}
+	if profiles := h.notifierCtl.DeliveryProfiles; profiles != nil {
+		if snap, err := profiles.Store.ProfileSnapshot("test"); err == nil {
+			if err := h.validateTestScope(snap.DeliveryProfile); err != nil {
+				h.handle(w, &response{http.StatusServiceUnavailable, "Scoped test Receiver incompatible"})
+				return
+			}
+		} else if _, err := profiles.Store.ProfileSnapshot("formal"); err != nil {
+			h.handle(w, &response{http.StatusServiceUnavailable, "No delivery profile accepting"})
+			return
+		}
 	}
 	if h.alerts.Durable != nil {
 		if err := h.alerts.Durable.Ready(); err != nil {
@@ -392,18 +434,48 @@ func (h *HttpHandler) acceptDurable(parent context.Context, alerts template.Aler
 			return spool.Intake{}, errors.New("unexpected frozen plan output")
 		}
 	}
+	snap, profiled := deliveryprofiles.Snapshot(parent)
+	if h.notifierCtl.DeliveryProfiles != nil && !profiled {
+		return spool.Intake{}, errors.New("profiled intake requires a server-bound lane")
+	}
+	if profiled {
+		plan = notify.ApplyProfile(plan, *snap)
+	}
 	targets, err := notify.Freeze(h.logger, h.notifierCtl, plan)
 	if err != nil {
 		return spool.Intake{}, err
 	}
-	history, err := notify.FreezeHistory(h.logger, h.notifierCtl, targets)
+	if profiled {
+		targets, err = notify.BindFrozenProfile(targets, *snap)
+		if err != nil {
+			return spool.Intake{}, err
+		}
+	}
+	var history []spool.Target
+	if !profiled || snap.ID != "test" {
+		history, err = notify.FreezeHistory(h.logger, h.notifierCtl, targets)
+	}
 	if err != nil {
 		return spool.Intake{}, err
+	}
+	if profiled {
+		history, err = notify.BindFrozenProfile(history, *snap)
+		if err != nil {
+			return spool.Intake{}, err
+		}
 	}
 	targets = append(targets, history...)
 	terminal := ""
 	if len(targets) == 0 {
 		terminal = "filtered_silenced_or_no_route"
+	}
+	if profiled {
+		window := time.Duration(0)
+		if strings.Contains(key, ":am:") {
+			window = h.notifierCtl.DeliveryProfiles.RepeatInterval
+		}
+		intake, _, err := h.alerts.Durable.SubmitProfile(key, hash, targets, terminal, *snap, window)
+		return intake, err
 	}
 	intake, _, err := h.alerts.Durable.Submit(key, hash, targets, terminal)
 	return intake, err

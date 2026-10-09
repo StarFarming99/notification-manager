@@ -11,6 +11,7 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/kubesphere/notification-manager/pkg/controller"
+	"github.com/kubesphere/notification-manager/pkg/deliveryprofiles"
 	"github.com/kubesphere/notification-manager/pkg/dispatcher"
 	"github.com/kubesphere/notification-manager/pkg/jevshadow"
 	feishunotifier "github.com/kubesphere/notification-manager/pkg/notify/notifier/feishu"
@@ -172,6 +173,11 @@ func Main() int {
 		return 1
 	}
 	defer alerts.FinalClose()
+	ctl.DeliveryProfiles, err = deliveryprofiles.FromEnv(alerts.Durable)
+	if err != nil {
+		_ = level.Error(logger).Log("msg", "Delivery profiles failed to initialize", "error", err)
+		return 1
+	}
 
 	// Setup webhook to receive alert/notification msg
 	webhook := wh.New(
@@ -179,11 +185,17 @@ func Main() int {
 		ctl,
 		alerts,
 		&wh.Options{
-			ListenAddress:  *listenAddress,
-			WebhookTimeout: *webhookTimeout,
-			WorkerTimeout:  *wkrTimeout,
+			ListenAddress:             *listenAddress,
+			WebhookTimeout:            *webhookTimeout,
+			WorkerTimeout:             *wkrTimeout,
+			FormalCompatListenAddress: os.Getenv("NM_FORMAL_COMPAT_LISTEN_ADDRESS"),
+			FormalCompatSourceCIDRs:   splitNonempty(os.Getenv("NM_FORMAL_COMPAT_SOURCE_CIDRS")),
 		})
 
+	if err := webhook.PrepareInitialProfiles(ctlCtx); err != nil {
+		_ = level.Error(logger).Log("msg", "Initial delivery profile failed readiness validation", "error", err)
+		return 1
+	}
 	ctxHttp, cancelHttp := context.WithCancel(context.Background())
 	defer cancelHttp()
 
@@ -228,4 +240,14 @@ func Main() int {
 
 func main() {
 	os.Exit(Main())
+}
+
+func splitNonempty(raw string) []string {
+	var result []string
+	for _, v := range strings.Split(raw, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			result = append(result, v)
+		}
+	}
+	return result
 }

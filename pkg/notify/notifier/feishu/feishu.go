@@ -1328,7 +1328,23 @@ func (n *Notifier) RenderForDurable(data *template.Data) (string, error) {
 	if n.tmpl == nil {
 		return "", utils.Error("frozen notification has no rendered content")
 	}
-	return n.tmpl.Text(n.receiver.TmplName, data)
+	content, err := n.tmpl.Text(n.receiver.TmplName, data)
+	if err != nil {
+		return "", err
+	}
+	if n.receiver.TmplType == constants.Interactive {
+		card := map[string]interface{}{}
+		if err := json.Unmarshal(sanitizeJSONControlChars([]byte(content)), &card); err != nil {
+			return "", err
+		}
+		setCardUpdateMulti(card)
+		raw, err := json.Marshal(card)
+		if err != nil {
+			return "", err
+		}
+		return string(raw), nil
+	}
+	return content, nil
 }
 
 func (n *Notifier) ConfigureFrozen(opts *v2beta2.Options) {

@@ -41,6 +41,9 @@ func (s *Service) SetCardPatcherResolver(resolver CardPatcherResolver) {
 	if s == nil {
 		return
 	}
+	for _, child := range s.scopeServices {
+		child.SetCardPatcherResolver(resolver)
+	}
 	s.mu.Lock()
 	s.patcherResolver = resolver
 	s.mu.Unlock()

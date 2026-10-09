@@ -15,9 +15,13 @@ var (
 )
 
 type Data struct {
-	FrozenContent *string `json:"-"`
-	Alerts        Alerts  `json:"alerts"`
-	DeliveryID    string  `json:"deliveryID,omitempty"`
+	ProfileID           string  `json:"profile_id,omitempty"`
+	ProfileVersion      string  `json:"profile_version,omitempty"`
+	CardOwnerID         string  `json:"card_owner_id,omitempty"`
+	OriginalDestination string  `json:"original_destination,omitempty"`
+	FrozenContent       *string `json:"-"`
+	Alerts              Alerts  `json:"alerts"`
+	DeliveryID          string  `json:"deliveryID,omitempty"`
 
 	GroupLabels       KV `json:"groupLabels"`
 	CommonLabels      KV `json:"commonLabels"`
@@ -79,7 +83,8 @@ func (d *Data) Status() string {
 
 func (d *Data) Clone() *Data {
 	nd := &Data{
-		Alerts:            nil,
+		Alerts:    nil,
+		ProfileID: d.ProfileID, ProfileVersion: d.ProfileVersion, CardOwnerID: d.CardOwnerID, OriginalDestination: d.OriginalDestination,
 		DeliveryID:        d.DeliveryID,
 		FrozenContent:     d.FrozenContent,
 		GroupLabels:       d.GroupLabels.Clone(),

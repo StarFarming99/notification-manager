@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +18,10 @@ import (
 	"github.com/kubesphere/notification-manager/pkg/internal"
 	feishutype "github.com/kubesphere/notification-manager/pkg/internal/feishu"
 	webhooktype "github.com/kubesphere/notification-manager/pkg/internal/webhook"
+	"github.com/kubesphere/notification-manager/pkg/jevshadow"
+	spool "github.com/kubesphere/notification-manager/pkg/notification_spool"
 	"github.com/kubesphere/notification-manager/pkg/template"
+	"github.com/kubesphere/notification-manager/pkg/utils"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -28,6 +33,51 @@ func testController(t *testing.T, render string) *controller.Controller {
 		t.Fatal(err)
 	}
 	return c
+}
+
+func TestProfileWrongApplicationFailsBeforeFreezeAndSend(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "public-scopes.json")
+	raw := `{"version":1,"profiles":[{"profile_id":"test","profile_version":"v1","card_owner_id":"test-owner","execution_domain":"test-domain","sender_app":"expected-app","receivers":["critical"],"destinations":["test-chat"],"receipt_token_env":"TEST_RECEIPT","annotation_token_env":"TEST_ANNOTATION","feedback_token_env":"TEST_FEEDBACK"},{"profile_id":"formal","profile_version":"v1","card_owner_id":"formal-owner","execution_domain":"formal-domain","sender_app":"expected-app","receivers":["critical"],"destinations":["production-chat"],"receipt_token_env":"FORMAL_RECEIPT","annotation_token_env":"FORMAL_ANNOTATION","feedback_token_env":"FORMAL_FEEDBACK"}]}`
+	if err := os.WriteFile(file, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range map[string]string{"JEV_SHADOW_ENABLED": "true", "JEV_DELIVERY_SCOPES_FILE": file, "JEV_SHADOW_SENDER_APP": "expected-app", "JEV_SHADOW_RECEIVER_ALLOWLIST": "critical", "JEV_SHADOW_DESTINATION_ALLOWLIST": "test-chat", "JEV_EXECUTOR_SUCCESS_URL": "http://unused.invalid/successful-deliveries", "JEV_EXECUTOR_TOKEN": strings.Repeat("x", 32)} {
+		t.Setenv(key, value)
+	}
+	shadow, err := jevshadow.NewNMFromEnv(log.NewNopLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	ctl := testController(t, `{{define "frozen"}}{"elements":[]}{{end}}`)
+	ctl.SetJevShadow(shadow)
+	ref := &v2beta2.Credential{ValueFrom: &v2beta2.ValueSource{SecretKeyRef: &v2beta2.SecretKeySelector{Name: "never-read", Key: "secret"}}}
+	receiver := &feishutype.Receiver{Common: &internal.Common{Name: "critical", Type: "feishu", Template: internal.Template{TmplName: "frozen", TmplType: "interactive"}}, ChatIDs: []string{"test-chat"}, Config: &feishutype.Config{AppID: &v2beta2.Credential{Value: "different-app"}, AppSecret: ref}}
+	data := &template.Data{ProfileID: "test", ProfileVersion: "v1", CardOwnerID: "test-owner", Alerts: template.Alerts{{ID: "fixture", Labels: template.KV{"alertname": "fixture"}}}}
+	if _, err := Freeze(log.NewNopLogger(), ctl, map[internal.Receiver][]*template.Data{receiver: {data}}); err == nil {
+		t.Fatal("wrong app reached durable admission")
+	}
+	receiver.AppID.Value = "expected-app"
+	plan, err := Freeze(log.NewNopLogger(), ctl, map[internal.Receiver][]*template.Data{receiver: {data}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err = BindFrozenProfile(plan, spool.ProfileSnapshot{DeliveryProfile: spool.DeliveryProfile{ID: "test", Version: "v1", CardOwnerID: "test-owner", Receiver: "critical", SourceChatID: "production-chat", TestChatID: "test-chat"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frozen FrozenNotification
+	_ = json.Unmarshal(plan[0].Payload, &frozen)
+	var mutated feishutype.Receiver
+	_ = json.Unmarshal(frozen.Receiver, &mutated)
+	mutated.AppID.Value = "different-app"
+	frozen.Receiver, _ = json.Marshal(mutated)
+	plan[0].Payload, _ = json.Marshal(frozen)
+	if err := SendFrozen(context.Background(), log.NewNopLogger(), ctl, plan[0]); err == nil {
+		t.Fatal("wrong app sent")
+	} else if state, _ := utils.DeliveryOutcome(err); state != spool.Retryable {
+		t.Fatal("known pre-send rejection became unknown", err)
+	}
 }
 
 func TestFrozenRenderDestinationAndRecoveryDoNotUseNewConfiguration(t *testing.T) {

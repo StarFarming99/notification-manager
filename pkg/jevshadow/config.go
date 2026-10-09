@@ -33,32 +33,35 @@ const (
 )
 
 type Config struct {
-	CardOwnerID            string
-	ExecutionDomain        string
-	Enabled                bool
-	ReceiptURL             string
-	ObservationURL         string
-	ExcludedIdentityLabels map[string]struct{}
-	Token                  string
-	AnnotationToken        string
-	FeedbackToken          string
-	ReceiverAllowlist      map[string]struct{}
-	DestinationAllowlist   map[string]struct{}
-	LogicalSource          string
-	Environment            string
-	SourceRegion           string
-	PermissionDomain       string
-	ObservationReceiver    string
-	SenderApp              string
-	ExpiresAt              time.Time
-	ReceiptOutboxDir       string
-	ReceiptMaxAttempts     int
-	ReceiptRetryMin        time.Duration
-	ReceiptRetryMax        time.Duration
-	ReceiptDrainTimeout    time.Duration
-	CardStateDir           string
-	FeedbackEnabled        bool
-	MaxCards               int
+	DeliveryScopes                            map[string]DeliveryScope
+	expectedProfileID, expectedProfileVersion string
+	CardOwnerID                               string
+	ExecutionDomain                           string
+	Enabled                                   bool
+	ReceiptURL                                string
+	ObservationURL                            string
+	ExcludedIdentityLabels                    map[string]struct{}
+	Token                                     string
+	AnnotationToken                           string
+	FeedbackToken                             string
+	ReceiverAllowlist                         map[string]struct{}
+	DestinationAllowlist                      map[string]struct{}
+	LogicalSource                             string
+	Environment                               string
+	SourceRegion                              string
+	PermissionDomain                          string
+	ObservationReceiver                       string
+	SenderApp                                 string
+	ExpiresAt                                 time.Time
+	ReceiptOutboxDir                          string
+	ReceiptMaxAttempts                        int
+	ReceiptRetryMin                           time.Duration
+	ReceiptRetryMax                           time.Duration
+	ReceiptDrainTimeout                       time.Duration
+	CardStateDir                              string
+	FeedbackEnabled                           bool
+	ExistingCallbackIntegrated                bool
+	MaxCards                                  int
 }
 
 func ConfigFromEnv() (Config, error) {
@@ -71,6 +74,7 @@ func ConfigFromEnv() (Config, error) {
 		return config.withReceiptDefaults(), nil
 	}
 
+	config.ExistingCallbackIntegrated = os.Getenv("JEV_EXISTING_CALLBACK_INTEGRATED") == "true"
 	config.ReceiptURL = strings.TrimSpace(os.Getenv(envReceiptURL))
 	config.ObservationURL = strings.TrimSpace(os.Getenv("JEV_SHADOW_OBSERVATION_URL"))
 	config.ExcludedIdentityLabels = csvSet(os.Getenv("JEV_SHADOW_IDENTITY_EXCLUDED_LABELS"))
@@ -117,6 +121,9 @@ func ConfigFromEnv() (Config, error) {
 		}
 	}
 
+	if config.DeliveryScopes, err = loadDeliveryScopes(true); err != nil {
+		return Config{}, err
+	}
 	if err := config.validate(); err != nil {
 		return Config{}, err
 	}
@@ -125,7 +132,7 @@ func ConfigFromEnv() (Config, error) {
 
 func (c Config) validate() error {
 	if c.Environment == "production" {
-		if c.CardOwnerID == "" || c.ExecutionDomain == "" {
+		if len(c.DeliveryScopes) == 0 && (c.CardOwnerID == "" || c.ExecutionDomain == "") {
 			return fmt.Errorf("production executor requires explicit card owner and execution domain")
 		}
 		u, err := url.Parse(c.ObservationURL)
@@ -137,11 +144,14 @@ func (c Config) validate() error {
 		return nil
 	}
 	if c.Environment == "prod" || c.Environment == "production" {
+		if c.FeedbackEnabled && !c.ExistingCallbackIntegrated {
+			return fmt.Errorf("production feedback requires the existing callback handler integration")
+		}
 		if c.FeedbackEnabled && os.Getenv("JEV_CARD_STATE_COORDINATED") != "true" {
 			return fmt.Errorf("production feedback requires verified original card writer coordination")
 		}
-		if len(c.AnnotationToken) < 32 || c.AnnotationToken == c.Token ||
-			(c.FeedbackEnabled && (len(c.FeedbackToken) < 32 || c.FeedbackToken == c.Token || c.FeedbackToken == c.AnnotationToken)) {
+		if len(c.DeliveryScopes) == 0 && (len(c.AnnotationToken) < 32 || c.AnnotationToken == c.Token ||
+			(c.FeedbackEnabled && (len(c.FeedbackToken) < 32 || c.FeedbackToken == c.Token || c.FeedbackToken == c.AnnotationToken))) {
 			return fmt.Errorf("production executor requires separate receipt, annotation and feedback credentials")
 		}
 	}
@@ -159,20 +169,23 @@ func (c Config) validate() error {
 		envSenderApp:           c.SenderApp,
 	}
 	for name, value := range required {
+		if name == envToken && len(c.DeliveryScopes) > 0 {
+			continue
+		}
 		if value == "" {
 			return fmt.Errorf("%s is required when %s=true", name, envEnabled)
 		}
 	}
-	if c.FeedbackEnabled && (len(c.ReceiverAllowlist) != 1 || len(c.DestinationAllowlist) != 1) {
+	if c.FeedbackEnabled && len(c.DeliveryScopes) == 0 && c.expectedProfileID == "" && (len(c.ReceiverAllowlist) != 1 || len(c.DestinationAllowlist) != 1) {
 		return fmt.Errorf(
 			"%s requires exactly one receiver and one destination in the UAT allowlists",
 			envFeedbackEnabled,
 		)
 	}
-	if len(c.ReceiverAllowlist) == 0 {
+	if len(c.DeliveryScopes) == 0 && len(c.ReceiverAllowlist) == 0 {
 		return fmt.Errorf("%s must contain at least one receiver", envReceiverAllowlist)
 	}
-	if len(c.DestinationAllowlist) == 0 {
+	if len(c.DeliveryScopes) == 0 && len(c.DestinationAllowlist) == 0 {
 		return fmt.Errorf("%s must contain at least one destination", envDestinationAllowlist)
 	}
 	if c.MaxCards < 1 {

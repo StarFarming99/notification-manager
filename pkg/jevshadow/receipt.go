@@ -15,6 +15,9 @@ import (
 )
 
 type deliveryReceipt struct {
+	ProfileID            string           `json:"profile_id,omitempty"`
+	ProfileVersion       string           `json:"profile_version,omitempty"`
+	OriginalDestination  string           `json:"original_destination,omitempty"`
 	CardOwnerID          string           `json:"card_owner_id,omitempty"`
 	ExecutionDomain      string           `json:"execution_domain,omitempty"`
 	SchemaVersion        string           `json:"schema_version"`
@@ -42,6 +45,16 @@ type receiptMember struct {
 }
 
 func (s *Service) buildReceipt(data *template.Data, receiver, destination, messageID, cardHash string) (deliveryReceipt, error) {
+	selected, err := s.scopeService(data)
+	if err != nil {
+		return deliveryReceipt{}, err
+	}
+	if selected != s {
+		return selected.buildReceipt(data, receiver, destination, messageID, cardHash)
+	}
+	if s.config.expectedProfileID != "" && !s.ShouldCapture(receiver, destination) {
+		return deliveryReceipt{}, ErrInvalidPayload
+	}
 	if s.config.Environment == "production" {
 		var err error
 		data, err = s.canonicalData(data)
@@ -89,6 +102,7 @@ func (s *Service) buildReceipt(data *template.Data, receiver, destination, messa
 		return members[i].Fingerprint < members[j].Fingerprint
 	})
 	receipt := deliveryReceipt{
+		ProfileID: data.ProfileID, ProfileVersion: data.ProfileVersion, OriginalDestination: data.OriginalDestination,
 		CardOwnerID: s.config.CardOwnerID, ExecutionDomain: s.config.ExecutionDomain,
 		SchemaVersion:        "1",
 		LogicalSource:        s.config.LogicalSource,
@@ -105,6 +119,9 @@ func (s *Service) buildReceipt(data *template.Data, receiver, destination, messa
 		BaseCardRevision:     1,
 		BaseCardSnapshotHash: cardHash,
 		Members:              members,
+	}
+	if data.CardOwnerID != "" && data.CardOwnerID != s.config.CardOwnerID {
+		return deliveryReceipt{}, fmt.Errorf("frozen card owner is outside this executor scope")
 	}
 	if s.config.Environment == "production" {
 		receipt.Observation = s.observation(data, receipt)

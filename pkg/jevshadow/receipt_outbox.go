@@ -563,6 +563,20 @@ func boundedReceiptError(err error) string {
 }
 
 func (s *Service) postDeliveryReceipt(parent context.Context, receipt deliveryReceipt) error {
+	if receipt.ProfileID != "" {
+		if s.config.expectedProfileID != "" {
+			if receipt.ProfileID != s.config.expectedProfileID || receipt.ProfileVersion != s.config.expectedProfileVersion || receipt.CardOwnerID != s.config.CardOwnerID || receipt.ExecutionDomain != s.config.ExecutionDomain || receipt.SenderApp != s.config.SenderApp {
+				return &receiptDeliveryFailure{err: ErrInvalidPayload, permanent: true}
+			}
+		} else {
+			child := s.scopeServices[scopeKey(receipt.ProfileID, receipt.ProfileVersion)]
+			if child == nil {
+				return &receiptDeliveryFailure{err: ErrInvalidPayload, permanent: true}
+			}
+			return child.postDeliveryReceipt(parent, receipt)
+		}
+	}
+
 	if receipt.Observation != nil {
 		if err := s.postObservation(parent, receipt.Observation, receipt.MessageID); err != nil {
 			return err

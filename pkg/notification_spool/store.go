@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -33,12 +34,16 @@ var ErrEmpty = errors.New("no notification ready for claim")
 var buckets = [][]byte{[]byte("meta"), []byte("intakes"), []byte("targets"), []byte("ready"), []byte("dedupe"), []byte("audit"), []byte("blocked")}
 
 type Target struct {
-	ID              string `json:"id"`
-	IntakeID        string `json:"intake_id"`
-	Receiver        string `json:"receiver"`
-	Channel         string `json:"channel"`
-	Destination     string `json:"destination"`
-	ContentRevision string `json:"content_revision"`
+	ProfileID           string `json:"profile_id,omitempty"`
+	ProfileVersion      string `json:"profile_version,omitempty"`
+	CardOwnerID         string `json:"card_owner_id,omitempty"`
+	OriginalDestination string `json:"original_destination,omitempty"`
+	ID                  string `json:"id"`
+	IntakeID            string `json:"intake_id"`
+	Receiver            string `json:"receiver"`
+	Channel             string `json:"channel"`
+	Destination         string `json:"destination"`
+	ContentRevision     string `json:"content_revision"`
 	// Payload contains a frozen render and credential references, never resolved secrets.
 	Payload     json.RawMessage `json:"payload"`
 	State       string          `json:"state"`
@@ -67,10 +72,13 @@ type Limits struct {
 	ReserveBytes uint64
 }
 type Store struct {
-	db     *bolt.DB
-	path   string
-	owner  string
-	limits Limits
+	db                   *bolt.DB
+	path                 string
+	owner                string
+	limits               Limits
+	healthMu             sync.Mutex
+	storageWriteFailures uint64
+	lastStorageError     string
 }
 
 // OpenReadOnly never repairs records or changes ownership. The shared lock
@@ -172,10 +180,14 @@ func Open(path string, limits Limits) (*Store, error) {
 		}
 		b := tx.Bucket([]byte("targets"))
 		var changes []Target
+		var active uint64
 		if err := b.ForEach(func(_, v []byte) error {
 			var t Target
 			if err := json.Unmarshal(v, &t); err != nil {
 				return err
+			}
+			if activeState(t.State) {
+				active++
 			}
 			if t.State == Sending {
 				t.State = Unknown
@@ -185,6 +197,9 @@ func Open(path string, limits Limits) (*Store, error) {
 			}
 			return nil
 		}); err != nil {
+			return err
+		}
+		if err := setActiveCount(tx, active); err != nil {
 			return err
 		}
 		for _, t := range changes {
@@ -221,6 +236,14 @@ func (s *Store) capacity() error {
 // A caller without a stable upstream key gets a new intake: an AM repeat must
 // not silently disappear through an unbounded content-hash deduplication window.
 func (s *Store) Submit(key, requestHash string, targets []Target, terminalReason string) (Intake, bool, error) {
+	return s.submit(key, requestHash, targets, terminalReason, nil, 0)
+}
+
+func (s *Store) SubmitProfile(key, requestHash string, targets []Target, terminalReason string, snapshot ProfileSnapshot, window time.Duration) (Intake, bool, error) {
+	return s.submit(key, requestHash, targets, terminalReason, &snapshot, window)
+}
+
+func (s *Store) submit(key, requestHash string, targets []Target, terminalReason string, snapshot *ProfileSnapshot, window time.Duration) (Intake, bool, error) {
 	var result Intake
 	duplicate := false
 	if requestHash == "" || (len(targets) == 0 && terminalReason == "") {
@@ -251,7 +274,10 @@ func (s *Store) Submit(key, requestHash string, targets []Target, terminalReason
 	if err != nil {
 		return result, false, err
 	}
-	err = s.db.Update(func(tx *bolt.Tx) error {
+	err = s.update(func(tx *bolt.Tx) error {
+		if err := checkProfileAdmission(tx, snapshot); err != nil {
+			return err
+		}
 		intakes, dedupe := tx.Bucket([]byte("intakes")), tx.Bucket([]byte("dedupe"))
 		if key != "" {
 			if previous := dedupe.Get([]byte(key)); previous != nil {
@@ -261,21 +287,46 @@ func (s *Store) Submit(key, requestHash string, targets []Target, terminalReason
 				if result.RequestHash != requestHash {
 					return errors.New("intake idempotency key reused with different content")
 				}
-				duplicate = true
-				return nil
+				// Identical AM intents cannot create another card while the
+				// original plan is still pending, retrying or uncertain. A
+				// completed plan may repeat only after its configured AM repeat
+				// interval; prolonged ACK loss is not a fresh repeat.
+				incomplete := false
+				if window > 0 {
+					for _, targetID := range result.TargetIDs {
+						var previousTarget Target
+						if err := json.Unmarshal(tx.Bucket([]byte("targets")).Get([]byte(targetID)), &previousTarget); err != nil {
+							return err
+						}
+						if previousTarget.State != Delivered {
+							incomplete = true
+							break
+						}
+					}
+				}
+				if window <= 0 || incomplete || time.Now().Before(result.AcceptedAt.Add(window)) {
+					duplicate = true
+					return nil
+				}
 			}
 		}
 		if err := s.capacity(); err != nil {
 			return err
 		}
 		b := tx.Bucket([]byte("targets"))
-		if b.Stats().KeyN+len(targets) > s.limits.MaxTargets || intakes.Stats().KeyN >= s.limits.MaxTargets {
+		if activeCount(tx)+uint64(len(targets)) > uint64(s.limits.MaxTargets) {
 			return ErrCapacity
 		}
 		now := time.Now().UTC()
 		result = Intake{ID: id, RequestHash: requestHash, AcceptedAt: now, TerminalReason: terminalReason}
 		seen := make(map[string]bool)
 		for _, t := range targets {
+			if err := validateProfileTarget(tx, t); err != nil {
+				return err
+			}
+			if snapshot != nil && (t.ProfileID != snapshot.ID || t.ProfileVersion != snapshot.Version) {
+				return errors.New("frozen target does not match intake profile")
+			}
 			if t.Receiver == "" || t.Channel == "" || t.Destination == "" || t.ContentRevision == "" || !json.Valid(t.Payload) || len(t.Payload) > 2<<20 {
 				return errors.New("invalid frozen target")
 			}
@@ -306,6 +357,9 @@ func (s *Store) Submit(key, requestHash string, targets []Target, terminalReason
 			}
 			result.TargetIDs = append(result.TargetIDs, t.ID)
 		}
+		if err := changeActiveCount(tx, len(targets)); err != nil {
+			return err
+		}
 		if err := put(intakes, id, result); err != nil {
 			return err
 		}
@@ -319,17 +373,29 @@ func (s *Store) Submit(key, requestHash string, targets []Target, terminalReason
 
 func (s *Store) Claim(now time.Time) (Claim, error) {
 	var claim Claim
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := s.update(func(tx *bolt.Tx) error {
 		q := tx.Bucket([]byte("ready"))
-		k, v := q.Cursor().First()
-		if k == nil {
-			return ErrEmpty
-		}
+		cursor := q.Cursor()
+		var k []byte
 		var t Target
-		if err := json.Unmarshal(tx.Bucket([]byte("targets")).Get(v), &t); err != nil {
-			return err
+		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+			if err := json.Unmarshal(tx.Bucket([]byte("targets")).Get(value), &t); err != nil {
+				return err
+			}
+			if t.AvailableAt.After(now) {
+				break
+			}
+			paused, err := profileDeliveryPaused(tx, t)
+			if err != nil {
+				return err
+			}
+			if paused {
+				continue
+			}
+			k = key
+			break
 		}
-		if t.AvailableAt.After(now) {
+		if k == nil {
 			return ErrEmpty
 		}
 		if t.State != Pending && t.State != Retryable {
@@ -363,11 +429,14 @@ func (s *Store) ClaimForRecovery(id, actor, evidence string, now time.Time) (Cla
 	if actor == "" || evidence == "" || len(actor) > 128 || len(evidence) > 512 {
 		return claim, errors.New("bounded recovery actor and evidence required")
 	}
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte("targets"))
 		var t Target
 		if err := json.Unmarshal(b.Get([]byte(id)), &t); err != nil {
 			return err
+		}
+		if paused, err := profileDeliveryPaused(tx, t); err != nil || paused {
+			return errors.New("profile is paused or invalid; recovery send forbidden")
 		}
 		if (t.State != Pending && t.State != Retryable) || t.AvailableAt.After(now) || tx.Bucket([]byte("ready")).Get(queueKey(t)) == nil {
 			return errors.New("target not eligible for recovery send")
@@ -402,7 +471,7 @@ func (s *Store) Finish(c Claim, state, outcome, evidence string, next time.Time)
 	if state != Delivered && state != Retryable && state != Unknown && state != DeadLetter {
 		return errors.New("illegal notification completion state")
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte("targets"))
 		var t Target
 		if err := json.Unmarshal(b.Get([]byte(c.Target.ID)), &t); err != nil {
@@ -410,6 +479,11 @@ func (s *Store) Finish(c Claim, state, outcome, evidence string, next time.Time)
 		}
 		if t.State != Sending || t.Owner != s.owner || c.Owner != s.owner || t.AttemptID != c.AttemptID {
 			return ErrFence
+		}
+		if !activeState(state) {
+			if err := changeActiveCount(tx, -1); err != nil {
+				return err
+			}
 		}
 		t.State = state
 		t.Outcome = outcome
@@ -466,7 +540,7 @@ func (s *Store) Resolve(id, state, actor, evidence string) error {
 	if state != Delivered && state != Retryable && state != DeadLetter {
 		return errors.New("resolve must choose delivered, retryable or dead_letter")
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte("targets"))
 		var t Target
 		if err := json.Unmarshal(b.Get([]byte(id)), &t); err != nil {
@@ -481,6 +555,18 @@ func (s *Store) Resolve(id, state, actor, evidence string) error {
 		}
 		if err := put(tx.Bucket([]byte("audit")), auditID, map[string]interface{}{"target_id": id, "from": t.State, "to": state, "actor": actor, "evidence": evidence, "at": time.Now().UTC()}); err != nil {
 			return err
+		}
+		if activeState(t.State) && !activeState(state) {
+			if err := changeActiveCount(tx, -1); err != nil {
+				return err
+			}
+		} else if !activeState(t.State) && activeState(state) {
+			if err := changeActiveCount(tx, 1); err != nil {
+				return err
+			}
+			if activeCount(tx) > uint64(s.limits.MaxTargets) {
+				return ErrCapacity
+			}
 		}
 		t.State = state
 		t.Outcome = "operator_reconciled"
@@ -514,7 +600,18 @@ func (s *Store) Status() (map[string]interface{}, error) {
 			return nil
 		})
 	})
-	return map[string]interface{}{"version": Version, "owner": s.owner, "counts": counts}, err
+	var active uint64
+	if err == nil {
+		err = s.db.View(func(tx *bolt.Tx) error { active = activeCount(tx); return nil })
+	}
+	s.healthMu.Lock()
+	writeFailures, lastStorageError := s.storageWriteFailures, s.lastStorageError
+	s.healthMu.Unlock()
+	var storedBytes int64
+	if fi, statErr := os.Stat(s.path); statErr == nil {
+		storedBytes = fi.Size()
+	}
+	return map[string]interface{}{"version": Version, "owner": s.owner, "storage_write_failures": writeFailures, "last_storage_error": lastStorageError, "counts": counts, "active_targets": active, "active_target_limit": s.limits.MaxTargets, "stored_bytes": storedBytes, "storage_byte_limit": s.limits.MaxBytes, "completed_payload_retention": "48h", "completed_cleanup_batch": 200}, err
 }
 func (s *Store) Check() error {
 	return s.db.View(func(tx *bolt.Tx) error {
@@ -527,7 +624,23 @@ func (s *Store) Check() error {
 		return errors.Join(failures...)
 	})
 }
-func (s *Store) Ready() error { return s.capacity() }
+func (s *Store) Ready() error {
+	s.healthMu.Lock()
+	failed := s.lastStorageError != ""
+	s.healthMu.Unlock()
+	if failed {
+		return errors.New("notification storage write unavailable")
+	}
+	if err := s.capacity(); err != nil {
+		return err
+	}
+	return s.db.View(func(tx *bolt.Tx) error {
+		if activeCount(tx) >= uint64(s.limits.MaxTargets) {
+			return ErrCapacity
+		}
+		return nil
+	})
+}
 func (s *Store) Close() error { return s.db.Close() }
 
 func releaseDependents(tx *bolt.Tx, parent Target) error {

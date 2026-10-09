@@ -3,23 +3,25 @@ package jevshadow
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 const maxFeedbackResponseBytes = 64 * 1024
 
 type CardFeedback struct {
-	SourceEventID   string
-	ActorID         string
-	ChatID          string
-	MessageID       string
-	ActionReference string
-	CorrectLabel    string
+	SourceEventID   string `json:"source_event_id"`
+	ActorID         string `json:"actor_id"`
+	ChatID          string `json:"chat_id"`
+	MessageID       string `json:"message_id"`
+	ActionReference string `json:"action_reference"`
+	CorrectLabel    string `json:"correct_label"`
 }
 
 type FeedbackResult struct {
@@ -28,7 +30,70 @@ type FeedbackResult struct {
 }
 
 func (s *Service) FeedbackEnabled() bool {
-	return s != nil && !s.IsRelay() && s.config.FeedbackEnabled && s.Enabled()
+	return s != nil && !s.IsRelay() && s.config.FeedbackEnabled && s.Enabled() && ((s.config.Environment != "production" && s.config.Environment != "prod") || s.config.ExistingCallbackIntegrated)
+}
+
+// HandleCardFeedback receives identities verified by the existing unique
+// callback consumer. It never subscribes to the Feishu event stream itself.
+func (s *Service) HandleCardFeedback(token string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if len(token) < 32 || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+token)) != 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if !s.FeedbackEnabled() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		var request struct {
+			AppID string `json:"app_id"`
+			CardFeedback
+		}
+		decoder := json.NewDecoder(io.LimitReader(r.Body, 16<<10))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if err := ensureEOF(decoder); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		selected := s
+		if len(s.scopeServices) > 0 {
+			var err error
+			selected, err = s.messageScope(request.MessageID)
+			if err != nil {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			binding, err := selected.getCardBinding(request.MessageID)
+			if err != nil || binding.destination != request.ChatID {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+		}
+		if request.AppID != selected.config.SenderApp {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		if _, ok := selected.config.DestinationAllowlist[request.ChatID]; !ok {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		result, err := selected.RelayCardFeedback(ctx, request.CardFeedback)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, result)
+	}
 }
 
 func (s *Service) FeedbackTarget() (string, string, bool) {
@@ -97,7 +162,9 @@ func (s *Service) RelayCardFeedback(ctx context.Context, feedback CardFeedback) 
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	response, err := s.client.Do(req)
+	client := *s.client
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	response, err := client.Do(req)
 	if err != nil {
 		return FeedbackResult{}, err
 	}

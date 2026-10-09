@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,7 +46,20 @@ func NewCheckedAlertStore(kind string) (*AlertStore, error) {
 	if mode != "handoff" && mode != "drain" {
 		return nil, errors.New("NM_SHUTDOWN_MODE must be handoff or drain")
 	}
-	db, err := spool.Open(path, spool.Limits{})
+	limits := spool.Limits{}
+	for _, item := range []struct {
+		name string
+		set  func(int64)
+	}{{"NM_NOTIFICATION_SPOOL_MAX_TARGETS", func(v int64) { limits.MaxTargets = int(v) }}, {"NM_NOTIFICATION_SPOOL_MAX_BYTES", func(v int64) { limits.MaxBytes = v }}, {"NM_NOTIFICATION_SPOOL_RESERVE_BYTES", func(v int64) { limits.ReserveBytes = uint64(v) }}} {
+		if raw := os.Getenv(item.name); raw != "" {
+			value, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || value <= 0 || value > 1<<53 {
+				return nil, errors.New("invalid positive spool capacity limit")
+			}
+			item.set(value)
+		}
+	}
+	db, err := spool.Open(path, limits)
 	if err != nil {
 		return nil, err
 	}

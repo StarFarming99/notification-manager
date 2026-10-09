@@ -62,10 +62,11 @@ type CardPatcher func(context.Context, string, map[string]interface{}) error
 type CardPatcherResolver func(context.Context, string, string) (CardPatcher, error)
 
 type Service struct {
-	relay  *successRelay
-	config Config
-	logger log.Logger
-	client *http.Client
+	scopeServices map[string]*Service
+	relay         *successRelay
+	config        Config
+	logger        log.Logger
+	client        *http.Client
 
 	mu              sync.RWMutex
 	cards           map[string]*cardBinding
@@ -107,7 +108,7 @@ func New(logger log.Logger, config Config, client *http.Client) (*Service, error
 		return nil, err
 	}
 	if client == nil {
-		client = &http.Client{Timeout: 3 * time.Second}
+		client = &http.Client{Timeout: 3 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	}
 	service := &Service{
 		config:   config,
@@ -116,7 +117,7 @@ func New(logger log.Logger, config Config, client *http.Client) (*Service, error
 		cards:    make(map[string]*cardBinding),
 		patchers: make(map[string]CardPatcher),
 	}
-	if config.Enabled {
+	if config.Enabled && len(config.DeliveryScopes) == 0 {
 		cardStore, err := newCardStateStore(logger, config.CardStateDir)
 		if err != nil {
 			_ = level.Error(logger).Log(
@@ -141,6 +142,55 @@ func New(logger log.Logger, config Config, client *http.Client) (*Service, error
 		}
 		service.outbox = outbox
 	}
+	if len(config.DeliveryScopes) > 0 {
+		service.scopeServices = make(map[string]*Service)
+		for key, scope := range config.DeliveryScopes {
+			if scope.SenderApp != config.SenderApp {
+				service.Close()
+				return nil, errors.New("all executor scopes must use the configured Feishu app")
+			}
+			childConfig := config
+			childConfig.DeliveryScopes = nil
+			childConfig.expectedProfileID = scope.ProfileID
+			childConfig.expectedProfileVersion = scope.ProfileVersion
+			childConfig.CardOwnerID = scope.CardOwnerID
+			childConfig.ExecutionDomain = scope.ExecutionDomain
+			childConfig.SenderApp = scope.SenderApp
+			childConfig.Token = scope.receiptToken
+			childConfig.AnnotationToken = scope.annotationToken
+			childConfig.FeedbackToken = scope.feedbackToken
+			childConfig.ReceiverAllowlist = make(map[string]struct{})
+			for _, r := range scope.Receivers {
+				childConfig.ReceiverAllowlist[r] = struct{}{}
+			}
+			childConfig.DestinationAllowlist = make(map[string]struct{})
+			for _, d := range scope.Destinations {
+				childConfig.DestinationAllowlist[d] = struct{}{}
+			}
+			var err error
+			childConfig.CardStateDir, err = bindScopeDirectory(config.CardStateDir, scope)
+			if err != nil {
+				service.Close()
+				return nil, err
+			}
+			childConfig.ReceiptOutboxDir, err = bindScopeDirectory(config.ReceiptOutboxDir, scope)
+			if err != nil {
+				service.Close()
+				return nil, err
+			}
+			child, err := New(logger, childConfig, client)
+			if err != nil {
+				service.Close()
+				return nil, err
+			}
+			if !child.Enabled() {
+				child.Close()
+				service.Close()
+				return nil, errors.New("executor scope durable stores unavailable")
+			}
+			service.scopeServices[key] = child
+		}
+	}
 	return service, nil
 }
 
@@ -159,6 +209,11 @@ func (s *Service) Enabled() bool {
 func (s *Service) ShouldCapture(receiver, destination string) bool {
 	if !s.Enabled() {
 		return false
+	}
+	for _, scope := range s.config.DeliveryScopes {
+		if scopeAllows(scope, receiver, destination) {
+			return true
+		}
 	}
 	if _, ok := s.config.ReceiverAllowlist[receiver]; !ok {
 		return false
@@ -182,11 +237,23 @@ func (s *Service) CaptureSuccessfulDelivery(
 		if data == nil || len(data.Alerts) == 0 || len(data.Alerts) > 1000 || messageID == "" {
 			return
 		}
+		app := s.config.SenderApp
+		if data.ProfileID != "" {
+			scope, ok := s.config.DeliveryScopes[scopeKey(data.ProfileID, data.ProfileVersion)]
+			if !ok || scope.CardOwnerID != data.CardOwnerID || !scopeAllows(scope, receiver, destination) {
+				return
+			}
+			app = scope.SenderApp
+		}
 		s.relay.offer(SuccessfulDelivery{Data: data, Receiver: receiver, Destination: destination,
-			MessageID: messageID, BaseCard: baseCard, SenderApp: s.config.SenderApp})
+			MessageID: messageID, BaseCard: baseCard, SenderApp: app})
 		return
 	}
-	if err := s.captureDurable(data, receiver, destination, messageID, baseCard, patcher); err != nil {
+	selected, err := s.scopeService(data)
+	if err != nil {
+		return
+	}
+	if err := selected.captureDurable(data, receiver, destination, messageID, baseCard, patcher); err != nil {
 		_ = level.Error(s.logger).Log("msg", "Jev successful delivery capture failed", "message_id", messageID)
 	}
 }
@@ -229,6 +296,9 @@ func (s *Service) Close() {
 		if s.relay != nil {
 			s.relay.shutdown(2 * time.Second)
 		}
+		for _, child := range s.scopeServices {
+			child.Close()
+		}
 		if s.outbox != nil {
 			s.outbox.Close()
 		}
@@ -236,6 +306,17 @@ func (s *Service) Close() {
 }
 
 func (s *Service) HandleAnnotation(w http.ResponseWriter, r *http.Request, messageID string) {
+	if len(s.scopeServices) > 0 {
+		selected, err := s.messageScope(messageID)
+		if err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if selected != s {
+			selected.HandleAnnotation(w, r, messageID)
+			return
+		}
+	}
 	if s == nil || !s.config.Enabled {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": ErrDisabled.Error()})
 		return
@@ -302,6 +383,9 @@ func (s *Service) HandleAnnotation(w http.ResponseWriter, r *http.Request, messa
 }
 
 func (s *Service) applyAnnotation(ctx context.Context, messageID, idempotencyKey string, component AnnotationComponent) (string, error) {
+	if (s.config.Environment == "production" || s.config.Environment == "prod") && !s.FeedbackEnabled() {
+		component.ActionReference = nil
+	}
 	if s.cardStore != nil {
 		return s.applyPersistentAnnotation(ctx, messageID, idempotencyKey, component)
 	}

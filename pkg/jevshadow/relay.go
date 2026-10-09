@@ -89,6 +89,9 @@ func NewNMFromEnv(logger log.Logger) (*Service, error) {
 	if config.SenderApp == "" || len(config.ReceiverAllowlist) == 0 || len(config.DestinationAllowlist) == 0 {
 		return nil, errors.New("relay requires explicit sender, receiver and destination bindings")
 	}
+	if config.DeliveryScopes, err = loadDeliveryScopes(false); err != nil {
+		return nil, err
+	}
 	endpoint := strings.TrimSpace(os.Getenv("JEV_EXECUTOR_SUCCESS_URL"))
 	parsed, err := url.Parse(endpoint)
 	token := strings.TrimSpace(os.Getenv("JEV_EXECUTOR_TOKEN"))
@@ -250,16 +253,27 @@ func (s *Service) HandleSuccessfulDelivery(token string) http.HandlerFunc {
 		decoder.DisallowUnknownFields()
 		if decoder.Decode(&delivery) != nil || decoder.Decode(new(interface{})) != io.EOF ||
 			delivery.Data == nil || len(delivery.Data.Alerts) == 0 || delivery.MessageID == "" ||
-			delivery.SenderApp != s.config.SenderApp || !s.ShouldCapture(delivery.Receiver, delivery.Destination) {
+			!s.ShouldCapture(delivery.Receiver, delivery.Destination) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		patcher, err := s.resolveCardPatcher(r.Context(), delivery.Receiver, delivery.Destination, nil)
+		selected, err := s.scopeService(delivery.Data)
+		if err != nil || delivery.SenderApp != selected.config.SenderApp || !selected.ShouldCapture(delivery.Receiver, delivery.Destination) {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if len(s.scopeServices) > 0 {
+			if prior, e := s.messageScope(delivery.MessageID); e == nil && prior != selected {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+		}
+		patcher, err := selected.resolveCardPatcher(r.Context(), delivery.Receiver, delivery.Destination, nil)
 		if err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		if err := s.captureDurable(delivery.Data, delivery.Receiver, delivery.Destination,
+		if err := selected.captureDurable(delivery.Data, delivery.Receiver, delivery.Destination,
 			delivery.MessageID, delivery.BaseCard, patcher); err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return

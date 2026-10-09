@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -63,6 +64,46 @@ func TestRelayCardFeedbackUsesVerifiedCallbackIdentity(t *testing.T) {
 		if got := received[key]; got != want {
 			t.Fatalf("%s=%#v, want %#v", key, got, want)
 		}
+	}
+}
+
+func TestExistingCallbackRelayRequiresAuthenticatedMatchingAppAndChat(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(202)
+		_, _ = w.Write([]byte(`{"id":"feedback","duplicate":true}`))
+	}))
+	defer upstream.Close()
+	cfg := testConfig(upstream.URL + "/v1/delivery-receipts")
+	cfg.Environment = "production"
+	cfg.FeedbackEnabled = true
+	cfg.ExistingCallbackIntegrated = true
+	s := &Service{config: cfg, client: upstream.Client()}
+	token := strings.Repeat("c", 32)
+	body := `{"app_id":"infra-alerts","source_event_id":"event","actor_id":"actor","chat_id":"oc_test","message_id":"message","action_reference":"signed","correct_label":"accurate"}`
+	for _, tc := range []struct {
+		body, token string
+		want        int
+	}{{body, "", 401}, {strings.Replace(body, "infra-alerts", "wrong-app", 1), token, 403}, {strings.Replace(body, "oc_test", "other-chat", 1), token, 403}, {strings.TrimSuffix(body, "}") + `,"unexpected":"value"}`, token, 400}, {body + `{}`, token, 400}, {body, token, 202}} {
+		r := httptest.NewRequest("POST", "/internal/jev/card-feedback", strings.NewReader(tc.body))
+		r.Header.Set("Authorization", "Bearer "+tc.token)
+		w := httptest.NewRecorder()
+		s.HandleCardFeedback(token)(w, r)
+		if w.Code != tc.want {
+			t.Fatal(tc.want, w.Code, w.Body.String())
+		}
+	}
+	if calls != 1 {
+		t.Fatal("rejected callback reached upstream", calls)
+	}
+	s.config.ExistingCallbackIntegrated = false
+	r := httptest.NewRequest("POST", "/internal/jev/card-feedback", strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	s.HandleCardFeedback(token)(w, r)
+	if w.Code != 503 || s.FeedbackEnabled() {
+		t.Fatal("uninstalled production callback claimed ready", w.Code)
 	}
 }
 

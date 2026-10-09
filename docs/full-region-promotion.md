@@ -1,157 +1,178 @@
-# Full-region parallel validation and promotion
+# Scoped parallel NM delivery and future stable-Service promotion
 
-Updated 2026-10-09. The user selected **StarFarming99/notification-manager** as
-NM's long-term main repository. Linkwei/notification-manager remains the verified
-production rc7 baseline, not the destination for future NM changes.
+Updated 2026-10-09. This description follows the latest development plan. It
+supersedes the previous all-receiver/full-region rollout description in this file.
+NM's main repository is **StarFarming99/notification-manager**. Linkwei's rc7 is
+only the verified production baseline. Business code lives in zilliz-cloud;
+deployment overlays live in vdc-deploy-prod. Codex builds NM/executor, Jev and
+Console for `harbor.op.zillizcloud.com`; the user builds AIOps when needed.
 
-Business code: [zilliz-cloud #10086](https://github.com/zilliztech/zilliz-cloud/pull/10086).
-Deployment design: [vdc-deploy-prod #2360](https://github.com/zilliztech/vdc-deploy-prod/pull/2360),
-`jev-alert-center-sidechannel/FULL_REGION_PLAN.md`.
+## Phase-one boundary
 
-## Required runtime
+Reuse the two existing stock AM instances. The deployment overlay copies only
+critical notifications belonging to `feishu-critical-receiver` and production
+chat `oc_6c65c3f33939cb742e54cd633f95d3a2`, to test chat
+`oc_fbb2c50fed6ea3bd0f0777bea6f35358`. Preserve all original AM branches,
+integration indices, timing, muting and destination configuration. No warning,
+other chat, user, department, chatbot, history webhook or Notification API
+request is folded into the test copy. New NM keeps the original silence,
+routing, filtering, aggregation and template pipeline, then applies its local
+copy overlay. Original action buttons and explicit card config remain intact.
 
-The latest user decision is to **reuse the existing AM, not deploy another AM**.
-Keep source notifier targets and the existing route tree, receiver names, grouping,
-repeat timing, muting, continue behavior, original integration indices and formal
-outputs. Append Observer then test-NM webhooks with send_resolved=true to every
-reachable receiver, including PD-only and root fallback. This requires a reviewed
-AM config/auth-mount overlay, not an assertion that all AM configuration stays
-unchanged. The same infra-alerts app keeps old NM production groups and sends new
-NM cards only to test chat `oc_fbb2c50fed6ea3bd0f0777bea6f35358`.
+This change does not guarantee all raw regional events before AM grouping or
+muting. Stock AM Fanout may wait for failing test integrations; PD remains the
+existing direct branch. The final two-peer real-AM/rc7/new-NM fault matrix must
+pass before a live test route is enabled. Live wiring, quota, permissions,
+feedback and real PD receipt are separate acceptance gates. User approval is
+required for deployment; no cluster or real Feishu write is part of code tests.
 
-AM v0.23 uses per-integration dedup/retry/success logs, but its concurrent Fanout
-waits for branches and shares resources/group deadlines. Prove original NM/PD
-behavior with local mock 503/timeout/outage/reload tests before rollout. Appending
-integrations preserves original indices; do not insert or reorder original ones.
-Cross-receiver duplicates, legitimate AM repeat, request retries and Observer vs
-success-receipt intake need explicit reconciliation, not a permanent fingerprint
-plus startsAt dedupe claim. AM does not generally supply an Idempotency-Key.
+## Runtime configuration and control
 
-Notification webhooks do not guarantee all silenced/inhibited/short-lived raw
-events. Full raw regional coverage requires a persistent event outlet before
-muting/grouping, separately wired to Observer per source. This is missing runtime
-implementation. Do not call sampled snapshots or old NM success receipts complete
-raw event capture. Notification and raw-event coverage are separate gates.
-References: [v0.23 notification pipeline](https://github.com/prometheus/alertmanager/blob/v0.23.0/notify/notify.go)
-and [group dispatch](https://github.com/prometheus/alertmanager/blob/v0.23.0/dispatch/dispatch.go).
+The candidate reads the **existing unique** NotificationManager CR through
+`NM_CONFIGURATION_NAME=notification-manager`; it creates no second CR and never
+writes shared Receiver/Config credentials. Omission preserves the legacy global
+controller behavior. The named instance's Secret/ConfigMap cache is restricted
+to `NAMESPACE`; cross-namespace references require a reviewed compatibility/RBAC
+change. Cluster-scoped notification CRs and namespace metadata remain read-only.
 
-The new NM must begin with the production-compatible durable sender, independent
-single-writer PVC, original template/channel/filter/silence/batching semantics,
-reference-based credentials and retained card/receipt ledger. A test destination
-profile is an instance-local overlay, not a write to shared production Receiver
-CRs. Preserve original logical receiver identity and profile version. Freeze the
-profile and destination in each queued plan; old test tasks never become formal
-sends just because the active profile changes.
+`NM_DELIVERY_PROFILES_FILE` is strict JSON with version 1, `initial_test_version`,
+`retry_dedupe_window` (2m), `repeat_interval` (12h), and exactly two `profiles`:
 
-## Implementation boundaries of this PR
+- `test`: immutable `version`, `card_owner_id`, `receiver`, `source_chat_id`,
+  `test_chat_id`; the two chats must be the IDs above.
+- `formal`: immutable `version`, `card_owner_id`; original destinations remain
+  in the frozen plan. Formal starts unprepared/inactive.
 
-This PR contains the existing phase-one adapter, durable original sender,
-independent executor, relay metrics/gaps, safe pre-send retry classification,
-original deadline compatibility, receipt/card fencing and static test controller.
-It does **not** implement or validate all of the following promotion requirements:
+`NM_TEST_INTAKE_TOKEN`, `NM_FORMAL_INTAKE_TOKEN`, `NM_PROFILE_CONTROL_TOKEN` are
+independent credentials of at least 32 bytes. `/api/v2/test/alerts` accepts only
+the test token. Test `/verify` and `/notifications` reject requests. Existing
+`/api/v2/alerts`, `/verify`, `/notifications` require the formal token while
+profiles are enabled; an inactive/paused formal profile returns 503.
 
-- Named NotificationManager configuration binding and isolated test/formal
-  destination overlay. Current dynamic-cr observes all cluster-scoped NM CRs;
-  creating a second CR can reconfigure the old controller. Namespace separation
-  does not solve this. The test/uat-only static-isolated mode cannot be promoted.
-- Complete equivalence for all actual production channels and receiver variants.
-  The durable provider supports Feishu and webhook plans and refuses unsupported
-  notifier kinds. Inventory and implement any other actual channel before rollout.
-- A single infra-alerts callback consumer/router with old/new message ownership,
-  original ACK/claim/recovery writers and coordinated suggestion PATCH. Do not
-  start two competing WebSocket consumers. Original card state and old callbacks
-  must remain supported after the old sender stops, requiring a verified owner
-  handoff or legacy-handler mode rather than discarding their state.
-- Actual all-receiver AM overlay and v0.23 failure/reload evidence, cross-receiver
-  duplicate/retry/repeat reconciliation and pre-mute/pre-group raw event wiring.
+GET `/internal/delivery-profiles` reports persistent revision/state and target
+counts by lane. POST `/internal/delivery-profiles/{test|formal}/{prepare|activate|pause|resume}`
+requires the control token and JSON `expected_revision`, `version`, `actor`,
+`evidence`. Prepare checks the actual enabled Receiver selector, original chat,
+credentials, original template and durable adapter. The first test activation
+performs these checks at startup. CAS rejects races/stale revisions; restart
+retains state. Pause stops intake and future claims. To drain, first remove the
+AM test route, verify no new intake, leave test sending active until delivered
+or reconciled, then pause. In-flight external sends need explicit reconciliation.
 
-The deployment PR has retired its memory/static snapshot runtime and rejects
-all attempts to enable it. These requirements are development/deployment gates,
-not a boolean approval switch or evidence from earlier static fixture tests.
-Validation session instructions: deployment PR
-`jev-alert-center-sidechannel/VERIFICATION_HANDOFF.md`. Report code regression,
-design consistency and deployment readiness separately; A01-A17 remain pending.
+Accepted plans freeze profile ID/version/owner, actual destination, original
+production destination, rendered content, Receiver and transport options.
+`content_revision` hashes that actual snapshot; profile version identifies the
+delivery overlay, not every live CR edit. Changing the active formal profile
+never rewrites historical test targets. Literal Feishu appSecret values remain
+only in the original Config: the spool stores Config name/UID/public appID and
+resolves the credential at send time. Same-app secret rotation is supported;
+Config replacement/app identity drift is a known pre-send rejection. Preparation,
+freeze and send also check the public appID against the executor's scope.
 
-## Promotion of the same NM
+## Preinstalled receipt and card scopes
 
-After full-region dual-group acceptance and separate user approval:
+Both NM and executor mount `JEV_DELIVERY_SCOPES_FILE`. Strict JSON contains
+`version: 1` and `profiles` entries with `profile_id` (`test` or `formal`),
+`profile_version`, `card_owner_id`, `execution_domain`, `sender_app` (real appID),
+`receivers` and `destinations` allowlists. Each entry names
+`receipt_token_env`, `annotation_token_env`, `feedback_token_env`.
+NM parses public bindings without reading those six credential values; executor
+resolves independent credentials, all at least 32 bytes. Jev must preload the
+matching principals and card owners, including each receipt principal's profile
+ID, destinations, domain, owner and app. Upgrade/migrate Jev's optional profile
+receipt contract before enabling the NM producer.
 
-1. Remove test-NM webhooks while retaining Observer/original slots. Stop only test
-   intake and drain/reconcile frozen test plans while old NM serves production.
-2. Ready and verify the same new NM's formal endpoint/profile, credentials and
-   callback ownership. Keep image/PVC/identities and all formal receivers.
-3. Switch the original AM NM URL in its existing slot to the verified new formal
-   endpoint. Verify new intake and that old NM receives no new work; do not stop
-   the old endpoint or pause the original notification path before this switch.
-4. Drain/reconcile old accepted/in-flight/unknown work, then stop old sender via
-   authoritative CR/Operator/GitOps. Verify rc7 drain capability in advance. HA
-   reload is not an atomic cluster-wide switch: target ownership and retry
-   reconciliation across both ledgers are required before approval. During drain,
-   old sender only finishes work accepted before intake cutover.
-5. Verify receipts, original receiver/card parity and old-card callbacks. PD/Vector
-   and Observer continue. Old AM logs never become fabricated new NM receipts;
-   frozen test plans remain test sends and existing cards cannot cross chats.
+The executor selects the scope from **frozen profile ID/version and owner**.
+Each scope has its own receipt principal/outbox/card binding directory, under
+one process-level fenced root. `scope-binding.json` persists the public identity;
+reusing the same ID/version with different owner/domain/app/destination is
+rejected. Credential values never enter that file. Keep older scope entries
+installed for historical cards/pending work. Startup validates all registered
+NM profile versions, not just the newly active version. When no scope file is configured, empty-profile legacy receipts keep their
+existing global behavior. Scoped mode rejects missing profile provenance and
+requires only the six scope credentials, not extra global receipt/annotation/
+feedback tokens or a global owner/domain.
 
-Rollback follows the same safe order: ready/verify the previous formal endpoint,
-switch the AM URL back, verify intake, then drain/reconcile/stop the outgoing
-sender. Never point AM at a stopped endpoint or replay the entire spool. Each
-notification target must retain one owner across the handoff.
+Scope config and credentials are read on controlled restart; no file hot reload
+is implemented. After restart/formal activation, old test receipts, annotations
+and feedback continue to use test credentials and destinations. Cross-lane
+annotation tokens and cross-owner/destination success envelopes are rejected.
+The executor hosts `/internal/jev/successful-deliveries` with independent
+`JEV_EXECUTOR_TOKEN`; it never starts a production WebSocket consumer.
 
-Named configuration isolation is a hard precondition, not optional follow-up.
-Do not create another cluster-scoped NM CR until implementation and evidence
-prove the original controller cannot be reconfigured by it. That review blocker
-remains open; the disabled chart does not count as implementing isolation.
+New feedback buttons require `JEV_SHADOW_FEEDBACK_ENABLED=true`,
+`JEV_EXISTING_CALLBACK_INTEGRATED=true` and verified writer coordination. The
+existing callback must POST the seven verified snake_case fields (`app_id`,
+`source_event_id`, `actor_id`, `chat_id`, `message_id`, `action_reference`,
+`correct_label`) to `/internal/jev/card-feedback` using independent
+`JEV_CALLBACK_RELAY_TOKEN`. The relay is bounded to two seconds and rejects
+redirects; actual message binding selects the historical lane. Until the real
+callback helper is installed and validated, keep the gate off. Original buttons
+remain; invalid new feedback actions are omitted.
 
-## Provenance and release ownership
+## Durable retry, capacity and quota
 
-The PR is based on StarFarming99 master `5bb4646764670c0a2320804b5ff1be60fa07c81b`.
-Before documentation changes, its complete reconstructed tree was
-`61f0627fdd20031031981d1891b915f5b9f58dbf`, identical to tested candidate
-`db9c7b89df393ba851bf33dccaa03cc52b9e53ef`. Documentation-only changes do not
-change the candidate's executable inputs. Existing image:
-`harbor.op.zillizcloud.com/devops/notification-manager@sha256:169d03edeb422241fc72608e78e737058430eb342ceca5f8df01baba57b7049b`.
-It proves that candidate build/pull, not completion of the missing promotion gates.
+AM normally supplies no Idempotency-Key. Canonical identity includes trusted
+profile/version, transport receiver, groupKey and sorted alert status/labels/
+annotations/startsAt plus resolved EndsAt; peer externalURL and rolling firing
+EndsAt do not create another card. Concurrent/ACK-loss retries reuse the durable
+plan through the configured **12h repeat interval**, not only the declared 2m
+retry window. Pending/retryable/sending/unknown and unreconciled dead-letter
+work never creates another automatic copy merely because time elapsed. Changed
+content/status creates a new intent; completed identical content can repeat at
+the configured AM repeat boundary. Canonical history survives restart.
 
-Codex tests/builds/pushes NM/executor, Jev and Console as linux/amd64 immutable
-index digests to harbor.op.zillizcloud.com. The user builds AIOps. Required runtime
-changes need new tested images before their manifests can be enabled. No cluster,
-production DB or real chat is modified by this PR. A01–A17 remain pending.
+`NM_NOTIFICATION_SEND_INTERVAL` defaults to 2s for profile instances and bounds
+all workers and retries together (at most 30 send attempts/minute). Legacy
+instances keep their existing behavior. This is a sender budget; real shared
+infra-app quota headroom still needs live verification.
 
+`NM_NOTIFICATION_SPOOL_MAX_TARGETS`, `MAX_BYTES`, `RESERVE_BYTES` (all with the
+full `NM_NOTIFICATION_SPOOL_` prefix) preserve defaults 100000 active targets,
+8GiB file budget, 64MiB reserve. Only pending/retryable/sending/unknown count
+against active capacity. Confirmed completed payloads are cleaned after 48h,
+at most 200 intakes per minute. Unknown/unreconciled work is retained. Compact
+intake/dedupe tombstones retain explicit-key replay protection; metadata/audits
+and retained uncertainty still use the physical byte budget. Bolt reuses freed
+pages; file compaction/export is an offline maintenance step and never deletes
+uncertain ownership. Byte exhaustion or commit failure returns 503/readiness
+failure rather than accepting unpersisted notifications. `/status` and `/metrics`
+expose state counts, active/file limits and sanitized storage failure counters;
+a successful durable write clears a storage-outage health signal. The relay's
+existing gap journal/metrics expose missing receipt correlation.
 
-## 2026-10-09 acceptance repairs and AM research correction
+## Future stable-Service handoff and current limitations
 
-The durable AM handler now passes the pipeline's unnamed alert slice. Frozen
-History receives a stable internal ledger identity without changing legacy memory
-History rendering; full HTTP/atomic-plan/dependency tests cover both paths.
-Relay Close stops admission and joins cancelled deliveries and fsynced gap records
-within a two-second budget. Timeout is explicitly incomplete, and reconciliation
-scope is the current process's shutdown gaps. Immediate-exit reproduction journals
-all 101 accepted receipts. These repairs do not close pending profile/config/card
-ownership or duplicate/repeat gates, and nothing has been deployed.
+No AM/notification-api DNS replacement is needed for future promotion. The new
+same NM image can enable an additional **default-disabled** formal compatibility
+listener (`NM_FORMAL_COMPAT_LISTEN_ADDRESS=:19093`) while authenticated test/
+control stays at :19094. `NM_FORMAL_COMPAT_SOURCE_CIDRS` must contain explicit
+canonical source ranges, never /0. The listener checks direct RemoteAddr and
+ignores X-Forwarded-For, serves only legacy APIs, has no test/control/annotation
+routes and returns 503 until formal is prepared/active. Deployment NetworkPolicy
+must also restrict actual AM/notification-api identities; real CNI source-IP
+behavior is an unverified promotion gate.
 
-Stock AM's short-interval fault fixture delayed the next resolved delivery because
-Fanout waits for retries, but the single-instance 60s production-timer fixture did
-not show extra latency. The 9.75s number is not measured production impact. The
-user initially retained reuse-AM and asked to eliminate the effect before rollout;
-the latest human decision below supersedes that zero-delay requirement. A local
-optional AM binary study isolates side aggregation while preserving primary keys;
-it is not selected for phase one. Three-replica HA, contents/counts and resource
-cost remain unverified. See deployment REPAIR_HANDOFF.md and business
-infra/jev-alert-shadow/deploy/production/alertmanager-study/README.md.
+An upgraded Operator consumes the annotation
+`notification.kubesphere.io/sender-handoff` on the existing unique CR:
+`operation_id`, `phase` (active/retired/rollback), candidate `deployment`,
+`deployment_uid`, disjoint `selector`, and `drain_evidence` for retirement.
+It continually reconciles the stable Service, preserves ClusterIP and recreates
+it directly on the selected Ready backend. The candidate must explicitly enable
+compatibility on :19093, keep its primary listener on :19094, and use
+`/-/formal-ready` on :19094 as its readinessProbe. That endpoint checks enabled
+compatibility, prepared/active formal configuration and durable storage. A test
+`/-/ready` probe cannot authorize takeover. Switch the probe through a controlled
+rollout and wait for formal readiness before submitting handoff intent. Active retains the old sender for
+verified drain. Retired keeps the owned original Deployment at zero, including
+recreation. Rollback readies the original before switching the Service back.
+Removing an active annotation is rejected as an implicit unsafe rollback.
 
-Fixed NM/executor/recovery image (linux/amd64):
-harbor.op.zillizcloud.com/devops/notification-manager@sha256:8bdc7d032e49d8a2e8e237b6fba4f7179a3eb10279e6e60af61369d347ce2368
-Build revision: b7df11e3b00a5e7fa987fd4e05ca9d45c3839df5.
-Previous runtime digest remains historical evidence, not this repair candidate.
-
-
-## Latest human review decision (2026-10-09)
-
-The user accepts the discussed phase-one NM/Feishu failure and delivery-delay risk,
-with existing direct PD, and requests a fresh review before sidechannel launch.
-No new AM binary is selected; no deployment or formal promotion has occurred.
-See deployment REVIEW_DELIVERY.md. This does not waive missing named-production
-configuration/test-formal profile, callback owner or full runtime implementation.
-Do not create a second cluster-scoped NM CR that can reconfigure the original
-controller. PD's independence must be checked against the actual proposed overlay,
-not merely the old live config. Risk acceptance is not evidence of passed A01-A17.
+Test rollout leaves the current Operator unchanged. Future handoff requires
+the bundled `/notification-manager-operator` consumer enabled by a separately
+reviewed Operator workload upgrade, actual old rc7 queue/in-flight
+reconciliation evidence, real source fencing, original callback ownership, and
+complete receiver/channel/API parity. Literal custom chatbot credentials and
+other notifier adapters still block complete formal preparation. The annotation
+cannot prove old drain by itself. Fake-client reconciliation tests do not close
+these live gates. A01–A17 are not automatically passed by runtime unit tests.

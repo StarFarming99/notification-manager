@@ -57,13 +57,20 @@ func run() error {
 		return patcher, nil
 	})
 	relayToken := os.Getenv("JEV_EXECUTOR_TOKEN")
-	if len(relayToken) < 32 || relayToken == config.Token || relayToken == config.AnnotationToken || relayToken == config.FeedbackToken {
+	if !service.IndependentExecutorCredential(relayToken) {
 		return errors.New("executor relay credential must be independent")
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/jev/successful-deliveries", service.HandleSuccessfulDelivery(relayToken))
+	if service.FeedbackEnabled() {
+		callbackToken := os.Getenv("JEV_CALLBACK_RELAY_TOKEN")
+		if callbackToken == relayToken || !service.IndependentExecutorCredential(callbackToken) {
+			return errors.New("existing callback relay requires an independent credential")
+		}
+		mux.HandleFunc("/internal/jev/card-feedback", service.HandleCardFeedback(callbackToken))
+	}
 	mux.HandleFunc("/internal/jev/annotations/", func(w http.ResponseWriter, r *http.Request) {
 		// Legacy original card callbacks can write the same message. Until their
 		// writer coordination is verified, leave production annotation closed.
@@ -98,7 +105,7 @@ func run() error {
 	})
 	server := &http.Server{Addr: ":19095", Handler: bounded, ReadHeaderTimeout: 3 * time.Second,
 		ReadTimeout: 5 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 * 1024}
-	if service.FeedbackEnabled() {
+	if service.FeedbackEnabled() && config.Environment != "production" && config.Environment != "prod" {
 		go func() {
 			if err := feishu.StartJevFeedbackListener(ctx, logger, service, appID, appSecret); err != nil {
 				// Feedback failure affects only the executor, never NM readiness.

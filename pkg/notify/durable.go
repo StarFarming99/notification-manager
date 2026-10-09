@@ -156,6 +156,30 @@ func Freeze(logger log.Logger, ctl *controller.Controller, input map[internal.Re
 				return nil, err
 			}
 			for _, target := range targets {
+				if data.ProfileID != "" {
+					if f, ok := target.receiver.(*feishutype.Receiver); ok && f.Config != nil {
+						if shadow := ctl.GetJevShadow(); shadow != nil && shadow.Enabled() {
+							appID, err := ctl.GetCredential(f.AppID)
+							if err != nil {
+								return nil, err
+							}
+							if err := shadow.ValidateProfileSender(data.ProfileID, data.ProfileVersion, appID); err != nil {
+								return nil, err
+							}
+						}
+					}
+				}
+				if f, ok := target.receiver.(*feishutype.Receiver); ok && f.Config != nil && f.AppSecret != nil && f.AppSecret.Value != "" {
+					ref, err := ctl.FreezeFeishuCredentialReference(f.Config)
+					if err != nil {
+						return nil, err
+					}
+					config := *f.Config
+					config.AppSecret = nil
+					config.AppID = &v2beta2.Credential{Value: ref.AppID}
+					config.CredentialConfigRef = ref
+					f.Config = &config
+				}
 				raw, err := json.Marshal(target.receiver)
 				if err != nil {
 					return nil, err
@@ -194,6 +218,25 @@ func SendFrozen(ctx context.Context, logger log.Logger, ctl *controller.Controll
 			sendErr = &utils.PreSendError{Err: sendErr}
 		}
 	}()
+	if ctl.DeliveryProfiles != nil {
+		p, err := ctl.DeliveryProfiles.Store.ProfileVersion(target.ProfileID, target.ProfileVersion)
+		if err != nil {
+			return err
+		}
+		if target.Channel == constants.Feishu && strings.HasPrefix(target.Destination, "chat:") {
+			if shadow := ctl.GetJevShadow(); shadow != nil && shadow.Enabled() {
+				if err := shadow.ValidateProfileBinding(p.ID, p.Version, p.CardOwnerID, target.Receiver, strings.TrimPrefix(target.Destination, "chat:")); err != nil {
+					return err
+				}
+			}
+		}
+		if p.CardOwnerID != target.CardOwnerID {
+			return errors.New("frozen profile owner invalid")
+		}
+		if p.ID == "test" && (target.Destination != "chat:"+p.TestChatID || target.Channel != constants.Feishu || target.Receiver != p.Receiver || target.OriginalDestination != "chat:"+p.SourceChatID) {
+			return errors.New("frozen test destination invalid")
+		}
+	}
 	var frozen FrozenNotification
 	if err := json.Unmarshal(target.Payload, &frozen); err != nil {
 		return err
@@ -212,6 +255,43 @@ func SendFrozen(ctx context.Context, logger log.Logger, ctl *controller.Controll
 	}
 	if err := json.Unmarshal(frozen.Receiver, receiver); err != nil {
 		return err
+	}
+	if target.ProfileID != "" {
+		if frozen.Data.ProfileID != target.ProfileID || frozen.Data.ProfileVersion != target.ProfileVersion || frozen.Data.CardOwnerID != target.CardOwnerID || frozen.Data.OriginalDestination != target.OriginalDestination {
+			return errors.New("frozen profile payload mismatch")
+		}
+		if f, ok := receiver.(*feishutype.Receiver); ok {
+			if len(f.ChatIDs) != 1 || "chat:"+f.ChatIDs[0] != target.Destination || len(f.User) > 0 || len(f.Department) > 0 || f.ChatBot != nil {
+				if target.ProfileID == "test" {
+					return errors.New("frozen test transport escapes destination fence")
+				}
+			}
+		}
+	}
+	if target.ProfileID != "" {
+		if f, ok := receiver.(*feishutype.Receiver); ok && f.Config != nil {
+			if shadow := ctl.GetJevShadow(); shadow != nil && shadow.Enabled() {
+				appID, err := ctl.GetCredential(f.AppID)
+				if err != nil {
+					return err
+				}
+				if err := shadow.ValidateProfileSender(target.ProfileID, target.ProfileVersion, appID); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if f, ok := receiver.(*feishutype.Receiver); ok && f.Config != nil && f.CredentialConfigRef != nil {
+		secret, err := ctl.ResolveFeishuCredentialReference(f.CredentialConfigRef)
+		if err != nil {
+			return err
+		}
+		if f.AppID == nil || f.AppID.Value != f.CredentialConfigRef.AppID {
+			return errors.New("frozen app identity does not match credential config reference")
+		}
+		config := *f.Config
+		config.AppSecret = &v2beta2.Credential{Value: secret}
+		f.Config = &config
 	}
 	// Receiver defaults were frozen at intake; configure only transport options.
 	nf, err := factories[target.Channel](logger, receiver, ctl)
