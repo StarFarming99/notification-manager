@@ -70,6 +70,23 @@ the generated boundary-case fixture under `pkg/jevshadow/testdata`; tests run th
 and Python-invalid payloads through the Go decoder. String limits count Unicode code points, not
 UTF-8 bytes.
 
+For `policy-facts-v1`, `decision_source=conservative_policy` represents an
+evidence guard retaining `Oncall` while the model result remains available. Both
+raw probability distributions are retained. This source requires
+`threshold_applied=false`, `threshold_source=not_applicable`, and no
+`pool_min_probability`. Its reason must be one of `pool_reason_unclear`,
+`pool_reason_tie`, `critical_evidence_missing`, `material_risk_present`,
+`recurring_episode_unverified`, `first_notification_unconfirmed`, or
+`incident_binding_unconfirmed`. It cannot select Pool or pretend that the model
+was unavailable. Cards show the model probabilities separately from the conservative
+decision and its reason. Existing `model_policy` decisions still require the
+proposal to match the unrounded Pool probability and threshold.
+
+Upgrade the independent annotation executor to support this source before
+deploying a Jev producer that emits it. The sending Notification Manager does not
+need replacement for this consumer upgrade; the executor uses the same binary
+source under `cmd/jev-annotation-executor` in the Notification Manager image.
+
 The base card, writer identity, annotation components, global annotation revision,
 idempotency records, and confirmed/failed/unknown patch state are atomically persisted. A
 per-message advisory filesystem lock serializes processes sharing the same volume. Before a

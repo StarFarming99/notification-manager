@@ -992,6 +992,14 @@ func (c AnnotationComponent) validatePolicyFactsV1() error {
 		if c.PolicyProposal != expected {
 			return ErrInvalidPayload
 		}
+	case "conservative_policy":
+		// Keep the model's raw distributions even when an evidence guard retains
+		// Oncall. This is distinct from both threshold routing and model failure.
+		if !modelAvailable || c.PolicyProposal != "oncall" || *c.ThresholdApplied ||
+			c.PoolMinProbability != nil || c.ThresholdSource != "not_applicable" ||
+			!conservativePolicyReason(c.PolicyReasonCode) {
+			return ErrInvalidPayload
+		}
 	case "model_unavailable":
 		if modelAvailable || c.PolicyProposal != "original" || *c.ThresholdApplied ||
 			c.PoolMinProbability != nil || c.ThresholdSource != "not_applicable" {
@@ -1001,6 +1009,17 @@ func (c AnnotationComponent) validatePolicyFactsV1() error {
 		return ErrInvalidPayload
 	}
 	return nil
+}
+
+func conservativePolicyReason(code string) bool {
+	switch code {
+	case "pool_reason_unclear", "pool_reason_tie", "critical_evidence_missing",
+		"material_risk_present", "recurring_episode_unverified",
+		"first_notification_unconfirmed", "incident_binding_unconfirmed":
+		return true
+	default:
+		return false
+	}
 }
 
 func validateMemberEventIDs(values []string, schemaVersion string) error {
@@ -1192,6 +1211,8 @@ func (c AnnotationComponent) policyLineV2() string {
 			if c.PoolMinProbability != nil {
 				return "Policy: " + label + " · Pool threshold " + formatProbability(*c.PoolMinProbability)
 			}
+		case "conservative_policy":
+			return "Policy: " + label + " · Conservative policy · " + policyReasonLabel(c.PolicyReasonCode, nil)
 		case "model_unavailable":
 			return "Policy: " + label + " · Model unavailable"
 		}
