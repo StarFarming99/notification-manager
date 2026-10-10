@@ -43,3 +43,20 @@ func TestConfigFromEnvRejectsInvalidOptionalExpiry(t *testing.T) {
 		t.Fatalf("ConfigFromEnv() error = %v, want RFC3339 validation error", err)
 	}
 }
+
+func TestConfigFromEnvAnnotationProfilesRequireInstalledVersion(t *testing.T) {
+	setRequiredConfigEnv(t)
+	installedScopes(t)
+	t.Setenv(envAnnotationProfiles, "test:v1")
+	cfg, err := ConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cfg.AnnotationProfiles["test:v1"]; !ok || len(cfg.AnnotationProfiles) != 1 {
+		t.Fatal("explicit annotation profile not loaded", cfg.AnnotationProfiles)
+	}
+	t.Setenv(envAnnotationProfiles, "test:typo")
+	if _, err := ConfigFromEnv(); err == nil || !strings.Contains(err.Error(), envAnnotationProfiles) {
+		t.Fatal("uninstalled activation accepted", err)
+	}
+}

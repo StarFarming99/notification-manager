@@ -30,10 +30,13 @@ const (
 	envReceiptDrainTimeout  = "JEV_SHADOW_RECEIPT_DRAIN_TIMEOUT"
 	envCardStateDir         = "JEV_SHADOW_CARD_STATE_DIR"
 	envFeedbackEnabled      = "JEV_SHADOW_FEEDBACK_ENABLED"
+	envAnnotationProfiles   = "JEV_ANNOTATION_ENABLED_PROFILES"
 )
 
 type Config struct {
 	DeliveryScopes                            map[string]DeliveryScope
+	AnnotationProfiles                        map[string]struct{}
+	annotationProfileEnabled                  bool
 	expectedProfileID, expectedProfileVersion string
 	CardOwnerID                               string
 	ExecutionDomain                           string
@@ -75,6 +78,7 @@ func ConfigFromEnv() (Config, error) {
 	}
 
 	config.ExistingCallbackIntegrated = os.Getenv("JEV_EXISTING_CALLBACK_INTEGRATED") == "true"
+	config.AnnotationProfiles = csvSet(os.Getenv(envAnnotationProfiles))
 	config.ReceiptURL = strings.TrimSpace(os.Getenv(envReceiptURL))
 	config.ObservationURL = strings.TrimSpace(os.Getenv("JEV_SHADOW_OBSERVATION_URL"))
 	config.ExcludedIdentityLabels = csvSet(os.Getenv("JEV_SHADOW_IDENTITY_EXCLUDED_LABELS"))
@@ -131,6 +135,13 @@ func ConfigFromEnv() (Config, error) {
 }
 
 func (c Config) validate() error {
+	if len(c.AnnotationProfiles) > 0 && c.expectedProfileID == "" {
+		for key := range c.AnnotationProfiles {
+			if _, ok := c.DeliveryScopes[key]; !ok {
+				return fmt.Errorf("%s must name an installed profile/version", envAnnotationProfiles)
+			}
+		}
+	}
 	if c.Environment == "production" {
 		if len(c.DeliveryScopes) == 0 && (c.CardOwnerID == "" || c.ExecutionDomain == "") {
 			return fmt.Errorf("production executor requires explicit card owner and execution domain")

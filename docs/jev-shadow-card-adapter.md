@@ -105,6 +105,15 @@ full-card PATCH could otherwise restore stale firing/unacknowledged content. Pro
 any UAT receiver with an active external card-mutating callback must therefore remain blocked
 until that writer is integrated or a verified remote-card reconciliation path is added.
 
+For production executors with versioned delivery scopes, verified coordination is a
+separate gate from writer activation. `JEV_ANNOTATION_ENABLED_PROFILES=test:v1`
+enables only cards already bound to that installed profile/version; the default
+keeps every production profile closed. Other installed scopes retain receipts and
+history but return 503 for annotation even with their own valid credential. A scope
+name or version absent from the installed registry fails startup. Development and
+UAT annotation behavior is unchanged. The existing executor coordination gate
+must also remain closed until the deployed callback's actual write paths are audited.
+
 Receipt and card state persist at their configured paths, but a container-local filesystem
 does not survive Kubernetes pod replacement. UAT must mount both paths on the same writable,
 single-writer or advisory-lock-capable persistent volume when pod-level recovery is required.

@@ -153,6 +153,8 @@ func New(logger log.Logger, config Config, client *http.Client) (*Service, error
 			childConfig.DeliveryScopes = nil
 			childConfig.expectedProfileID = scope.ProfileID
 			childConfig.expectedProfileVersion = scope.ProfileVersion
+			_, childConfig.annotationProfileEnabled = config.AnnotationProfiles[key]
+			childConfig.AnnotationProfiles = nil
 			childConfig.CardOwnerID = scope.CardOwnerID
 			childConfig.ExecutionDomain = scope.ExecutionDomain
 			childConfig.SenderApp = scope.SenderApp
@@ -327,6 +329,14 @@ func (s *Service) HandleAnnotation(w http.ResponseWriter, r *http.Request, messa
 	}
 	if !s.authorized(r.Header.Get("Authorization")) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	// A production coordination attestation does not enable every installed
+	// historical scope. Only explicitly activated profile/version writers may
+	// mutate their own persisted cards; receipts and legacy UAT stay independent.
+	if (s.config.Environment == "production" || s.config.Environment == "prod") &&
+		!s.config.annotationProfileEnabled {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "annotation profile is disabled"})
 		return
 	}
 	if strings.TrimSpace(messageID) == "" {

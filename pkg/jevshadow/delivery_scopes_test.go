@@ -66,6 +66,7 @@ func TestPreinstalledScopesKeepHistoricalTestOwnerTokensAndCardAfterRestart(t *t
 	cfg.CardOwnerID = ""
 	cfg.ExecutionDomain = ""
 	cfg.DeliveryScopes = installedScopes(t)
+	cfg.AnnotationProfiles = map[string]struct{}{"test:v1": {}}
 	cfg.FeedbackEnabled = true
 	cfg.ExistingCallbackIntegrated = true
 	t.Setenv("JEV_CARD_STATE_COORDINATED", "true")
@@ -139,10 +140,20 @@ func TestPreinstalledScopesKeepHistoricalTestOwnerTokensAndCardAfterRestart(t *t
 			t.Fatal(tc.want, w.Code, w.Body.String())
 		}
 	}
-	feedback := `{"app_id":"infra-alerts","source_event_id":"old-test-click","actor_id":"actor","chat_id":"oc_test","message_id":"om_test","action_reference":"signed","correct_label":"accurate"}`
-	r := httptest.NewRequest("POST", "/internal/jev/card-feedback", strings.NewReader(feedback))
-	r.Header.Set("Authorization", "Bearer "+token)
+	// Installing the inactive formal scope is necessary to preserve history,
+	// but its own credential must not activate writes while only test:v1 is on.
+	r := httptest.NewRequest("PUT", "/internal/jev/annotations/om_formal", bytes.NewReader(body))
+	r.Header.Set("Authorization", "Bearer "+cfg.DeliveryScopes["formal:v1"].annotationToken)
+	r.Header.Set("Idempotency-Key", "inactive-formal-annotation")
 	w := httptest.NewRecorder()
+	service.HandleAnnotation(w, r, "om_formal")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatal("inactive formal annotation scope accepted", w.Code, w.Body.String())
+	}
+	feedback := `{"app_id":"infra-alerts","source_event_id":"old-test-click","actor_id":"actor","chat_id":"oc_test","message_id":"om_test","action_reference":"signed","correct_label":"accurate"}`
+	r = httptest.NewRequest("POST", "/internal/jev/card-feedback", strings.NewReader(feedback))
+	r.Header.Set("Authorization", "Bearer "+token)
+	w = httptest.NewRecorder()
 	service.HandleCardFeedback(token)(w, r)
 	if w.Code != 202 {
 		t.Fatal(w.Code, w.Body.String())
@@ -154,6 +165,46 @@ func TestPreinstalledScopesKeepHistoricalTestOwnerTokensAndCardAfterRestart(t *t
 		}
 	case <-time.After(time.Second):
 		t.Fatal("feedback not relayed")
+	}
+}
+
+func TestProductionAnnotationProfileDefaultsClosedAndRequiresInstalledVersion(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer upstream.Close()
+	cfg := testConfig(upstream.URL + "/v1/delivery-receipts")
+	cfg.Environment = "production"
+	cfg.ObservationURL = upstream.URL + "/v1/observations"
+	cfg.FeedbackEnabled = false
+	cfg.DeliveryScopes = installedScopes(t)
+	cfg.ReceiptOutboxDir = t.TempDir()
+	cfg.CardStateDir = t.TempDir()
+	service, err := New(log.NewNopLogger(), cfg, upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	patchCalls := 0
+	child := service.scopeServices["test:v1"]
+	if err := child.captureCardBinding("critical", "oc_test", "om_disabled", map[string]interface{}{"elements": []interface{}{}}, func(context.Context, string, map[string]interface{}) error {
+		patchCalls++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(validV2Component())
+	r := httptest.NewRequest("PUT", "/internal/jev/annotations/om_disabled", bytes.NewReader(body))
+	r.Header.Set("Authorization", "Bearer "+cfg.DeliveryScopes["test:v1"].annotationToken)
+	r.Header.Set("Idempotency-Key", "default-disabled-annotation")
+	w := httptest.NewRecorder()
+	service.HandleAnnotation(w, r, "om_disabled")
+	if w.Code != http.StatusServiceUnavailable || patchCalls != 0 {
+		t.Fatal("production write enabled without a profile activation", w.Code, patchCalls)
+	}
+	cfg.AnnotationProfiles = map[string]struct{}{"test:uninstalled": {}}
+	if _, err := New(log.NewNopLogger(), cfg, upstream.Client()); err == nil || !strings.Contains(err.Error(), envAnnotationProfiles) {
+		t.Fatal("uninstalled annotation profile/version accepted", err)
 	}
 }
 
