@@ -27,6 +27,7 @@ type File struct {
 	RepeatInterval     string                  `json:"repeat_interval"`
 }
 type Manager struct {
+	RecordAdmissionFailure               func(string)
 	Store                                *spool.Store
 	Window                               time.Duration
 	RepeatInterval                       time.Duration
@@ -135,6 +136,9 @@ func (m *Manager) Guard(id string, next http.HandlerFunc) http.HandlerFunc {
 		}
 		snap, err := m.Store.ProfileSnapshot(id)
 		if err != nil {
+			if m.RecordAdmissionFailure != nil {
+				m.RecordAdmissionFailure(id)
+			}
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "delivery profile not accepting", http.StatusServiceUnavailable)
 			return
@@ -159,6 +163,9 @@ func (m *Manager) FormalCompatibility(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		snapshot, err := m.Store.ProfileSnapshot("formal")
 		if err != nil {
+			if m.RecordAdmissionFailure != nil {
+				m.RecordAdmissionFailure("formal")
+			}
 			http.Error(w, "formal delivery profile not accepting", 503)
 			return
 		}

@@ -50,6 +50,7 @@ func New(logger log.Logger, notifierCtl *controller.Controller, alerts *store.Al
 	h.router.Get("/receiverWithConfig", h.handler.ListReceiverWithConfig)
 	formalAlert, formalVerify, formalNotification := h.handler.Alert, h.handler.Verify, h.handler.Notification
 	if profiles := notifierCtl.DeliveryProfiles; profiles != nil {
+		profiles.RecordAdmissionFailure = h.handler.RecordProfileAdmissionFailure
 		formalAlert = profiles.Guard("formal", formalAlert)
 		formalVerify = profiles.Guard("formal", formalVerify)
 		formalNotification = profiles.Guard("formal", formalNotification)
@@ -66,6 +67,9 @@ func New(logger log.Logger, notifierCtl *controller.Controller, alerts *store.Al
 	}
 	h.router.Post("/api/v2/alerts", formalAlert)
 	if shadow := notifierCtl.GetJevShadow(); shadow != nil && shadow.Enabled() && !shadow.IsRelay() {
+		h.router.Get("/internal/jev/annotations/{messageID}", func(w http.ResponseWriter, r *http.Request) {
+			shadow.HandleAnnotationStatus(w, r, chi.URLParam(r, "messageID"))
+		})
 		h.router.Put("/internal/jev/annotations/{messageID}", func(w http.ResponseWriter, r *http.Request) {
 			shadow.HandleAnnotation(w, r, chi.URLParam(r, "messageID"))
 		})

@@ -63,3 +63,7 @@ func DeliveryOutcome(err error) (string, string) {
 	}
 	return "unknown", "platform_result_uncertain"
 }
+
+// MarkDeliveryStarted is used by non-HTTP-helper transports immediately before
+// a notification can leave the process (SMTP DATA or an SDK publish).
+func MarkDeliveryStarted(ctx context.Context) { markDelivery(ctx) }

@@ -19,8 +19,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/modern-go/reflect2"
-
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/kubesphere/notification-manager/pkg/async"
@@ -168,6 +166,25 @@ func (n *Notifier) Notify(ctx context.Context, data *template.Data) error {
 		_ = level.Error(n.logger).Log("msg", "EmailNotifier: unknown message type", "type", n.receiver.TmplType)
 		return utils.Errorf("Unknown message type, %s", n.receiver.TmplType)
 	}
+	if err != nil {
+		return err
+	}
+
+	// A durable target has one independently acknowledged destination. Wait for
+	// its SMTP worker to stop before returning: Group.Wait can return on timeout
+	// while a worker is still before DATA, which must not become a retry while
+	// that same worker can later send the accepted notification.
+	if n.receiver.Frozen {
+		for _, to := range n.receiver.To {
+			if err := sendEmail(to, subject, body); err != nil {
+				return err
+			}
+			if n.sentSuccessfulHandler != nil {
+				(*n.sentSuccessfulHandler)(data.Alerts)
+			}
+		}
+		return nil
+	}
 
 	group := async.NewGroup(ctx)
 	for _, t := range n.receiver.To {
@@ -187,27 +204,55 @@ func (n *Notifier) Notify(ctx context.Context, data *template.Data) error {
 	return group.Wait()
 }
 
-func (n *Notifier) send(ctx context.Context, to, subject, body string) error {
+// dialSMTP binds both plain SMTP and implicit TLS to the same attempt context.
+// Cleanup stops its cancellation callback and always closes the raw connection.
+func dialSMTP(ctx context.Context, addr string, tlsConfig *tls.Config) (net.Conn, func(), error) {
+	d := net.Dialer{}
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, nil, err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			_ = conn.Close()
+			return nil, nil, err
+		}
+	}
+	// SMTP protocol operations are not context-aware. Close the underlying
+	// connection on cancellation so neither a greeting nor a delayed RCPT can
+	// resume after the durable attempt has been returned as safe to retry.
+	cancelConn := conn
+	stopClose := context.AfterFunc(ctx, func() { _ = cancelConn.Close() })
+	cleanup := func() {
+		stopClose()
+		_ = cancelConn.Close()
+	}
+	if tlsConfig != nil {
+		tlsConn := tls.Client(conn, tlsConfig)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			cleanup()
+			return nil, nil, err
+		}
+		conn = tlsConn
+	}
+	return conn, cleanup, nil
+}
 
+func (n *Notifier) send(ctx context.Context, to, subject, body string) error {
 	addr := fmt.Sprintf("%s:%d", n.receiver.SmartHost.Host, n.receiver.SmartHost.Port)
-	var err error
-	var conn net.Conn
+	var tlsConfig *tls.Config
 	if n.receiver.SmartHost.Port == 465 {
-		tlsConfig, err := n.newTLSConfig()
+		var err error
+		tlsConfig, err = n.newTLSConfig()
 		if err != nil {
 			return err
 		}
-		conn, err = tls.Dial("tcp", addr, tlsConfig)
-	} else {
-		d := net.Dialer{}
-		conn, err = d.DialContext(ctx, "tcp", addr)
 	}
+	conn, cleanup, err := dialSMTP(ctx, addr, tlsConfig)
 	if err != nil {
 		return err
 	}
-	if reflect2.IsNil(conn) {
-		return utils.Errorf("failed to connect to %s", addr)
-	}
+	defer cleanup()
 
 	c, err := smtp.NewClient(conn, n.receiver.SmartHost.Host)
 	if err != nil {
@@ -276,6 +321,10 @@ func (n *Notifier) send(ctx context.Context, to, subject, body string) error {
 	}
 
 	// Send the email headers and body.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	utils.MarkDeliveryStarted(ctx)
 	message, err := c.Data()
 	if err != nil {
 		return err
@@ -285,7 +334,6 @@ func (n *Notifier) send(ctx context.Context, to, subject, body string) error {
 	multipartWriter := multipart.NewWriter(multipartBuffer)
 	defer func() {
 		_ = multipartWriter.Close()
-		_ = message.Close()
 	}()
 
 	buffer := &bytes.Buffer{}
@@ -325,7 +373,12 @@ func (n *Notifier) send(ctx context.Context, to, subject, body string) error {
 	_ = qw.Close()
 
 	_, err = message.Write(multipartBuffer.Bytes())
-	return err
+	if err != nil {
+		return err
+	}
+	// Close completes DATA and reads the server's final acknowledgement. A
+	// socket write alone cannot prove delivery if that response is lost.
+	return message.Close()
 }
 
 func (n *Notifier) newTLSConfig() (*tls.Config, error) {

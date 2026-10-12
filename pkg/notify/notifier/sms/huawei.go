@@ -60,7 +60,7 @@ func NewHuaweiProvider(c *controller.Controller, providers *v2beta2.Providers, p
 	}
 }
 
-func (h *HuaweiNotifier) MakeRequest(_ context.Context, messages string) error {
+func (h *HuaweiNotifier) MakeRequest(ctx context.Context, messages string) error {
 	appKey, err := h.notifierCtl.GetCredential(h.AppKey)
 	if err != nil {
 		return utils.Errorf("[Huawei SendSms]cannot get appKey: %s", err.Error())
@@ -94,7 +94,8 @@ func (h *HuaweiNotifier) MakeRequest(_ context.Context, messages string) error {
 	req.Header.Set("X-WSSE", xheader)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := client.Do(req)
+	utils.MarkDeliveryStarted(ctx)
+	resp, err := client.Do(req.WithContext(ctx))
 	if err != nil {
 		return utils.Errorf("[Huawei SendSms] An API error occurs: %s", err.Error())
 	}

@@ -133,8 +133,15 @@ func TestFeishuFreezeSplitsEveryOriginalPathAndRejectsPlaintext(t *testing.T) {
 		if r.ChatBot != nil {
 			paths++
 		}
-		if paths != 1 || !r.Frozen || r.Common.Name != "critical" || r.Config == nil || r.AppSecret.ValueFrom == nil {
+		if paths != 1 || !r.Frozen || r.Common.Name != "critical" {
 			t.Fatal("target not isolated/frozen", string(frozen.Receiver))
+		}
+		if r.ChatBot != nil {
+			if r.Config != nil || r.ChatBot.Webhook.ValueFrom == nil {
+				t.Fatal("chatbot must retain only its own transport credential")
+			}
+		} else if r.Config == nil || r.AppSecret.ValueFrom == nil {
+			t.Fatal("original app credential reference missing")
 		}
 	}
 	receiver.AppSecret = &v2beta2.Credential{Value: "synthetic-plaintext-must-not-persist"}
@@ -143,5 +150,40 @@ func TestFeishuFreezeSplitsEveryOriginalPathAndRejectsPlaintext(t *testing.T) {
 	}
 	if strings.Contains(string(plan[0].Payload), "synthetic-plaintext") {
 		t.Fatal("immutable plan mutated")
+	}
+}
+
+func TestFormalOtherGroupsAndAPIDoNotRequireJevBinding(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "scopes.json")
+	raw := `{"version":1,"profiles":[{"profile_id":"test","profile_version":"v1","card_owner_id":"test-owner","execution_domain":"test-domain","sender_app":"expected-app","receivers":["critical"],"destinations":["test-chat"],"receipt_token_env":"TEST_RECEIPT","annotation_token_env":"TEST_ANNOTATION","feedback_token_env":"TEST_FEEDBACK"},{"profile_id":"formal","profile_version":"v1","card_owner_id":"formal-owner","execution_domain":"formal-domain","sender_app":"expected-app","receivers":["critical"],"destinations":["production-chat"],"receipt_token_env":"FORMAL_RECEIPT","annotation_token_env":"FORMAL_ANNOTATION","feedback_token_env":"FORMAL_FEEDBACK"}]}`
+	if err := os.WriteFile(file, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range map[string]string{"JEV_SHADOW_ENABLED": "true", "JEV_DELIVERY_SCOPES_FILE": file, "JEV_SHADOW_SENDER_APP": "expected-app", "JEV_SHADOW_RECEIVER_ALLOWLIST": "critical", "JEV_SHADOW_DESTINATION_ALLOWLIST": "production-chat", "JEV_EXECUTOR_SUCCESS_URL": "http://unused.invalid", "JEV_EXECUTOR_TOKEN": strings.Repeat("x", 32)} {
+		t.Setenv(key, value)
+	}
+	shadow, err := jevshadow.NewNMFromEnv(log.NewNopLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	ctl := testController(t, `{{define "frozen"}}{"elements":[]}{{end}}`)
+	ctl.SetJevShadow(shadow)
+	ref := &v2beta2.Credential{ValueFrom: &v2beta2.ValueSource{SecretKeyRef: &v2beta2.SecretKeySelector{Name: "never-read", Key: "secret"}}}
+	receiver := &feishutype.Receiver{Common: &internal.Common{Name: "another-receiver", Type: "feishu", Template: internal.Template{TmplName: "frozen", TmplType: "interactive"}}, ChatIDs: []string{"another-original-group"}, Config: &feishutype.Config{AppID: &v2beta2.Credential{Value: "another-original-app"}, AppSecret: ref}}
+	data := &template.Data{ProfileID: "formal", ProfileVersion: "v1", CardOwnerID: "formal-owner", Alerts: template.Alerts{{ID: "legacy", Labels: template.KV{"alertname": "another-original-channel", "severity": "critical"}}}}
+	plan, err := Freeze(log.NewNopLogger(), ctl, map[internal.Receiver][]*template.Data{receiver: {data}})
+	if err != nil || len(plan) != 1 {
+		t.Fatal("non-Jev formal destination rejected", err)
+	}
+	receiver.Common.Name = "critical"
+	receiver.ChatIDs = []string{"production-chat"}
+	data.JevCaptureExcluded = true
+	if _, err := Freeze(log.NewNopLogger(), ctl, map[internal.Receiver][]*template.Data{receiver: {data}}); err != nil {
+		t.Fatal("original inline API blocked by unrelated Jev app", err)
+	}
+	data.JevCaptureExcluded = false
+	if _, err := Freeze(log.NewNopLogger(), ctl, map[internal.Receiver][]*template.Data{receiver: {data}}); err == nil {
+		t.Fatal("scoped AM app identity fence bypassed")
 	}
 }

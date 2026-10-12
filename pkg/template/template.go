@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	tmpltext "text/template"
 	"time"
@@ -332,4 +333,36 @@ func (t *Template) Expired(expiredAt time.Duration) bool {
 	}
 
 	return false
+}
+
+// Snapshot freezes the parsed template catalogue and translation dictionary.
+// Legacy channels keep their original message splitting/title/HTML behaviour
+// while accepted work cannot pick up a later ConfigMap or template edit.
+type Snapshot struct {
+	Language    string                       `json:"language"`
+	Definitions []string                     `json:"definitions"`
+	Dictionary  map[string]map[string]string `json:"dictionary,omitempty"`
+}
+
+func (t *Template) Snapshot() Snapshot {
+	names := []string{}
+	for _, parsed := range t.text.Templates() {
+		if parsed.Name() != "" && parsed.Tree != nil {
+			names = append(names, parsed.Name())
+		}
+	}
+	sort.Strings(names)
+	result := Snapshot{Language: t.language, Dictionary: t.dictionary}
+	for _, name := range names {
+		result.Definitions = append(result.Definitions, fmt.Sprintf("{{define %q}}%s{{end}}", name, t.text.Lookup(name).Tree.Root.String()))
+	}
+	return result
+}
+func FromSnapshot(s Snapshot) (*Template, error) {
+	t, err := New(s.Language, nil)
+	if err != nil {
+		return nil, err
+	}
+	t.dictionary = s.Dictionary
+	return t.ParserText(s.Definitions...)
 }

@@ -15,6 +15,7 @@ var (
 )
 
 type Data struct {
+	JevCaptureExcluded  bool    `json:"jev_capture_excluded,omitempty"`
 	ProfileID           string  `json:"profile_id,omitempty"`
 	ProfileVersion      string  `json:"profile_version,omitempty"`
 	CardOwnerID         string  `json:"card_owner_id,omitempty"`
@@ -83,8 +84,9 @@ func (d *Data) Status() string {
 
 func (d *Data) Clone() *Data {
 	nd := &Data{
-		Alerts:    nil,
-		ProfileID: d.ProfileID, ProfileVersion: d.ProfileVersion, CardOwnerID: d.CardOwnerID, OriginalDestination: d.OriginalDestination,
+		Alerts:             nil,
+		JevCaptureExcluded: d.JevCaptureExcluded,
+		ProfileID:          d.ProfileID, ProfileVersion: d.ProfileVersion, CardOwnerID: d.CardOwnerID, OriginalDestination: d.OriginalDestination,
 		DeliveryID:        d.DeliveryID,
 		FrozenContent:     d.FrozenContent,
 		GroupLabels:       d.GroupLabels.Clone(),

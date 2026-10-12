@@ -186,7 +186,7 @@ func (n *Notifier) Notify(ctx context.Context, data *template.Data) error {
 
 		sendMessage := func() (bool, error) {
 
-			accessToken, err := n.getToken(ctx, r)
+			accessToken, err := n.getToken(utils.CredentialContext(ctx), r)
 			if err != nil {
 				_ = level.Error(n.logger).Log("msg", "WechatNotifier: get access token error", "error", err.Error())
 				return false, err
@@ -383,7 +383,7 @@ func (n *Notifier) sendToChatBot(ctx context.Context, data *template.Data) error
 		}
 		request.Header.Set("Content-Type", "application/json")
 
-		body, err := utils.DoHttpRequest(context.Background(), nil, request)
+		body, err := utils.DoHttpRequest(ctx, nil, request.WithContext(ctx))
 		if err != nil {
 			_ = level.Error(n.logger).Log("msg", "wechatBotNotifier: do http error", "error", err)
 			return err

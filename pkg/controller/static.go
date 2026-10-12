@@ -54,7 +54,10 @@ func NewStatic(ctx context.Context, logger log.Logger, config StaticConfiguratio
 	}
 	c := &Controller{logger: logger, ctx: ctx, history: config.History, staticIsolated: true, staticCluster: config.Cluster, staticRouters: config.Routers, staticSilences: config.Silences,
 		receivers: make(map[string]map[string]internal.Receiver), configs: make(map[string]map[string]internal.Config),
-		ch: make(chan *task, ChannelCapacity), tenantKey: defaultTenantKey, ReceiverOpts: config.Options,
+		globalReceiverSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"type": "global"}},
+		defaultConfigSelector:  &metav1.LabelSelector{MatchLabels: map[string]string{"type": "default"}},
+		tenantReceiverSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"type": "tenant"}},
+		ch:                     make(chan *task, ChannelCapacity), tenantKey: defaultTenantKey, ReceiverOpts: config.Options,
 		batchMaxSize: 100, batchMaxWait: metav1.Duration{Duration: time.Second}, groupLabels: config.GroupLabels, tmpl: tmpl}
 	c.receivers[globalTenantID] = make(map[string]internal.Receiver)
 	// Global receivers resolve credentials through defaultConfig, just like

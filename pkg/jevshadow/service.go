@@ -232,7 +232,7 @@ func (s *Service) CaptureSuccessfulDelivery(
 	baseCard map[string]interface{},
 	patcher CardPatcher,
 ) {
-	if !s.ShouldCapture(receiver, destination) {
+	if data == nil || data.JevCaptureExcluded || !s.ShouldCapture(receiver, destination) {
 		return
 	}
 	if s.IsRelay() {

@@ -41,7 +41,7 @@ func NewTencentProvider(c *controller.Controller, providers *v2beta2.Providers, 
 	}
 }
 
-func (t *TencentNotifier) MakeRequest(_ context.Context, messages string) error {
+func (t *TencentNotifier) MakeRequest(ctx context.Context, messages string) error {
 	secretId, err := t.notifierCtl.GetCredential(t.SecretId)
 	if err != nil {
 		return utils.Errorf("[Tencent SendSms]cannot get accessKeyId: %s", err.Error())
@@ -63,6 +63,7 @@ func (t *TencentNotifier) MakeRequest(_ context.Context, messages string) error 
 	req.TemplateID = common.StringPtr(t.TemplateID)
 	req.PhoneNumberSet = common.StringPtrs(t.PhoneNums)
 
+	utils.MarkDeliveryStarted(ctx)
 	resp, err := client.SendSms(req)
 
 	if err != nil {

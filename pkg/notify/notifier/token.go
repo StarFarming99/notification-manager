@@ -7,7 +7,6 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
-	"github.com/kubesphere/notification-manager/pkg/utils"
 )
 
 type token struct {
@@ -18,8 +17,9 @@ type token struct {
 }
 
 type AccessTokenService struct {
-	mutex  sync.Mutex
-	tokens map[string]*token
+	mutex    sync.Mutex
+	tokens   map[string]*token
+	inFlight map[string]chan struct{}
 }
 
 var ats *AccessTokenService
@@ -34,70 +34,63 @@ func GetAccessTokenService() *AccessTokenService {
 	return ats
 }
 
+// Token cache locks protect only cache access. Remote token acquisition uses the
+// caller deadline directly and leaves no detached goroutine after cancellation.
 func (ats *AccessTokenService) InvalidToken(ctx context.Context, key string, l log.Logger) {
-
-	ats.mutex.Lock()
-	defer ats.mutex.Unlock()
-
-	ch := make(chan interface{})
-
-	go func() {
-		t, ok := ats.tokens[key]
-		if ok {
-			t.accessTokenAt = time.Time{}
-		}
-		ch <- struct{}{}
-	}()
-
-	select {
-	case <-ctx.Done():
+	if ctx.Err() != nil {
 		_ = level.Error(l).Log("msg", "invalid token timeout")
 		return
-	case <-ch:
-		return
+	}
+	ats.mutex.Lock()
+	defer ats.mutex.Unlock()
+	if t, ok := ats.tokens[key]; ok {
+		t.accessTokenAt = time.Time{}
 	}
 }
 
-func (ats *AccessTokenService) GetToken(ctx context.Context, key string, getToken func(ctx context.Context) (string, time.Duration, error)) (string, error) {
-
-	ats.mutex.Lock()
-	defer ats.mutex.Unlock()
-
-	ch := make(chan interface{})
-
-	go func() {
-		t, ok := ats.tokens[key]
-		if ok && time.Since(t.accessTokenAt) < t.expires {
-			ch <- t.accessToken
-			return
+func (ats *AccessTokenService) GetToken(ctx context.Context, key string, getToken func(context.Context) (string, time.Duration, error)) (string, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
 		}
-
-		accessToken, expires, err := getToken(ctx)
-		if err != nil {
-			ch <- err
-			return
-		} else {
-			ats.tokens[key] = &token{
-				accessToken:   accessToken,
-				accessTokenAt: time.Now(),
-				expires:       expires,
+		ats.mutex.Lock()
+		if t, ok := ats.tokens[key]; ok && time.Since(t.accessTokenAt) < t.expires {
+			value := t.accessToken
+			ats.mutex.Unlock()
+			return value, nil
+		}
+		if waiting := ats.inFlight[key]; waiting != nil {
+			ats.mutex.Unlock()
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-waiting:
+				continue
 			}
-			ch <- accessToken
-			return
 		}
-	}()
+		if ats.inFlight == nil {
+			ats.inFlight = make(map[string]chan struct{})
+		}
+		done := make(chan struct{})
+		ats.inFlight[key] = done
+		ats.mutex.Unlock()
 
-	select {
-	case <-ctx.Done():
-		return "", utils.Error("get token timeout")
-	case val := <-ch:
-		switch val.(type) {
-		case error:
-			return "", val.(error)
-		case string:
-			return val.(string), nil
-		default:
-			return "", utils.Error("wrong token type")
+		// Only the acquiring caller performs I/O. Other callers wait with their own
+		// deadlines; no token-fetch goroutine can outlive a cancelled acquisition.
+		value, expires, err := getToken(ctx)
+		if err == nil {
+			err = ctx.Err()
 		}
+		ats.mutex.Lock()
+		if err == nil {
+			ats.tokens[key] = &token{accessToken: value, accessTokenAt: time.Now(), expires: expires}
+		}
+		delete(ats.inFlight, key)
+		close(done)
+		ats.mutex.Unlock()
+		if err != nil {
+			return "", err
+		}
+		return value, nil
 	}
 }

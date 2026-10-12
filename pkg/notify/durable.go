@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/url"
 	"sort"
 	"strings"
@@ -23,11 +22,13 @@ import (
 )
 
 type FrozenNotification struct {
-	Version  int              `json:"version"`
-	Receiver json.RawMessage  `json:"receiver"`
-	Options  *v2beta2.Options `json:"options,omitempty"`
-	Data     *template.Data   `json:"data"`
-	Content  string           `json:"content"`
+	Version              int                              `json:"version"`
+	Receiver             json.RawMessage                  `json:"receiver"`
+	Options              *v2beta2.Options                 `json:"options,omitempty"`
+	Data                 *template.Data                   `json:"data"`
+	Content              string                           `json:"content"`
+	TemplateSnapshot     *template.Snapshot               `json:"template_snapshot,omitempty"`
+	CredentialReferences []controller.CredentialReference `json:"credential_references,omitempty"`
 }
 
 // assertReferences excludes literal credentials from durable records. Public
@@ -90,26 +91,22 @@ func destinations(receiver internal.Receiver) ([]frozenDestination, error) {
 		if r.ChatBot != nil {
 			v := base()
 			v.ChatBot = r.ChatBot
+			v.Config = nil // chatbot transport does not use app credentials
 			ref, _ := json.Marshal(r.ChatBot.Webhook)
 			result = append(result, frozenDestination{v, "bot-ref:" + spool.Hash(ref)})
 		}
 	case *webhooktype.Receiver:
 		u, err := url.Parse(r.URL)
-		if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Scheme != "http" && u.Scheme != "https") {
-			return nil, errors.New("durable webhook must use a credential-free URL and referenced HTTP credentials")
+		if err != nil || u.Host == "" || u.Fragment != "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return nil, errors.New("durable webhook must use an HTTP or HTTPS URL")
 		}
-		if r.HttpConfig != nil && r.HttpConfig.ProxyURL != "" {
-			p, err := url.Parse(r.HttpConfig.ProxyURL)
-			if err != nil || p.User != nil || p.RawQuery != "" {
-				return nil, errors.New("proxy URL must not contain credentials")
-			}
-		}
+
 		v := r.Clone().(*webhooktype.Receiver)
 		v.Frozen = true
 		v.TmplText = nil
 		result = append(result, frozenDestination{v, "webhook:" + spool.Hash([]byte(r.URL))})
 	default:
-		return nil, fmt.Errorf("durable target adapter unavailable for channel %s", receiver.GetType())
+		return legacyDestinations(receiver)
 	}
 	if len(result) == 0 {
 		return nil, errors.New("notification has no destination")
@@ -134,8 +131,14 @@ func Freeze(logger log.Logger, ctl *controller.Controller, input map[internal.Re
 		renderer, ok := nf.(interface {
 			RenderForDurable(*template.Data) (string, error)
 		})
+		var templateSnapshot *template.Snapshot
 		if !ok {
-			return nil, fmt.Errorf("channel %s has no durable renderer", r.GetType())
+			frozenTemplate, err := ctl.GetReceiverTmpl(receiverCommon(r).TmplText)
+			if err != nil {
+				return nil, err
+			}
+			captured := frozenTemplate.Snapshot()
+			templateSnapshot = &captured
 		}
 		for _, group := range groups {
 			data := group.Clone()
@@ -147,7 +150,20 @@ func Freeze(logger log.Logger, ctl *controller.Controller, input map[internal.Re
 					alert.Labels[constants.ReceiverName] = r.GetName()
 				}
 			}
-			content, err := renderer.RenderForDurable(data)
+			content := ""
+			if ok {
+				content, err = renderer.RenderForDurable(data)
+			} else {
+				frozenTemplate, e := template.FromSnapshot(*templateSnapshot)
+				if e != nil {
+					return nil, e
+				}
+				common := receiverCommon(r)
+				_, err = frozenTemplate.Text(common.TmplName, data)
+				if err == nil && common.TitleTmplName != "" {
+					_, err = frozenTemplate.Text(common.TitleTmplName, data)
+				}
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -156,7 +172,7 @@ func Freeze(logger log.Logger, ctl *controller.Controller, input map[internal.Re
 				return nil, err
 			}
 			for _, target := range targets {
-				if data.ProfileID != "" {
+				if profileAnnotationTarget(ctl, data, target.receiver, target.destination) {
 					if f, ok := target.receiver.(*feishutype.Receiver); ok && f.Config != nil {
 						if shadow := ctl.GetJevShadow(); shadow != nil && shadow.Enabled() {
 							appID, err := ctl.GetCredential(f.AppID)
@@ -169,18 +185,11 @@ func Freeze(logger log.Logger, ctl *controller.Controller, input map[internal.Re
 						}
 					}
 				}
-				if f, ok := target.receiver.(*feishutype.Receiver); ok && f.Config != nil && f.AppSecret != nil && f.AppSecret.Value != "" {
-					ref, err := ctl.FreezeFeishuCredentialReference(f.Config)
-					if err != nil {
-						return nil, err
-					}
-					config := *f.Config
-					config.AppSecret = nil
-					config.AppID = &v2beta2.Credential{Value: ref.AppID}
-					config.CredentialConfigRef = ref
-					f.Config = &config
-				}
 				raw, err := json.Marshal(target.receiver)
+				if err != nil {
+					return nil, err
+				}
+				raw, refs, err := ctl.FreezeCredentialReferences(raw, r.GetName(), receiverConfigName(target.receiver), r.GetType())
 				if err != nil {
 					return nil, err
 				}
@@ -191,7 +200,7 @@ func Freeze(logger log.Logger, ctl *controller.Controller, input map[internal.Re
 				if err := assertReferences(decoded, ""); err != nil {
 					return nil, err
 				}
-				payload, err := json.Marshal(FrozenNotification{Version: spool.Version, Receiver: raw, Options: ctl.ReceiverOpts, Data: data, Content: content})
+				payload, err := json.Marshal(FrozenNotification{Version: spool.Version, Receiver: raw, Options: ctl.ReceiverOpts, Data: data, Content: content, TemplateSnapshot: templateSnapshot, CredentialReferences: refs})
 				if err != nil {
 					return nil, err
 				}
@@ -209,8 +218,10 @@ func Freeze(logger log.Logger, ctl *controller.Controller, input map[internal.Re
 	return result, nil
 }
 
-// SendFrozen never re-routes or re-renders. Live credential references may be
-// resolved, but a receiver/template edit cannot change the accepted target.
+// SendFrozen never re-routes accepted work. Feishu/Webhook use frozen renders;
+// other upstream channels render only their frozen catalogue/data/options so
+// the original title/HTML/message-splitting behavior remains intact. Live
+// credentials may rotate under the original UID; destinations cannot drift.
 func SendFrozen(ctx context.Context, logger log.Logger, ctl *controller.Controller, target spool.Target) (sendErr error) {
 	ctx, attempt := utils.TrackDelivery(ctx)
 	defer func() {
@@ -223,7 +234,8 @@ func SendFrozen(ctx context.Context, logger log.Logger, ctl *controller.Controll
 		if err != nil {
 			return err
 		}
-		if target.Channel == constants.Feishu && strings.HasPrefix(target.Destination, "chat:") {
+		if target.Channel == constants.Feishu && strings.HasPrefix(target.Destination, "chat:") &&
+			(p.ID == "test" || annotationBindingConfigured(ctl, p.ID, p.Version, target.Receiver, strings.TrimPrefix(target.Destination, "chat:"))) {
 			if shadow := ctl.GetJevShadow(); shadow != nil && shadow.Enabled() {
 				if err := shadow.ValidateProfileBinding(p.ID, p.Version, p.CardOwnerID, target.Receiver, strings.TrimPrefix(target.Destination, "chat:")); err != nil {
 					return err
@@ -251,9 +263,16 @@ func SendFrozen(ctx context.Context, logger log.Logger, ctl *controller.Controll
 	case constants.Webhook:
 		receiver = &webhooktype.Receiver{}
 	default:
-		return errors.New("unsupported frozen channel")
+		receiver = legacyReceiver(target.Channel)
+		if receiver == nil {
+			return errors.New("unsupported frozen channel")
+		}
 	}
-	if err := json.Unmarshal(frozen.Receiver, receiver); err != nil {
+	resolved, err := ctl.ResolveCredentialReferences(frozen.Receiver, frozen.CredentialReferences)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(resolved, receiver); err != nil {
 		return err
 	}
 	if target.ProfileID != "" {
@@ -268,7 +287,7 @@ func SendFrozen(ctx context.Context, logger log.Logger, ctl *controller.Controll
 			}
 		}
 	}
-	if target.ProfileID != "" {
+	if profileAnnotationTarget(ctl, frozen.Data, receiver, target.Destination) {
 		if f, ok := receiver.(*feishutype.Receiver); ok && f.Config != nil {
 			if shadow := ctl.GetJevShadow(); shadow != nil && shadow.Enabled() {
 				appID, err := ctl.GetCredential(f.AppID)
@@ -293,15 +312,25 @@ func SendFrozen(ctx context.Context, logger log.Logger, ctl *controller.Controll
 		config.AppSecret = &v2beta2.Credential{Value: secret}
 		f.Config = &config
 	}
-	// Receiver defaults were frozen at intake; configure only transport options.
-	nf, err := factories[target.Channel](logger, receiver, ctl)
+	// Use accepted options and templates in a request-local controller. Legacy
+	// channels retain the original splitting/transport logic without re-routing.
+	sendCtl := ctl
+	if frozen.TemplateSnapshot != nil {
+		sendCtl, err = ctl.FrozenRuntime(frozen.Options, *frozen.TemplateSnapshot)
+		if err != nil {
+			return err
+		}
+	}
+	nf, err := factories[target.Channel](logger, receiver, sendCtl)
 	if err != nil {
 		return err
 	}
 	if configured, ok := nf.(interface{ ConfigureFrozen(*v2beta2.Options) }); ok {
 		configured.ConfigureFrozen(frozen.Options)
 	}
-	frozen.Data.FrozenContent = &frozen.Content
+	if frozen.TemplateSnapshot == nil {
+		frozen.Data.FrozenContent = &frozen.Content
+	}
 	return nf.Notify(ctx, frozen.Data)
 }
 

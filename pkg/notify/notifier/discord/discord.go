@@ -97,7 +97,7 @@ func (n *Notifier) SetSentSuccessfulHandler(h *func([]*template.Alert)) {
 
 func (n *Notifier) Notify(ctx context.Context, data *template.Data) error {
 
-	mentionedUsers := n.receiver.MentionedUsers
+	mentionedUsers := append([]string(nil), n.receiver.MentionedUsers...)
 	for i := range mentionedUsers {
 		if mentionedUsers[i] == "everyone" {
 			mentionedUsers[i] = "@everyone"
@@ -106,7 +106,7 @@ func (n *Notifier) Notify(ctx context.Context, data *template.Data) error {
 		mentionedUsers[i] = fmt.Sprintf("<@%s>", mentionedUsers[i])
 	}
 
-	mentionedRoles := n.receiver.MentionedRoles
+	mentionedRoles := append([]string(nil), n.receiver.MentionedRoles...)
 	for i := range mentionedRoles {
 		mentionedRoles[i] = fmt.Sprintf("<@&%s>", mentionedRoles[i])
 	}
@@ -175,6 +175,7 @@ func (n *Notifier) sendTo(ctx context.Context, content string) error {
 		}
 		request.Header.Set("Content-Type", "application/json; charset=utf-8")
 		client := http.Client{}
+		utils.MarkDeliveryStarted(ctx)
 		resp, err := client.Do(request)
 		if err != nil {
 			return true, err

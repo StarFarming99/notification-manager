@@ -54,6 +54,7 @@ var (
 )
 
 type Controller struct {
+	frozenTemplate    *template.Template
 	configurationName string
 	DeliveryProfiles  *deliveryprofiles.Manager
 	staticRouters     []v2beta2.Router
@@ -1147,6 +1148,9 @@ func (c *Controller) GetGlobalTmpl() (*template.Template, error) {
 }
 
 func (c *Controller) GetReceiverTmpl(cm *v2beta2.ConfigmapKeySelector) (*template.Template, error) {
+	if c.frozenTemplate != nil {
+		return c.frozenTemplate.Clone(), nil
+	}
 	text, err := c.GetConfigmap(cm)
 	if err != nil {
 		return nil, err

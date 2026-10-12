@@ -45,7 +45,7 @@ func DoHttpRequest(ctx context.Context, client *http.Client, request *http.Reque
 	markDelivery(ctx)
 	resp, err := client.Do(request.WithContext(ctx))
 	if err != nil {
-		return nil, err
+		return nil, &TransportError{Err: err}
 	}
 
 	defer func() {
@@ -74,3 +74,10 @@ type HTTPStatusError struct{ Status int }
 func (e *HTTPStatusError) Error() string {
 	return fmt.Sprintf("notification platform HTTP %d", e.Status)
 }
+
+// TransportError retains error identity without exposing URLs carrying tokens,
+// passwords, userinfo, or signed chatbot parameters in logs.
+type TransportError struct{ Err error }
+
+func (e *TransportError) Error() string { return "notification transport unavailable" }
+func (e *TransportError) Unwrap() error { return e.Err }

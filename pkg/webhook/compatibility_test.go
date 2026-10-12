@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/kubesphere/notification-manager/pkg/controller"
 	"github.com/kubesphere/notification-manager/pkg/deliveryprofiles"
 	spool "github.com/kubesphere/notification-manager/pkg/notification_spool"
+	"github.com/kubesphere/notification-manager/pkg/notify"
 	"github.com/kubesphere/notification-manager/pkg/store"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -122,6 +124,67 @@ func TestFormalCompatibilityRejectsBroadOrAmbiguousSourceConfiguration(t *testin
 		h := &Webhook{Options: &Options{ListenAddress: ":19094", FormalCompatListenAddress: ":19093", FormalCompatSourceCIDRs: cidrs}}
 		if _, err := h.compatibilityRouter(&deliveryprofiles.Manager{}); err == nil {
 			t.Fatal("unsafe source CIDRs admitted", cidrs)
+		}
+	}
+}
+
+func TestFormalLegacyNotificationAndVerifyInlineCredentialsRemainAccepted(t *testing.T) {
+	t.Setenv("NM_FROZEN_CREDENTIAL_ACTIVE_KEY", "fixture-key")
+	t.Setenv("NM_FROZEN_CREDENTIAL_KEYS", `{"fixture-key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="}`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	u := "http://mock.invalid/original"
+	ctl, err := controller.NewStatic(ctx, log.NewNopLogger(), controller.StaticConfiguration{Environment: "test", Cluster: "fixture", Template: `{{define "original"}}{"elements":[{"tag":"action","actions":[{"tag":"button","value":{"action":"acknowledge"}}]}]}{{end}}`, Receivers: []v2beta2.Receiver{{ObjectMeta: metav1.ObjectMeta{Name: "original"}, Spec: v2beta2.ReceiverSpec{Webhook: &v2beta2.WebhookReceiver{URL: &u}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ctl.Run(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := spool.Open(filepath.Join(t.TempDir(), "spool.db"), spool.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	m, err := deliveryprofiles.New(db, deliveryprofiles.File{Version: 1, RetryDedupeWindow: "2m", RepeatInterval: "12h", Profiles: []spool.DeliveryProfile{{ID: "test", Version: "v1", CardOwnerID: "test-owner", Receiver: "critical", SourceChatID: deliveryprofiles.ProductionChat, TestChatID: deliveryprofiles.TestChat}, {ID: "formal", Version: "v1", CardOwnerID: "formal-owner"}}}, strings.Repeat("t", 32), strings.Repeat("f", 32), strings.Repeat("c", 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctl.DeliveryProfiles = m
+	if _, err := db.ControlProfile("formal", "prepare", "v1", 1, "fixture", "offline compatibility"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ControlProfile("formal", "activate", "v1", 2, "fixture", "offline activation"); err != nil {
+		t.Fatal(err)
+	}
+	h := New(log.NewNopLogger(), ctl, &store.AlertStore{Durable: db}, &Options{ListenAddress: ":19094", FormalCompatListenAddress: ":19093", FormalCompatSourceCIDRs: []string{"10.0.0.9/32"}, WebhookTimeout: time.Second, WorkerTimeout: time.Second})
+	receiver := `{"metadata":{"name":"inline","labels":{"type":"global"}},"spec":{"feishu":{"chatids":["another-original-group"],"template":"original","tmplType":"interactive"}}}`
+	config := `{"metadata":{"name":"inline-config","labels":{"type":"default"}},"spec":{"feishu":{"appID":{"value":"another-original-app"},"appSecret":{"value":"inline-api-secret-never-persist"}}}}`
+	for _, path := range []string{"/api/v2/verify", "/api/v2/notifications"} {
+		body := `{"receiver":` + receiver + `,"config":` + config + `,"alert":{"alerts":[{"status":"firing","labels":{"alertname":"API","severity":"critical"}}]}}`
+		r := httptest.NewRequest("POST", path, strings.NewReader(body))
+		r.RemoteAddr = "10.0.0.9:1234"
+		w := httptest.NewRecorder()
+		h.compatRouter.ServeHTTP(w, r)
+		if w.Code != 200 {
+			t.Fatal("legacy API rejected", path, w.Code, w.Body.String())
+		}
+	}
+	_, targets, err := db.Snapshot()
+	if err != nil || len(targets) != 2 {
+		t.Fatal("API deliveries lost", len(targets), err)
+	}
+	for _, target := range targets {
+		if target.ProfileID != "formal" || target.Destination != "chat:another-original-group" || strings.Contains(string(target.Payload), "inline-api-secret-never-persist") {
+			t.Fatal("API destination/credential compatibility lost")
+		}
+		var frozen notify.FrozenNotification
+		_ = json.Unmarshal(target.Payload, &frozen)
+		if !frozen.Data.JevCaptureExcluded || len(frozen.CredentialReferences) != 1 || frozen.CredentialReferences[0].Kind != "encrypted_inline" {
+			t.Fatal("inline API entered Jev or credential was not encrypted")
+		}
+		if !strings.Contains(frozen.Content, "acknowledge") {
+			t.Fatal("original card action lost")
 		}
 	}
 }

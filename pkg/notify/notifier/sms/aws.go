@@ -74,6 +74,7 @@ func (a *AWSNotifier) MakeRequest(ctx context.Context, messages string) error {
 		PhoneNumber: &a.PhoneNums,
 	}
 
+	utils.MarkDeliveryStarted(ctx)
 	_, err = PublishMessage(ctx, client, input)
 	if err != nil {
 		return utils.Errorf("[AWS  SendSms] Send failed: %s", err.Error())

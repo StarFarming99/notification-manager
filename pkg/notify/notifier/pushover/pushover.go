@@ -86,7 +86,7 @@ func NewPushoverNotifier(logger log.Logger, receiver internal.Receiver, notifier
 
 		if opts.Pushover.NotificationTimeout != nil {
 			n.timeout = time.Second * time.Duration(*opts.Pushover.NotificationTimeout)
-			client.Timeout = n.timeout
+
 		}
 
 		if !utils.StringIsNil(opts.Pushover.Template) {
@@ -184,7 +184,9 @@ func (n *Notifier) Notify(ctx context.Context, data *template.Data) error {
 		request.Header.Set("Content-Type", "application/json")
 
 		// send the request
-		response, err := client.Do(request)
+		localClient := &http.Client{Timeout: n.timeout, Transport: client.Transport}
+		utils.MarkDeliveryStarted(ctx)
+		response, err := localClient.Do(request)
 		if err != nil {
 			_ = level.Error(n.logger).Log("msg", "PushoverNotifier: do http error", "userKey", userKey, "error", err.Error())
 			return err

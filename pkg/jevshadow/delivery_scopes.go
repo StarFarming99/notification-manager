@@ -247,3 +247,13 @@ func bindScopeDirectory(root string, scope DeliveryScope) (string, error) {
 	}
 	return dir, nil
 }
+
+// ProfileBindingConfigured answers whether this destination participates in
+// Jev. Formal destinations outside it retain the original notification path.
+func (s *Service) ProfileBindingConfigured(id, version, receiver, destination string) bool {
+	if !s.Enabled() {
+		return false
+	}
+	scope, ok := s.config.DeliveryScopes[scopeKey(id, version)]
+	return ok && scopeAllows(scope, receiver, destination)
+}

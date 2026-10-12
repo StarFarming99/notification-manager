@@ -252,7 +252,7 @@ func (s *Service) HandleSuccessfulDelivery(token string) http.HandlerFunc {
 		decoder := json.NewDecoder(reader)
 		decoder.DisallowUnknownFields()
 		if decoder.Decode(&delivery) != nil || decoder.Decode(new(interface{})) != io.EOF ||
-			delivery.Data == nil || len(delivery.Data.Alerts) == 0 || delivery.MessageID == "" ||
+			delivery.Data == nil || delivery.Data.JevCaptureExcluded || len(delivery.Data.Alerts) == 0 || delivery.MessageID == "" ||
 			!s.ShouldCapture(delivery.Receiver, delivery.Destination) {
 			w.WriteHeader(http.StatusBadRequest)
 			return

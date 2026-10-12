@@ -104,7 +104,7 @@ func (n *Notifier) Notify(ctx context.Context, data *template.Data) error {
 	provider := providerFunc(n.notifierCtl, n.receiver.Providers, n.receiver.PhoneNumbers)
 
 	// make request by the provider
-	ctx, cancel := context.WithTimeout(context.Background(), n.timeout)
+	ctx, cancel := context.WithTimeout(ctx, n.timeout)
 	defer cancel()
 
 	if err := provider.MakeRequest(ctx, msg); err != nil {

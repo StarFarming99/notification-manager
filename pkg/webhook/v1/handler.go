@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-kit/kit/log"
@@ -31,10 +32,12 @@ import (
 )
 
 type HttpHandler struct {
-	logger      log.Logger
-	wkrTimeout  time.Duration
-	notifierCtl *controller.Controller
-	alerts      *store.AlertStore
+	logger            log.Logger
+	wkrTimeout        time.Duration
+	notifierCtl       *controller.Controller
+	alerts            *store.AlertStore
+	admissionMu       sync.Mutex
+	admissionFailures map[string]uint64
 }
 
 type response struct {
@@ -120,7 +123,12 @@ func (h *HttpHandler) Alert(w http.ResponseWriter, r *http.Request) {
 					h.handle(w, &response{http.StatusBadRequest, "invalid AM intent"})
 					return
 				}
-				key = "am:" + requestHash
+				group, groupErr := CanonicalAMGroup(raw)
+				if groupErr != nil {
+					h.handle(w, &response{http.StatusBadRequest, "invalid AM group"})
+					return
+				}
+				key = "am-group:" + group
 			} else {
 				key = "explicit:" + key
 			}
@@ -128,6 +136,8 @@ func (h *HttpHandler) Alert(w http.ResponseWriter, r *http.Request) {
 		}
 		intake, err := h.acceptDurable(r.Context(), data.Alerts, nil, key, requestHash)
 		if err != nil {
+			groupHash, _ := CanonicalAMGroup(raw)
+			h.recordAdmissionFailure(err, groupHash)
 			w.Header().Set("Retry-After", "1")
 			h.handle(w, &response{http.StatusServiceUnavailable, "Notification frozen plan could not be persisted"})
 			return
@@ -138,6 +148,12 @@ func (h *HttpHandler) Alert(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *HttpHandler) ServeMetrics(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	h.admissionMu.Lock()
+	for class, count := range h.admissionFailures {
+		_, _ = fmt.Fprintf(w, "nm_notification_admission_failures_total{class=%q} %d\n", class, count)
+	}
+	h.admissionMu.Unlock()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	if h.alerts.Durable != nil {
 		if status, err := h.alerts.Durable.Status(); err == nil {
@@ -200,6 +216,7 @@ func (h *HttpHandler) ServeStatus(w http.ResponseWriter, _ *http.Request) {
 			return
 		}
 		closing, mode, deadline := h.alerts.ShutdownState()
+		status["admission_failures"] = h.admissionFailureSnapshot()
 		status["accepting"] = !closing
 		status["shutdown_mode"] = mode
 		status["shutdown_deadline"] = deadline
@@ -210,7 +227,7 @@ func (h *HttpHandler) ServeStatus(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(status)
 		return
 	}
-	status := map[string]interface{}{"accepting": h.alerts.Accepting()}
+	status := map[string]interface{}{"accepting": h.alerts.Accepting(), "admission_failures": h.admissionFailureSnapshot()}
 	if shadow := h.notifierCtl.GetJevShadow(); shadow != nil {
 		status["jev_relay"] = shadow.RelaySnapshot()
 	}
@@ -374,6 +391,7 @@ func (h *HttpHandler) send(parent context.Context, receivers []internal.Receiver
 	if h.alerts.Durable != nil {
 		_, err := h.acceptDurable(parent, alerts, receivers, key, hash)
 		if err != nil {
+			h.recordAdmissionFailure(err, "")
 			return "Original notification durable intake unavailable"
 		}
 		return ""
@@ -403,7 +421,13 @@ func (h *HttpHandler) send(parent context.Context, receivers []internal.Receiver
 
 // acceptDurable executes the original pipeline only as far as aggregation. The
 // complete plan is committed once, before any external platform side effect.
-func (h *HttpHandler) acceptDurable(parent context.Context, alerts template.Alerts, receivers []internal.Receiver, key, hash string) (spool.Intake, error) {
+func (h *HttpHandler) acceptDurable(parent context.Context, alerts template.Alerts, receivers []internal.Receiver, key, hash string) (result spool.Intake, failure error) {
+	stageClass := "intake_admission"
+	defer func() {
+		if failure != nil {
+			failure = &admissionFailure{stage: stageClass, err: failure}
+		}
+	}()
 	if !h.alerts.Accepting() {
 		return spool.Intake{}, errors.New("intake stopping")
 	}
@@ -422,6 +446,7 @@ func (h *HttpHandler) acceptDurable(parent context.Context, alerts template.Aler
 		input = m
 	}
 	pipeline = append(pipeline, aggregation.NewStage(h.notifierCtl))
+	stageClass = "original_pipeline"
 	_, output, err := pipeline.Exec(ctx, h.logger, input)
 	if err != nil {
 		return spool.Intake{}, err
@@ -441,11 +466,20 @@ func (h *HttpHandler) acceptDurable(parent context.Context, alerts template.Aler
 	if profiled {
 		plan = notify.ApplyProfile(plan, *snap)
 	}
+	if receivers != nil {
+		for _, groups := range plan {
+			for _, data := range groups {
+				data.JevCaptureExcluded = true
+			}
+		}
+	}
+	stageClass = "template_or_credential_freeze"
 	targets, err := notify.Freeze(h.logger, h.notifierCtl, plan)
 	if err != nil {
 		return spool.Intake{}, err
 	}
 	if profiled {
+		stageClass = "profile_binding"
 		targets, err = notify.BindFrozenProfile(targets, *snap)
 		if err != nil {
 			return spool.Intake{}, err
@@ -453,6 +487,7 @@ func (h *HttpHandler) acceptDurable(parent context.Context, alerts template.Aler
 	}
 	var history []spool.Target
 	if !profiled || snap.ID != "test" {
+		stageClass = "history_freeze"
 		history, err = notify.FreezeHistory(h.logger, h.notifierCtl, targets)
 	}
 	if err != nil {
@@ -469,10 +504,13 @@ func (h *HttpHandler) acceptDurable(parent context.Context, alerts template.Aler
 	if len(targets) == 0 {
 		terminal = "filtered_silenced_or_no_route"
 	}
+	stageClass = "spool_commit"
 	if profiled {
 		window := time.Duration(0)
-		if strings.Contains(key, ":am:") {
+		if strings.Contains(key, ":am-group:") {
 			window = h.notifierCtl.DeliveryProfiles.RepeatInterval
+			intake, _, err := h.alerts.Durable.SubmitAMProfile(key, hash, targets, terminal, *snap, window)
+			return intake, err
 		}
 		intake, _, err := h.alerts.Durable.SubmitProfile(key, hash, targets, terminal, *snap, window)
 		return intake, err

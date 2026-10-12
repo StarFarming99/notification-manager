@@ -84,6 +84,7 @@ func (h *HttpHandler) TestAlert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.validateTestScope(snap.DeliveryProfile); err != nil {
+		h.recordAdmissionFailure(&admissionFailure{stage: "test_scope", err: err}, "")
 		http.Error(w, err.Error(), 503)
 		return
 	}
@@ -208,34 +209,45 @@ func (h *HttpHandler) validateProfile(p spool.DeliveryProfile) error {
 	}
 	matched := 0
 	for _, r := range receivers {
-		if r.GetType() != constants.Feishu && r.GetType() != constants.Webhook {
-			return errors.New("formal preparation blocked: channel lacks durable adapter")
-		}
+
 		if err := r.Validate(); err != nil {
 			return err
 		}
 		if f, ok := r.(*feishutype.Receiver); ok {
-			if f.Config == nil {
+			if f.Config == nil && (len(f.ChatIDs) > 0 || len(f.User) > 0 || len(f.Department) > 0) {
 				return errors.New("feishu credentials unavailable")
 			}
-			appID, err := h.notifierCtl.GetCredential(f.AppID)
-			if err != nil {
-				return errors.New("feishu app unavailable")
-			}
-			if shadow := h.notifierCtl.GetJevShadow(); shadow != nil && shadow.Enabled() {
-				if err := shadow.ValidateProfileSender(p.ID, p.Version, appID); err != nil {
-					return err
+			if f.Config != nil && (len(f.ChatIDs) > 0 || len(f.User) > 0 || len(f.Department) > 0) {
+				appID, err := h.notifierCtl.GetCredential(f.AppID)
+				if err != nil {
+					return errors.New("feishu app unavailable")
 				}
-				if p.ID == "formal" {
+				if shadow := h.notifierCtl.GetJevShadow(); shadow != nil && shadow.Enabled() {
+					annotationScope := p.ID == "test"
 					for _, chat := range f.ChatIDs {
-						if err := shadow.ValidateProfileBinding(p.ID, p.Version, p.CardOwnerID, r.GetName(), chat); err != nil {
+						if shadow.ProfileBindingConfigured(p.ID, p.Version, r.GetName(), chat) {
+							annotationScope = true
+						}
+					}
+					if annotationScope {
+						if err := shadow.ValidateProfileSender(p.ID, p.Version, appID); err != nil {
 							return err
 						}
 					}
+					if p.ID == "formal" {
+						for _, chat := range f.ChatIDs {
+							if !shadow.ProfileBindingConfigured(p.ID, p.Version, r.GetName(), chat) {
+								continue
+							}
+							if err := shadow.ValidateProfileBinding(p.ID, p.Version, p.CardOwnerID, r.GetName(), chat); err != nil {
+								return err
+							}
+						}
+					}
 				}
-			}
-			if _, err := h.notifierCtl.GetCredential(f.AppSecret); err != nil {
-				return errors.New("feishu credential unavailable")
+				if _, err := h.notifierCtl.GetCredential(f.AppSecret); err != nil {
+					return errors.New("feishu credential unavailable")
+				}
 			}
 			for _, chat := range f.ChatIDs {
 				if chat == p.SourceChatID {
@@ -302,6 +314,26 @@ func CanonicalAMIntent(raw []byte) (string, error) {
 	}
 	sort.Strings(rows)
 	encoded, err := json.Marshal(map[string]interface{}{"receiver": data.Receiver, "group_key": data.GroupKey, "alerts": rows})
+	if err != nil {
+		return "", err
+	}
+	return spool.Hash(encoded), nil
+}
+
+// CanonicalAMGroup contains the stable AM transport receiver and aggregation
+// group, independently of alert content and peer externalURL.
+func CanonicalAMGroup(raw []byte) (string, error) {
+	var data struct {
+		Receiver string `json:"receiver"`
+		GroupKey string `json:"groupKey"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return "", err
+	}
+	if data.Receiver == "" || data.GroupKey == "" {
+		return "", errors.New("AM receiver and groupKey are required")
+	}
+	encoded, err := json.Marshal(data)
 	if err != nil {
 		return "", err
 	}

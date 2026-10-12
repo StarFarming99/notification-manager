@@ -72,6 +72,10 @@ func run() error {
 		mux.HandleFunc("/internal/jev/card-feedback", service.HandleCardFeedback(callbackToken))
 	}
 	mux.HandleFunc("/internal/jev/annotations/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			service.HandleAnnotationStatus(w, r, strings.TrimPrefix(r.URL.Path, "/internal/jev/annotations/"))
+			return
+		}
 		// Legacy original card callbacks can write the same message. Until their
 		// writer coordination is verified, leave production annotation closed.
 		if os.Getenv("JEV_CARD_STATE_COORDINATED") != "true" {

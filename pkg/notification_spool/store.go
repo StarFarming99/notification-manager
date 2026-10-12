@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -236,14 +237,21 @@ func (s *Store) capacity() error {
 // A caller without a stable upstream key gets a new intake: an AM repeat must
 // not silently disappear through an unbounded content-hash deduplication window.
 func (s *Store) Submit(key, requestHash string, targets []Target, terminalReason string) (Intake, bool, error) {
-	return s.submit(key, requestHash, targets, terminalReason, nil, 0)
+	return s.submit(key, requestHash, targets, terminalReason, nil, 0, false)
 }
 
 func (s *Store) SubmitProfile(key, requestHash string, targets []Target, terminalReason string, snapshot ProfileSnapshot, window time.Duration) (Intake, bool, error) {
-	return s.submit(key, requestHash, targets, terminalReason, &snapshot, window)
+	return s.submit(key, requestHash, targets, terminalReason, &snapshot, window, false)
 }
 
-func (s *Store) submit(key, requestHash string, targets []Target, terminalReason string, snapshot *ProfileSnapshot, window time.Duration) (Intake, bool, error) {
+// SubmitAMProfile deduplicates only the current receiver/group generation. A
+// changed group may return to an older delivered payload without losing its
+// legitimate notification. Unfinished/uncertain older intents stay fenced.
+func (s *Store) SubmitAMProfile(groupKey, requestHash string, targets []Target, terminalReason string, snapshot ProfileSnapshot, window time.Duration) (Intake, bool, error) {
+	return s.submit(groupKey, requestHash, targets, terminalReason, &snapshot, window, true)
+}
+
+func (s *Store) submit(key, requestHash string, targets []Target, terminalReason string, snapshot *ProfileSnapshot, window time.Duration, group bool) (Intake, bool, error) {
 	var result Intake
 	duplicate := false
 	if requestHash == "" || (len(targets) == 0 && terminalReason == "") {
@@ -280,33 +288,51 @@ func (s *Store) submit(key, requestHash string, targets []Target, terminalReason
 		}
 		intakes, dedupe := tx.Bucket([]byte("intakes")), tx.Bucket([]byte("dedupe"))
 		if key != "" {
-			if previous := dedupe.Get([]byte(key)); previous != nil {
+			previous := dedupe.Get([]byte(key))
+			// A delayed peer retry must not replay an older in-flight or unknown send.
+			if group {
+				historical := dedupe.Get([]byte(key + ":intent:" + requestHash))
+				// Older ledgers retain canonical intent indexes without group metadata.
+				// Preserve exact historical uncertainty without guessing the current group
+				// or suppressing a delivered content return after an intervening change.
+				if historical == nil {
+					if split := strings.LastIndex(key, ":am-group:"); split >= 0 {
+						historical = dedupe.Get([]byte(key[:split] + ":am:" + requestHash))
+					}
+				}
+				if historical != nil {
+					var old Intake
+					if err := json.Unmarshal(intakes.Get(historical), &old); err != nil {
+						return err
+					}
+					incomplete, err := intakeIncomplete(tx, old)
+					if err != nil {
+						return err
+					}
+					if incomplete {
+						result = old
+						duplicate = true
+						return nil
+					}
+				}
+			}
+			if previous != nil {
 				if err := json.Unmarshal(intakes.Get(previous), &result); err != nil {
 					return err
 				}
 				if result.RequestHash != requestHash {
-					return errors.New("intake idempotency key reused with different content")
-				}
-				// Identical AM intents cannot create another card while the
-				// original plan is still pending, retrying or uncertain. A
-				// completed plan may repeat only after its configured AM repeat
-				// interval; prolonged ACK loss is not a fresh repeat.
-				incomplete := false
-				if window > 0 {
-					for _, targetID := range result.TargetIDs {
-						var previousTarget Target
-						if err := json.Unmarshal(tx.Bucket([]byte("targets")).Get([]byte(targetID)), &previousTarget); err != nil {
-							return err
-						}
-						if previousTarget.State != Delivered {
-							incomplete = true
-							break
-						}
+					if !group {
+						return errors.New("intake idempotency key reused with different content")
 					}
-				}
-				if window <= 0 || incomplete || time.Now().Before(result.AcceptedAt.Add(window)) {
-					duplicate = true
-					return nil
+				} else {
+					incomplete, err := intakeIncomplete(tx, result)
+					if err != nil {
+						return err
+					}
+					if window <= 0 || incomplete || time.Now().Before(result.AcceptedAt.Add(window)) {
+						duplicate = true
+						return nil
+					}
 				}
 			}
 		}
@@ -364,6 +390,11 @@ func (s *Store) submit(key, requestHash string, targets []Target, terminalReason
 			return err
 		}
 		if key != "" {
+			if group {
+				if err := dedupe.Put([]byte(key+":intent:"+requestHash), []byte(id)); err != nil {
+					return err
+				}
+			}
 			return dedupe.Put([]byte(key), []byte(id))
 		}
 		return nil
@@ -677,4 +708,17 @@ func releaseDependents(tx *bolt.Tx, parent Target) error {
 		}
 	}
 	return nil
+}
+
+func intakeIncomplete(tx *bolt.Tx, intake Intake) (bool, error) {
+	for _, id := range intake.TargetIDs {
+		var target Target
+		if err := json.Unmarshal(tx.Bucket([]byte("targets")).Get([]byte(id)), &target); err != nil {
+			return false, err
+		}
+		if target.State != Delivered {
+			return true, nil
+		}
+	}
+	return false, nil
 }

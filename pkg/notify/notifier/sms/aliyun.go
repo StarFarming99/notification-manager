@@ -36,7 +36,7 @@ func NewAliyunProvider(c *controller.Controller, providers *v2beta2.Providers, p
 	}
 }
 
-func (a *AliyunNotifier) MakeRequest(_ context.Context, messages string) error {
+func (a *AliyunNotifier) MakeRequest(ctx context.Context, messages string) error {
 	accessKeyId, err := a.notifierCtl.GetCredential(a.AccessKeyId)
 	if err != nil {
 		return utils.Errorf("[Aliyun  SendSms] cannot get accessKeyId: %s", err.Error())
@@ -50,8 +50,7 @@ func (a *AliyunNotifier) MakeRequest(_ context.Context, messages string) error {
 	c.AccessKeySecret = &accessKeySecret
 	client, err := dysmsapi.NewClient(c)
 	if err != nil {
-		return utils.Errorf("[Aliyun  SendSms] cannot make a client with accessKeyId:%s,accessKeySecret:%s",
-			a.AccessKeyId.ValueFrom.SecretKeyRef.Name, a.AccessKeySecret.ValueFrom.SecretKeyRef.Name)
+		return utils.Error("[Aliyun SendSms] cannot create provider client")
 	}
 
 	templateParam := `{"code":"` + messages + `"}`
@@ -61,6 +60,7 @@ func (a *AliyunNotifier) MakeRequest(_ context.Context, messages string) error {
 		TemplateCode:  &a.TemplateCode,
 		TemplateParam: &templateParam,
 	}
+	utils.MarkDeliveryStarted(ctx)
 	resp, err := client.SendSms(req)
 	if err != nil {
 		return utils.Errorf("[Aliyun  SendSms] An API error occurs: %s", err.Error())

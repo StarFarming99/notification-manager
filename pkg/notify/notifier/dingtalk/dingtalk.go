@@ -311,7 +311,7 @@ func (n *Notifier) sendToChatBot(ctx context.Context, data *template.Data) error
 		}
 		request.Header.Set("Content-Type", "application/json")
 
-		body, err := utils.DoHttpRequest(context.Background(), nil, request)
+		body, err := utils.DoHttpRequest(ctx, nil, request.WithContext(ctx))
 		if err != nil {
 			_ = level.Error(n.logger).Log("msg", "DingTalkNotifier: do http error", "error", err)
 			return err
@@ -423,7 +423,7 @@ func (n *Notifier) sendToConversation(ctx context.Context, data *template.Data) 
 			_ = level.Debug(n.logger).Log("msg", "DingTalkNotifier: send message to conversation", "conversation", chatID, "used", time.Since(start).String())
 		}()
 
-		token, err := n.getToken(ctx, appkey, appsecret)
+		token, err := n.getToken(utils.CredentialContext(ctx), appkey, appsecret)
 		if err != nil {
 			_ = level.Debug(n.logger).Log("msg", "DingTalkNotifier: get token error", "conversation", chatID, "error", err)
 			return err
@@ -473,7 +473,7 @@ func (n *Notifier) sendToConversation(ctx context.Context, data *template.Data) 
 		}
 		request.Header.Set("Content-Type", "application/json")
 
-		body, err := utils.DoHttpRequest(context.Background(), nil, request)
+		body, err := utils.DoHttpRequest(ctx, nil, request.WithContext(ctx))
 		if err != nil {
 			_ = level.Error(n.logger).Log("msg", "DingTalkNotifier: do http error", "conversation", chatID, "error", err)
 			return err
@@ -558,7 +558,7 @@ func (n *Notifier) getToken(ctx context.Context, appkey, appsecret string) (stri
 		}
 		request.Header.Set("Content-Type", "application/json")
 
-		body, err := utils.DoHttpRequest(context.Background(), nil, request)
+		body, err := utils.DoHttpRequest(ctx, nil, request.WithContext(ctx))
 		if err != nil {
 			return "", 0, err
 		}
@@ -572,7 +572,7 @@ func (n *Notifier) getToken(ctx context.Context, appkey, appsecret string) (stri
 			return "", 0, utils.Errorf("%d, %s", res.Code, res.Message)
 		}
 
-		_ = level.Debug(n.logger).Log("msg", "DingTalkNotifier: get token", "key", appkey+" | "+appsecret)
+		_ = level.Debug(n.logger).Log("msg", "DingTalkNotifier: get token")
 		return res.Token, n.tokenExpires, nil
 	}
 
