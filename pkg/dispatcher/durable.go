@@ -37,21 +37,44 @@ func (d *Dispatcher) runDurable() error {
 	if workers > 32 {
 		workers = 32
 	}
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() { defer wg.Done(); d.durableWorker() }()
+	if profiles := d.notifierCtl.DeliveryProfiles; profiles != nil {
+		// Independent workers never claim another lane's historical backlog.
+		// Keep original throughput by default; one bounded worker serves test.
+		formalWorkers := profiles.FormalWorkers
+		for _, lane := range []struct {
+			id      string
+			workers int
+		}{{"formal", formalWorkers}, {"test", profiles.TestWorkers}} {
+			for i := 0; i < lane.workers; i++ {
+				id := lane.id
+				wg.Add(1)
+				go func() { defer wg.Done(); d.durableWorkerLane(id) }()
+			}
+		}
+	} else {
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() { defer wg.Done(); d.durableWorker() }()
+		}
 	}
 	wg.Wait()
 	return nil
 }
 
-func (d *Dispatcher) durableWorker() {
+func (d *Dispatcher) durableWorker() { d.durableWorkerLane("*") }
+func (d *Dispatcher) durableWorkerLane(lane string) {
 	for {
 		closing, mode, deadline := d.alerts.ShutdownState()
 		if closing && (mode == "handoff" || !time.Now().Before(deadline)) {
 			return
 		}
-		claim, err := d.alerts.Durable.Claim(time.Now().UTC())
+		var claim spool.Claim
+		var err error
+		if lane == "*" {
+			claim, err = d.alerts.Durable.Claim(time.Now().UTC())
+		} else {
+			claim, err = d.alerts.Durable.ClaimProfile(lane, time.Now().UTC())
+		}
 		if errors.Is(err, spool.ErrEmpty) {
 			if closing {
 				status, statusErr := d.alerts.Durable.Status()
@@ -83,7 +106,7 @@ func (d *Dispatcher) sendClaim(claim spool.Claim) {
 	defer cancel()
 	interval := time.Duration(0)
 	if profiles := d.notifierCtl.DeliveryProfiles; profiles != nil {
-		interval = profiles.SendInterval
+		interval = profiles.IntervalFor(claim.Target.ProfileID)
 	}
 	started := false
 	err := d.alerts.Durable.WithSendPermit(claim, interval, time.Now().UTC(), func() error {

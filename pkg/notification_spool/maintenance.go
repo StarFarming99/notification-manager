@@ -99,7 +99,7 @@ func (s *Store) CleanupCompleted(retention time.Duration, batch int, now time.Ti
 				if err := targets.Delete([]byte(target.ID)); err != nil {
 					return err
 				}
-				if err := tx.Bucket([]byte("ready")).Delete(queueKey(target)); err != nil {
+				if err := deleteReady(tx, target); err != nil {
 					return err
 				}
 				if err := tx.Bucket([]byte("blocked")).Delete([]byte(target.ID)); err != nil {

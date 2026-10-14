@@ -426,6 +426,9 @@ func (s *Service) HandleAnnotation(w http.ResponseWriter, r *http.Request, messa
 }
 
 func (s *Service) applyAnnotation(ctx context.Context, messageID, idempotencyKey string, component AnnotationComponent) (string, error) {
+	if s.config.FormalWriterDisabled && s.config.expectedProfileID == "formal" {
+		return "", fmt.Errorf("%w: formal annotation writer disabled by startup fence", ErrPatchWriterPaused)
+	}
 	if (s.config.Environment == "production" || s.config.Environment == "prod") && !s.FeedbackEnabled() {
 		component.ActionReference = nil
 	}

@@ -3,9 +3,12 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,7 +17,6 @@ import (
 	"github.com/kubesphere/notification-manager/pkg/controller"
 	"github.com/kubesphere/notification-manager/pkg/deliveryprofiles"
 	spool "github.com/kubesphere/notification-manager/pkg/notification_spool"
-	"github.com/kubesphere/notification-manager/pkg/notify"
 	"github.com/kubesphere/notification-manager/pkg/store"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -78,6 +80,31 @@ func TestFormalCompatibilitySourceFenceAndLegacyAlertFreezesFormal(t *testing.T)
 	// formal admission. Full real-CR API send parity is a separate promotion gate.
 	if code := formalReady(); code != 200 {
 		t.Fatal("prepared active formal was not Ready", code)
+	}
+	statusRequest := httptest.NewRequest("GET", "/internal/cutover-status", nil)
+	statusRecorder := httptest.NewRecorder()
+	h.router.ServeHTTP(statusRecorder, statusRequest)
+	if statusRecorder.Code != 401 {
+		t.Fatal("unauthorized cutover status exposed", statusRecorder.Code)
+	}
+	statusRequest = httptest.NewRequest("GET", "/internal/cutover-status", nil)
+	statusRequest.Header.Set("Authorization", "Bearer "+strings.Repeat("c", 32))
+	statusRecorder = httptest.NewRecorder()
+	h.router.ServeHTTP(statusRecorder, statusRequest)
+	if statusRecorder.Code != 200 {
+		t.Fatal(statusRecorder.Code, statusRecorder.Body.String())
+	}
+	var cutover map[string]interface{}
+	if err := json.Unmarshal(statusRecorder.Body.Bytes(), &cutover); err != nil {
+		t.Fatal(err)
+	}
+	if cutover["contract_version"] != float64(1) || cutover["budgets"].(map[string]interface{})["formal_interval"] != "0s" {
+		t.Fatal(cutover)
+	}
+	for _, secret := range []string{strings.Repeat("t", 32), strings.Repeat("f", 32), strings.Repeat("c", 32)} {
+		if strings.Contains(statusRecorder.Body.String(), secret) {
+			t.Fatal("cutover status disclosed a credential")
+		}
 	}
 	saved := h.FormalCompatListenAddress
 	h.FormalCompatListenAddress = ""
@@ -160,6 +187,21 @@ func TestFormalLegacyNotificationAndVerifyInlineCredentialsRemainAccepted(t *tes
 	h := New(log.NewNopLogger(), ctl, &store.AlertStore{Durable: db}, &Options{ListenAddress: ":19094", FormalCompatListenAddress: ":19093", FormalCompatSourceCIDRs: []string{"10.0.0.9/32"}, WebhookTimeout: time.Second, WorkerTimeout: time.Second})
 	receiver := `{"metadata":{"name":"inline","labels":{"type":"global"}},"spec":{"feishu":{"chatids":["another-original-group"],"template":"original","tmplType":"interactive"}}}`
 	config := `{"metadata":{"name":"inline-config","labels":{"type":"default"}},"spec":{"feishu":{"appID":{"value":"another-original-app"},"appSecret":{"value":"inline-api-secret-never-persist"}}}}`
+	var messages atomic.Int32
+	originalTransport := http.DefaultTransport
+	http.DefaultTransport = inlineFixtureTransport(func(r *http.Request) (*http.Response, error) {
+		body := `{"code":0,"tenant_access_token":"synthetic-inline-token","expire":3600}`
+		if !strings.Contains(r.URL.Path, "tenant_access_token") {
+			messages.Add(1)
+			raw, _ := io.ReadAll(r.Body)
+			if !strings.Contains(string(raw), "acknowledge") {
+				t.Error("original card action lost")
+			}
+			body = `{"code":0,"data":{"message_id":"synthetic-inline-message"}}`
+		}
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	defer func() { http.DefaultTransport = originalTransport }()
 	for _, path := range []string{"/api/v2/verify", "/api/v2/notifications"} {
 		body := `{"receiver":` + receiver + `,"config":` + config + `,"alert":{"alerts":[{"status":"firing","labels":{"alertname":"API","severity":"critical"}}]}}`
 		r := httptest.NewRequest("POST", path, strings.NewReader(body))
@@ -171,20 +213,11 @@ func TestFormalLegacyNotificationAndVerifyInlineCredentialsRemainAccepted(t *tes
 		}
 	}
 	_, targets, err := db.Snapshot()
-	if err != nil || len(targets) != 2 {
-		t.Fatal("API deliveries lost", len(targets), err)
-	}
-	for _, target := range targets {
-		if target.ProfileID != "formal" || target.Destination != "chat:another-original-group" || strings.Contains(string(target.Payload), "inline-api-secret-never-persist") {
-			t.Fatal("API destination/credential compatibility lost")
-		}
-		var frozen notify.FrozenNotification
-		_ = json.Unmarshal(target.Payload, &frozen)
-		if !frozen.Data.JevCaptureExcluded || len(frozen.CredentialReferences) != 1 || frozen.CredentialReferences[0].Kind != "encrypted_inline" {
-			t.Fatal("inline API entered Jev or credential was not encrypted")
-		}
-		if !strings.Contains(frozen.Content, "acknowledge") {
-			t.Fatal("original card action lost")
-		}
+	if err != nil || len(targets) != 0 || messages.Load() != 2 {
+		t.Fatal("API success must be the actual synchronous platform result, not queued work", len(targets), messages.Load(), err)
 	}
 }
+
+type inlineFixtureTransport func(*http.Request) (*http.Response, error)
+
+func (f inlineFixtureTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

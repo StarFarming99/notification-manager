@@ -68,6 +68,8 @@ func run() error {
 		if config.WriterControlToken == relayToken || !service.IndependentExecutorCredential(config.WriterControlToken) {
 			return errors.New("executor writer control requires an independent credential")
 		}
+	}
+	if config.WriterControlToken != "" || config.CutoverReadToken != "" {
 		mux.HandleFunc("/internal/jev/writer-control", service.HandleWriterControl(config.WriterControlToken))
 	}
 	if service.FeedbackEnabled() {

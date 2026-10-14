@@ -114,6 +114,9 @@ func (s *Store) RegisterProfiles(profiles []DeliveryProfile, initialTestVersion 
 
 func (s *Store) ProfileSnapshot(id string) (ProfileSnapshot, error) {
 	var snap ProfileSnapshot
+	if id == "formal" && s.formalDisabled {
+		return snap, ErrProfilePaused
+	}
 	err := s.db.View(func(tx *bolt.Tx) error {
 		st, err := readProfileState(tx, id)
 		if err != nil {
@@ -140,10 +143,13 @@ func (s *Store) ProfileVersion(id, version string) (DeliveryProfile, error) {
 // ControlProfile changes admission/delivery using one persisted CAS. Prepare
 // must be preceded by compatibility validation in the authenticated handler.
 func (s *Store) ControlProfile(id, action, version string, expected uint64, actor, evidence string) (ProfileState, error) {
-	// Once pause returns, every previously started bounded platform call has
-	// finished. Claimed work still waiting for its budget stays recoverable.
-	s.sendMu.Lock()
-	defer s.sendMu.Unlock()
+	// Pause waits for this lane's bounded send boundary and fences future calls.
+	// It is not proof that a platform has stopped processing an in-flight request;
+	// manual rollback still stops the candidate process before restoring old.
+	// Claimed work waiting for its budget stays recoverable.
+	mu := s.profileSendMutex(id)
+	mu.Lock()
+	defer mu.Unlock()
 	var result ProfileState
 	if actor == "" || evidence == "" || len(actor) > 128 || len(evidence) > 512 {
 		return result, errors.New("bounded audit actor and evidence required")
@@ -155,6 +161,9 @@ func (s *Store) ControlProfile(id, action, version string, expected uint64, acto
 		}
 		if st.Revision != expected {
 			return ErrProfileConflict
+		}
+		if id == "formal" && s.formalDisabled && (action == "activate" || action == "resume") {
+			return ErrProfilePaused
 		}
 		switch action {
 		case "prepare":

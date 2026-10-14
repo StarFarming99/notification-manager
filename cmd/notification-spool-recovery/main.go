@@ -18,22 +18,26 @@ import (
 	"gopkg.in/alecthomas/kingpin.v2"
 )
 
-func run() error {
-	path := kingpin.Flag("spool", "Absolute original-notification spool file").Required().String()
-	action := kingpin.Flag("action", "check, export, resolve, replay-target, seed-am-group").Default("check").Enum("check", "export", "resolve", "replay-target", "seed-am-group")
-	target := kingpin.Flag("target", "Exact target ID; no whole-intake replay").String()
-	state := kingpin.Flag("state", "Reconciliation result").Default("delivered").Enum("delivered", "retryable", "dead_letter")
-	actor := kingpin.Flag("actor", "Audited operator identifier").String()
-	evidence := kingpin.Flag("evidence", "Receipt/change reference, never credentials").String()
-	output := kingpin.Flag("output", "New private JSON export file; must not exist").String()
-	permit := kingpin.Flag("permit-platform-send", "Explicitly permit one frozen platform request").Bool()
-	profileID := kingpin.Flag("profile", "Exact paused profile for AM index migration").String()
-	profileVersion := kingpin.Flag("profile-version", "Registered immutable profile version").String()
-	expectedRevision := kingpin.Flag("expected-profile-revision", "Paused profile CAS revision").Uint64()
-	groupHash := kingpin.Flag("am-group-hash", "Verified canonical AM receiver/group SHA256").String()
-	requestHash := kingpin.Flag("am-request-hash", "Exact canonical AM intent SHA256").String()
-	intakeID := kingpin.Flag("intake", "Proven last accepted legacy intake for this group").String()
-	kingpin.Parse()
+func run() error { return runArgs(os.Args[1:]) }
+func runArgs(args []string) error {
+	app := kingpin.New("notification-spool-recovery", "Offline fenced original notification ledger maintenance")
+	path := app.Flag("spool", "Absolute original-notification spool file").Required().String()
+	action := app.Flag("action", "check, export, resolve, replay-target, seed-am-group, pause-profile").Default("check").Enum("check", "export", "resolve", "replay-target", "seed-am-group", "pause-profile")
+	target := app.Flag("target", "Exact target ID; no whole-intake replay").String()
+	state := app.Flag("state", "Reconciliation result").Default("delivered").Enum("delivered", "retryable", "dead_letter")
+	actor := app.Flag("actor", "Audited operator identifier").String()
+	evidence := app.Flag("evidence", "Receipt/change reference, never credentials").String()
+	output := app.Flag("output", "New private JSON export file; must not exist").String()
+	permit := app.Flag("permit-platform-send", "Explicitly permit one frozen platform request").Bool()
+	profileID := app.Flag("profile", "Exact paused profile for AM index migration").String()
+	profileVersion := app.Flag("profile-version", "Registered immutable profile version").String()
+	expectedRevision := app.Flag("expected-profile-revision", "Paused profile CAS revision").Uint64()
+	groupHash := app.Flag("am-group-hash", "Verified canonical AM receiver/group SHA256").String()
+	requestHash := app.Flag("am-request-hash", "Exact canonical AM intent SHA256").String()
+	intakeID := app.Flag("intake", "Proven last accepted legacy intake for this group").String()
+	if _, err := app.Parse(args); err != nil {
+		return err
+	}
 	if *action == "check" || *action == "export" {
 		s, err := spool.OpenReadOnly(*path)
 		if err != nil {
@@ -48,6 +52,11 @@ func run() error {
 			if err != nil {
 				return err
 			}
+			profiles, err := s.ProfileStatus()
+			if err != nil {
+				return err
+			}
+			status["profiles"] = profiles
 			return json.NewEncoder(os.Stdout).Encode(status)
 		}
 		if *output == "" {
@@ -67,7 +76,7 @@ func run() error {
 		}
 		return file.Sync()
 	}
-	if (*action != "seed-am-group" && *target == "") || *actor == "" || *evidence == "" {
+	if (*action != "seed-am-group" && *action != "pause-profile" && *target == "") || *actor == "" || *evidence == "" {
 		return errors.New("mutations require exact target, actor and evidence")
 	}
 	if *action == "replay-target" && !*permit {
@@ -80,6 +89,16 @@ func run() error {
 	defer s.Close()
 	if err := s.Check(); err != nil {
 		return err
+	}
+	if *action == "pause-profile" {
+		if *profileID != "formal" || *expectedRevision == 0 {
+			return errors.New("offline pause requires formal profile and exact persisted revision")
+		}
+		paused, err := s.ControlProfile("formal", "pause", "", *expectedRevision, *actor, *evidence)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(map[string]interface{}{"action": "pause-profile", "profile_id": "formal", "state": paused, "writer_stopped": true})
 	}
 	if *action == "seed-am-group" {
 		return s.SeedAMGroup(*profileID, *profileVersion, *groupHash, *intakeID, *requestHash, *expectedRevision, *actor, *evidence)
@@ -109,7 +128,7 @@ func run() error {
 	next := time.Now().Add(5 * time.Second)
 	interval := time.Duration(0)
 	if profiles != nil {
-		interval = profiles.SendInterval
+		interval = profiles.IntervalFor(claim.Target.ProfileID)
 	}
 	started := false
 	if claim.Target.ProfileID != "" && profiles == nil {

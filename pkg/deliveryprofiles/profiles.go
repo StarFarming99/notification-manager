@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	spool "github.com/kubesphere/notification-manager/pkg/notification_spool"
@@ -32,7 +33,12 @@ type Manager struct {
 	Window                               time.Duration
 	RepeatInterval                       time.Duration
 	SendInterval                         time.Duration
+	FormalSendInterval                   time.Duration
+	TestWorkers                          int
+	FormalWorkers                        int
+	TestActiveLimit                      int
 	testToken, formalToken, controlToken string
+	cutoverReadToken                     string
 	InitialTestVersion                   string
 }
 type snapshotKey struct{}
@@ -42,7 +48,7 @@ func Snapshot(ctx context.Context) (*spool.ProfileSnapshot, bool) {
 	return &s, ok
 }
 
-func New(db *spool.Store, config File, testToken, formalToken, controlToken string) (*Manager, error) {
+func New(db *spool.Store, config File, testToken, formalToken, controlToken string, readTokens ...string) (*Manager, error) {
 	if db == nil {
 		return nil, errors.New("delivery profiles require the durable store")
 	}
@@ -56,6 +62,16 @@ func New(db *spool.Store, config File, testToken, formalToken, controlToken stri
 	}
 	if testToken == formalToken || testToken == controlToken || formalToken == controlToken {
 		return nil, errors.New("test, formal and control credentials must differ")
+	}
+	readToken := ""
+	if len(readTokens) > 1 {
+		return nil, errors.New("at most one optional cutover read credential accepted")
+	}
+	if len(readTokens) == 1 {
+		readToken = readTokens[0]
+	}
+	if readToken != "" && (len(readToken) < 32 || readToken == testToken || readToken == formalToken || readToken == controlToken) {
+		return nil, errors.New("cutover read credential requires at least 32 independent bytes")
 	}
 	seen := map[string]bool{}
 	for _, p := range config.Profiles {
@@ -81,7 +97,10 @@ func New(db *spool.Store, config File, testToken, formalToken, controlToken stri
 	if err := db.RegisterProfiles(config.Profiles, config.InitialTestVersion); err != nil {
 		return nil, err
 	}
-	return &Manager{Store: db, Window: window, RepeatInterval: repeat, SendInterval: 2 * time.Second, testToken: testToken, formalToken: formalToken, controlToken: controlToken, InitialTestVersion: config.InitialTestVersion}, nil
+	if err := db.ConfigureTestCapacity(db.DefaultTestCapacity()); err != nil {
+		return nil, err
+	}
+	return &Manager{TestWorkers: 0, FormalWorkers: 0, TestActiveLimit: db.DefaultTestCapacity(), Store: db, Window: window, RepeatInterval: repeat, SendInterval: 2 * time.Second, testToken: testToken, formalToken: formalToken, controlToken: controlToken, cutoverReadToken: readToken, InitialTestVersion: config.InitialTestVersion}, nil
 }
 func FromEnv(db *spool.Store) (*Manager, error) {
 	path := os.Getenv("NM_DELIVERY_PROFILES_FILE")
@@ -107,7 +126,7 @@ func FromEnv(db *spool.Store) (*Manager, error) {
 	if err := dec.Decode(new(interface{})); err != io.EOF {
 		return nil, errors.New("profile configuration must contain one JSON object")
 	}
-	manager, err := New(db, config, os.Getenv("NM_TEST_INTAKE_TOKEN"), os.Getenv("NM_FORMAL_INTAKE_TOKEN"), os.Getenv("NM_PROFILE_CONTROL_TOKEN"))
+	manager, err := New(db, config, os.Getenv("NM_TEST_INTAKE_TOKEN"), os.Getenv("NM_FORMAL_INTAKE_TOKEN"), os.Getenv("NM_PROFILE_CONTROL_TOKEN"), os.Getenv("NM_CUTOVER_READ_TOKEN"))
 	if err != nil {
 		return nil, err
 	}
@@ -117,6 +136,42 @@ func FromEnv(db *spool.Store) (*Manager, error) {
 			return nil, errors.New("profiled notification send interval must be between 100ms and one minute")
 		}
 		manager.SendInterval = interval
+	}
+	if raw := os.Getenv("NM_FORMAL_NOTIFICATION_SEND_INTERVAL"); raw != "" {
+		interval, err := time.ParseDuration(raw)
+		if err != nil || interval < 0 || interval > time.Second {
+			return nil, errors.New("formal send interval must be zero through one second")
+		}
+		manager.FormalSendInterval = interval
+	}
+	for _, setting := range []struct {
+		name  string
+		value *int
+	}{{"NM_TEST_NOTIFICATION_WORKERS", &manager.TestWorkers}, {"NM_FORMAL_NOTIFICATION_WORKERS", &manager.FormalWorkers}, {"NM_TEST_MAX_PENDING_TARGETS", &manager.TestActiveLimit}} {
+		if raw := os.Getenv(setting.name); raw != "" {
+			value, err := strconv.Atoi(raw)
+			if err != nil || value < 1 {
+				return nil, errors.New("positive lane limit required")
+			}
+			*setting.value = value
+		}
+	}
+	if manager.TestWorkers > 32 || manager.FormalWorkers > 32 {
+		return nil, errors.New("lane worker limit exceeded")
+	}
+	if err := db.ConfigureTestCapacity(manager.TestActiveLimit); err != nil {
+		return nil, err
+	}
+	if raw := os.Getenv("NM_FORMAL_DISABLED"); raw != "" {
+		disabled, err := strconv.ParseBool(raw)
+		if err != nil {
+			return nil, errors.New("invalid NM_FORMAL_DISABLED")
+		}
+		if disabled {
+			if err := db.DisableFormal(); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return manager, nil
 }
@@ -170,5 +225,38 @@ func (m *Manager) FormalCompatibility(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		next(w, r.WithContext(context.WithValue(r.Context(), snapshotKey{}, snapshot)))
+	}
+}
+
+// IntervalFor never lets the test budget pace the original production lane.
+func (m *Manager) IntervalFor(id string) time.Duration {
+	if id == "formal" {
+		return m.FormalSendInterval
+	}
+	if id == "test" {
+		return m.SendInterval
+	}
+	return 0
+}
+func (m *Manager) BudgetStatus() map[string]interface{} {
+	return map[string]interface{}{"test_interval": m.SendInterval.String(), "formal_interval": m.FormalSendInterval.String(), "test_workers": m.TestWorkers, "formal_workers": m.FormalWorkers, "test_active_limit": m.TestActiveLimit, "formal_disabled": m.Store.FormalDisabled(), "clock_isolation": true, "queue_isolation": true}
+}
+
+// CutoverReadGuard is only installed on the read-only GET status resource.
+// Holding its independent credential never authorizes profile mutations/intake.
+func (m *Manager) CutoverReadGuard(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "cutover status is read-only", http.StatusMethodNotAllowed)
+			return
+		}
+		authorization := []byte(r.Header.Get("Authorization"))
+		control := len(m.controlToken) >= 32 && subtle.ConstantTimeCompare(authorization, []byte("Bearer "+m.controlToken)) == 1
+		readonly := len(m.cutoverReadToken) >= 32 && subtle.ConstantTimeCompare(authorization, []byte("Bearer "+m.cutoverReadToken)) == 1
+		if !control && !readonly {
+			http.Error(w, "unauthorized cutover read", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
 	}
 }

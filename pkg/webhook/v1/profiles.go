@@ -147,7 +147,7 @@ func (h *HttpHandler) ServeFormalReadiness(w http.ResponseWriter, _ *http.Reques
 		http.Error(w, "formal configuration incompatible", 503)
 		return
 	}
-	if err := h.alerts.Durable.Ready(); err != nil {
+	if err := h.alerts.Durable.ReadyProfile("formal"); err != nil {
 		http.Error(w, "formal storage unavailable", 503)
 		return
 	}

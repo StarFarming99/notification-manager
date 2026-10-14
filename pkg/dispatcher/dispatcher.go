@@ -33,6 +33,21 @@ type Dispatcher struct {
 
 func New(l log.Logger, notifierCtl *controller.Controller, alerts *store.AlertStore, scheduleTimeout time.Duration, wkrTimeout time.Duration, workerQueue int) *Dispatcher {
 
+	if profiles := notifierCtl.DeliveryProfiles; profiles != nil {
+		workers := workerQueue
+		if workers < 1 {
+			workers = 1
+		}
+		if workers > 32 {
+			workers = 32
+		}
+		if profiles.FormalWorkers == 0 {
+			profiles.FormalWorkers = workers
+		}
+		if profiles.TestWorkers == 0 {
+			profiles.TestWorkers = workers
+		}
+	}
 	return &Dispatcher{
 		l:               l,
 		notifierCtl:     notifierCtl,

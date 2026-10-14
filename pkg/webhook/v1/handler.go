@@ -189,18 +189,33 @@ func (h *HttpHandler) ServeReadinessCheck(w http.ResponseWriter, _ *http.Request
 		return
 	}
 	if profiles := h.notifierCtl.DeliveryProfiles; profiles != nil {
-		if snap, err := profiles.Store.ProfileSnapshot("test"); err == nil {
-			if err := h.validateTestScope(snap.DeliveryProfile); err != nil {
-				h.handle(w, &response{http.StatusServiceUnavailable, "Scoped test Receiver incompatible"})
+		// A broken/over-budget test receiver must not remove an active formal
+		// backend from the original Service. Formal's dedicated readiness separately
+		// validates full configuration and the guarded compatibility contract.
+		if _, formalErr := profiles.Store.ProfileSnapshot("formal"); formalErr != nil {
+			if snap, err := profiles.Store.ProfileSnapshot("test"); err == nil {
+				if err := h.validateTestScope(snap.DeliveryProfile); err != nil {
+					h.handle(w, &response{http.StatusServiceUnavailable, "Scoped test Receiver incompatible"})
+					return
+				}
+			} else {
+				h.handle(w, &response{http.StatusServiceUnavailable, "No delivery profile accepting"})
 				return
 			}
-		} else if _, err := profiles.Store.ProfileSnapshot("formal"); err != nil {
-			h.handle(w, &response{http.StatusServiceUnavailable, "No delivery profile accepting"})
-			return
 		}
 	}
 	if h.alerts.Durable != nil {
-		if err := h.alerts.Durable.Ready(); err != nil {
+		var err error
+		if profiles := h.notifierCtl.DeliveryProfiles; profiles != nil {
+			lane := "test"
+			if _, e := profiles.Store.ProfileSnapshot("formal"); e == nil {
+				lane = "formal"
+			}
+			err = h.alerts.Durable.ReadyProfile(lane)
+		} else {
+			err = h.alerts.Durable.Ready()
+		}
+		if err != nil {
 			h.handle(w, &response{http.StatusServiceUnavailable, "Original notification spool unavailable"})
 			return
 		}
@@ -307,7 +322,7 @@ func (h *HttpHandler) Verify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.alerts.Durable != nil {
+	if h.alerts.Durable != nil && !formalAPI(r.Context()) {
 		h.handle(w, &response{http.StatusOK, "Verification notification accepted for durable delivery"})
 		return
 	}
@@ -352,7 +367,7 @@ func (h *HttpHandler) Notification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.alerts.Durable != nil {
+	if h.alerts.Durable != nil && !formalAPI(r.Context()) {
 		h.handle(w, &response{http.StatusOK, "Notification accepted for durable delivery"})
 		return
 	}
@@ -366,14 +381,22 @@ func (h *HttpHandler) getReceiversFromRequest(m map[string]interface{}) ([]inter
 		return nil, utils.Error("Receiver is nil")
 	}
 
-	if err := utils.MapToStruct(m["receiver"].(map[string]interface{}), &nr); err != nil {
+	rawReceiver, ok := m["receiver"].(map[string]interface{})
+	if !ok {
+		return nil, utils.Error("Receiver must be an object")
+	}
+	if err := utils.MapToStruct(rawReceiver, &nr); err != nil {
 		return nil, err
 	}
 
 	var nc *v2beta2.Config = nil
 	if _, ok := m["config"]; ok {
 		tmp := v2beta2.Config{}
-		if err := utils.MapToStruct(m["config"].(map[string]interface{}), &tmp); err != nil {
+		rawConfig, ok := m["config"].(map[string]interface{})
+		if !ok {
+			return nil, utils.Error("Config must be an object")
+		}
+		if err := utils.MapToStruct(rawConfig, &tmp); err != nil {
 			return nil, err
 		}
 		nc = &tmp
@@ -388,7 +411,7 @@ func (h *HttpHandler) getReceiversFromRequest(m map[string]interface{}) ([]inter
 }
 
 func (h *HttpHandler) send(parent context.Context, receivers []internal.Receiver, alerts template.Alerts, seq, key, hash string) string {
-	if h.alerts.Durable != nil {
+	if h.alerts.Durable != nil && !formalAPI(parent) {
 		_, err := h.acceptDurable(parent, alerts, receivers, key, hash)
 		if err != nil {
 			h.recordAdmissionFailure(err, "")
@@ -400,18 +423,37 @@ func (h *HttpHandler) send(parent context.Context, receivers []internal.Receiver
 	ctx = context.WithValue(ctx, "seq", seq)
 	defer cancel()
 
-	pipeline := stage.MultiStage{}
-	// Aggregation stage
-	pipeline = append(pipeline, aggregation.NewStage(h.notifierCtl))
-	// Notify stage
-	pipeline = append(pipeline, notify.NewStage(h.notifierCtl))
-
+	pipeline := stage.MultiStage{aggregation.NewStage(h.notifierCtl)}
 	val := make(map[internal.Receiver][]*template.Alert)
 	for _, receiver := range receivers {
 		val[receiver] = alerts
 	}
-
-	_, _, err := pipeline.Exec(ctx, h.logger, val)
+	send := func() error {
+		_, output, err := pipeline.Exec(ctx, h.logger, val)
+		if err != nil {
+			return err
+		}
+		if groups, ok := output.(map[internal.Receiver][]*template.Data); ok {
+			for _, items := range groups {
+				for _, data := range items {
+					data.JevCaptureExcluded = true
+				}
+			}
+		}
+		_, _, err = notify.NewStage(h.notifierCtl).Exec(ctx, h.logger, output)
+		return err
+	}
+	var err error
+	if snap, ok := deliveryprofiles.Snapshot(parent); ok && snap.ID == "formal" {
+		if !h.alerts.Accepting() {
+			return "Notification intake is stopping"
+		}
+		// Keep original synchronous sending/error semantics. A paused profile cannot
+		// admit a late API call and no test backlog or test clock is involved.
+		err = h.alerts.Durable.WithProfilePermit(*snap, send)
+	} else {
+		err = send()
+	}
 	if err != nil {
 		return err.Error()
 	}
@@ -517,4 +559,9 @@ func (h *HttpHandler) acceptDurable(parent context.Context, alerts template.Aler
 	}
 	intake, _, err := h.alerts.Durable.Submit(key, hash, targets, terminal)
 	return intake, err
+}
+
+func formalAPI(ctx context.Context) bool {
+	snap, ok := deliveryprofiles.Snapshot(ctx)
+	return ok && snap.ID == "formal"
 }

@@ -148,7 +148,11 @@ func (g *patchWriterGate) persist() error {
 // scopes, while preserving successful-delivery intake and all durable receipts.
 func (s *Service) HandleWriterControl(token string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if len(token) < 32 || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+token)) != 1 {
+		authorization := []byte(r.Header.Get("Authorization"))
+		control := len(token) >= 32 && subtle.ConstantTimeCompare(authorization, []byte("Bearer "+token)) == 1
+		readToken := s.config.CutoverReadToken
+		readonly := r.Method == http.MethodGet && len(readToken) >= 32 && subtle.ConstantTimeCompare(authorization, []byte("Bearer "+readToken)) == 1
+		if !control && !readonly {
 			w.WriteHeader(401)
 			return
 		}
@@ -160,7 +164,7 @@ func (s *Service) HandleWriterControl(token string) http.HandlerFunc {
 		if r.Method == http.MethodGet {
 			g.mu.Lock()
 			defer g.mu.Unlock()
-			writeJSON(w, 200, map[string]interface{}{"state": g.state, "patch_interval_seconds": g.interval.Seconds(), "permission_domain": s.config.PermissionDomain, "execution_domain": s.config.ExecutionDomain})
+			writeJSON(w, 200, map[string]interface{}{"state": g.state, "patch_interval_seconds": g.interval.Seconds(), "permission_domain": s.config.PermissionDomain, "execution_domain": s.config.ExecutionDomain, "formal_disabled": s.config.FormalWriterDisabled})
 			return
 		}
 		if r.Method != http.MethodPost {

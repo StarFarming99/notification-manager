@@ -33,6 +33,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 const (
@@ -58,6 +60,8 @@ type NotificationManagerReconciler struct {
 	Namespace string
 	Log       logr.Logger
 	Scheme    *runtime.Scheme
+	// Test injection only; production probes actual guarded candidate Pod endpoints.
+	FormalReadyProbe func(context.Context, *corev1.Pod) error
 }
 
 // Reconcile reads that state of NotificationManager objects and makes changes based on the state read
@@ -70,6 +74,10 @@ type NotificationManagerReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch
 
 func (r *NotificationManagerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 
@@ -88,12 +96,34 @@ func (r *NotificationManagerReconciler) Reconcile(ctx context.Context, req ctrl.
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	// Rollback readies the original deployment before changing the stable Service.
-	if handoff != nil && handoff.Phase == "rollback" {
-		deploy := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: nm.Name + "-deployment", Namespace: r.Namespace}}
-		if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, deploy, r.mutateDeployment(deploy, &nm)); err != nil {
-			return ctrl.Result{}, err
+	if handoff != nil {
+		return r.reconcileHandoff(ctx, &nm, handoff)
+	}
+	if state, err := handoffState(&nm); err != nil {
+		return ctrl.Result{}, err
+	} else if state != nil {
+		return r.reconcileMissingIntent(ctx, &nm, state)
+	}
+	// On first reconciliation by an upgraded Operator, retain the installed
+	// Deployment byte-for-byte. Future explicit CR spec changes remain managed.
+	var installed appsv1.Deployment
+	if err := r.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: nm.Name + "-deployment"}, &installed); err == nil {
+		fingerprint := specFingerprint(&nm)
+		if nm.Annotations[reconciledSpecAnnotation] == "" {
+			if nm.Annotations == nil {
+				nm.Annotations = map[string]string{}
+			}
+			nm.Annotations[reconciledSpecAnnotation] = fingerprint
+			if err := r.Update(ctx, &nm); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, r.createDeploymentSvc(ctx, &nm)
 		}
+		if nm.Annotations[reconciledSpecAnnotation] == fingerprint {
+			return ctrl.Result{}, r.createDeploymentSvc(ctx, &nm)
+		}
+	} else if client.IgnoreNotFound(err) != nil {
+		return ctrl.Result{}, err
 	}
 	// Create deployment service
 	if err = r.createDeploymentSvc(ctx, &nm); err != nil {
@@ -112,14 +142,18 @@ func (r *NotificationManagerReconciler) Reconcile(ctx context.Context, req ctrl.
 	}
 	log.V(10).Info("CreateOrUpdate deployment returns", "result", result)
 
-	return ctrl.Result{}, nil
+	if nm.Annotations == nil {
+		nm.Annotations = map[string]string{}
+	}
+	nm.Annotations[reconciledSpecAnnotation] = specFingerprint(&nm)
+	return ctrl.Result{}, r.Update(ctx, &nm)
 }
 
 func (r *NotificationManagerReconciler) createDeploymentSvc(ctx context.Context, nm *v2beta2.NotificationManager) error {
 	if handoff, err := handoffIntent(nm); err != nil {
 		return err
 	} else if handoff != nil {
-		return r.createManagedHandoffService(ctx, nm, handoff)
+		return fmt.Errorf("managed handoff must use ordered stop reconciliation")
 	}
 	var existing corev1.Service
 	if err := r.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: nm.Name + "-svc"}, &existing); err == nil && existing.Annotations[SenderHandoffAnnotation] != "" && !strings.HasSuffix(existing.Annotations[SenderHandoffAnnotation], ":rollback") {
@@ -188,7 +222,7 @@ func (r *NotificationManagerReconciler) mutateDeployment(deploy *appsv1.Deployme
 		deploy.Spec.Replicas = nm.Spec.Replicas
 		if handoff, err := handoffIntent(nm); err != nil {
 			return err
-		} else if handoff != nil && handoff.Phase == "retired" {
+		} else if handoff != nil && (handoff.Phase == "retired" || handoff.Phase == "stopped") {
 			zero := int32(0)
 			deploy.Spec.Replicas = &zero
 		}
@@ -358,5 +392,23 @@ func (r *NotificationManagerReconciler) SetupWithManager(mgr ctrl.Manager) error
 		For(&v2beta2.NotificationManager{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
+		Watches(&appsv1.Deployment{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+			if obj.GetNamespace() != r.Namespace {
+				return nil
+			}
+			var managers v2beta2.NotificationManagerList
+			if err := r.List(ctx, &managers); err != nil {
+				return nil
+			}
+			requests := []reconcile.Request{}
+			for _, nm := range managers.Items {
+				h, _ := handoffIntent(&nm)
+				s, _ := handoffState(&nm)
+				if (h != nil && h.Deployment == obj.GetName()) || (s != nil && s.CandidateName == obj.GetName()) {
+					requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKey{Name: nm.Name}})
+				}
+			}
+			return requests
+		})).
 		Complete(r)
 }

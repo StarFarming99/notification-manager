@@ -14,12 +14,13 @@ type SendBudgetDeferred struct{ AvailableAt time.Time }
 func (e *SendBudgetDeferred) Error() string { return "notification send budget not yet available" }
 
 // WithSendPermit persists the reservation and send boundary before invoking
-// the bounded platform call. All profiled sends and retries share one clock;
+// the bounded platform call. Each profile has its own persisted clock;
 // unprofiled legacy sends keep their existing throughput. Pause waits for any
 // call already inside this boundary and prevents every later claimed send.
 func (s *Store) WithSendPermit(c Claim, interval time.Duration, now time.Time, send func() error) error {
-	s.sendMu.RLock()
-	defer s.sendMu.RUnlock()
+	mu := s.profileSendMutex(c.Target.ProfileID)
+	mu.RLock()
+	defer mu.RUnlock()
 	err := s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte("targets"))
 		var t Target
@@ -42,6 +43,10 @@ func (s *Store) WithSendPermit(c Claim, interval time.Duration, now time.Time, s
 		if t.ProfileID != "" && interval > 0 {
 			meta := tx.Bucket([]byte("meta"))
 			key := []byte("profile-send-next-at")
+			// Retain the existing test clock across upgrades; formal never inherits it.
+			if t.ProfileID == "formal" {
+				key = []byte("formal-send-next-at")
+			}
 			if raw := meta.Get(key); raw != nil {
 				var next time.Time
 				if err := json.Unmarshal(raw, &next); err != nil {

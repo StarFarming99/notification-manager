@@ -199,13 +199,13 @@ func Main() int {
 	ctxHttp, cancelHttp := context.WithCancel(context.Background())
 	defer cancelHttp()
 
+	disp := dispatcher.New(logger, ctl, alerts, *webhookTimeout, *wkrTimeout, *wkrQueue)
 	srvCh := make(chan error, 1)
 	go func() {
 		srvCh <- webhook.Run(ctxHttp)
 	}()
 
 	dispCh := make(chan error, 1)
-	disp := dispatcher.New(logger, ctl, alerts, *webhookTimeout, *wkrTimeout, *wkrQueue)
 	go func() {
 		dispCh <- disp.Run()
 	}()

@@ -2,6 +2,7 @@
 package notification_spool
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -77,6 +78,10 @@ type Limits struct {
 }
 type Store struct {
 	sendMu               sync.RWMutex
+	testSendMu           sync.RWMutex
+	formalSendMu         sync.RWMutex
+	formalDisabled       bool
+	testActiveLimit      int
 	db                   *bolt.DB
 	path                 string
 	owner                string
@@ -177,6 +182,9 @@ func Open(path string, limits Limits) (*Store, error) {
 		if v := meta.Get([]byte("version")); v != nil && string(v) != "1" {
 			return errors.New("unsupported notification spool version")
 		}
+		if _, err := tx.CreateBucketIfNotExists([]byte("ready-lanes")); err != nil {
+			return err
+		}
 		if err := meta.Put([]byte("version"), []byte("1")); err != nil {
 			return err
 		}
@@ -186,6 +194,7 @@ func Open(path string, limits Limits) (*Store, error) {
 		b := tx.Bucket([]byte("targets"))
 		var changes []Target
 		var active uint64
+		laneActive := map[string]int{}
 		if err := b.ForEach(func(_, v []byte) error {
 			var t Target
 			if err := json.Unmarshal(v, &t); err != nil {
@@ -193,6 +202,7 @@ func Open(path string, limits Limits) (*Store, error) {
 			}
 			if activeState(t.State) {
 				active++
+				laneActive[t.ProfileID]++
 			}
 			if t.State == Sending {
 				if t.SendPrepared {
@@ -213,17 +223,23 @@ func Open(path string, limits Limits) (*Store, error) {
 		if err := setActiveCount(tx, active); err != nil {
 			return err
 		}
+		for _, lane := range []string{"", "test", "formal"} {
+			if err := put(meta, "active-targets-profile:"+lane, laneActive[lane]); err != nil {
+				return err
+			}
+		}
 		for _, t := range changes {
 			if err := put(b, t.ID, t); err != nil {
 				return err
 			}
 			if t.State == Retryable {
-				if err := tx.Bucket([]byte("ready")).Put(queueKey(t), []byte(t.ID)); err != nil {
+				if err := putReady(tx, t); err != nil {
 					return err
 				}
 			}
 		}
-		return nil
+		// Rebuild only the secondary lane index, retaining every frozen target.
+		return rebuildLaneIndex(tx)
 	})
 	if err != nil {
 		db.Close()
@@ -355,7 +371,33 @@ func (s *Store) submit(key, requestHash string, targets []Target, terminalReason
 			return err
 		}
 		b := tx.Bucket([]byte("targets"))
-		if activeCount(tx)+uint64(len(targets)) > uint64(s.limits.MaxTargets) {
+		if snapshot != nil && snapshot.ID == "test" && s.testActiveLimit > 0 {
+			count, err := profileActiveCount(tx, "test")
+			if err != nil {
+				return err
+			}
+			if count+len(targets) > s.testActiveLimit {
+				return ErrCapacity
+			}
+		}
+		quotaActive := activeCount(tx)
+		if snapshot != nil && snapshot.ID == "formal" {
+			test, err := profileActiveCount(tx, "test")
+			if err != nil {
+				return err
+			}
+			if quotaActive < uint64(test) {
+				return errors.New("invalid profile quota counter")
+			}
+			quotaActive -= uint64(test)
+		} else if snapshot != nil && snapshot.ID == "test" {
+			test, err := profileActiveCount(tx, "test")
+			if err != nil {
+				return err
+			}
+			quotaActive = uint64(test)
+		}
+		if quotaActive+uint64(len(targets)) > uint64(s.limits.MaxTargets) {
 			return ErrCapacity
 		}
 		now := time.Now().UTC()
@@ -388,12 +430,14 @@ func (s *Store) submit(key, requestHash string, targets []Target, terminalReason
 			if err := put(b, t.ID, t); err != nil {
 				return err
 			}
-			index, indexKey := tx.Bucket([]byte("ready")), queueKey(t)
 			if len(t.DependencyRevisions) > 0 {
-				index = tx.Bucket([]byte("blocked"))
-				indexKey = []byte(t.ID)
+				if err := tx.Bucket([]byte("blocked")).Put([]byte(t.ID), []byte(t.ID)); err != nil {
+					return err
+				}
+			} else if err := putReady(tx, t); err != nil {
+				return err
 			}
-			if err := index.Put(indexKey, []byte(t.ID)); err != nil {
+			if err := changeProfileActiveCount(tx, t.ProfileID, 1); err != nil {
 				return err
 			}
 			result.TargetIDs = append(result.TargetIDs, t.ID)
@@ -417,14 +461,33 @@ func (s *Store) submit(key, requestHash string, targets []Target, terminalReason
 	return result, duplicate, err
 }
 
-func (s *Store) Claim(now time.Time) (Claim, error) {
+func (s *Store) Claim(now time.Time) (Claim, error) { return s.claim(now, "*") }
+
+// ClaimProfile uses a separate persistent index so a test backlog cannot occupy
+// the formal sender's workers or cause a scan through every historical test row.
+func (s *Store) ClaimProfile(id string, now time.Time) (Claim, error) {
+	if id != "test" && id != "formal" && id != "" {
+		return Claim{}, errors.New("invalid claim lane")
+	}
+	return s.claim(now, id)
+}
+func (s *Store) claim(now time.Time, lane string) (Claim, error) {
 	var claim Claim
 	err := s.update(func(tx *bolt.Tx) error {
 		q := tx.Bucket([]byte("ready"))
+		prefix := []byte(nil)
+		if lane != "*" {
+			q = tx.Bucket([]byte("ready-lanes"))
+			prefix = []byte(lane + ":")
+		}
 		cursor := q.Cursor()
 		var k []byte
 		var t Target
-		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+		first, value := cursor.First()
+		if prefix != nil {
+			first, value = cursor.Seek(prefix)
+		}
+		for key := first; key != nil && (prefix == nil || bytes.HasPrefix(key, prefix)); key, value = cursor.Next() {
 			if err := json.Unmarshal(tx.Bucket([]byte("targets")).Get(value), &t); err != nil {
 				return err
 			}
@@ -460,7 +523,7 @@ func (s *Store) Claim(now time.Time) (Claim, error) {
 		if err := put(tx.Bucket([]byte("targets")), t.ID, t); err != nil {
 			return err
 		}
-		if err := q.Delete(k); err != nil {
+		if err := deleteReady(tx, t); err != nil {
 			return err
 		}
 		claim = Claim{Target: t, Owner: s.owner, AttemptID: attempt}
@@ -495,7 +558,7 @@ func (s *Store) ClaimForRecovery(id, actor, evidence string, now time.Time) (Cla
 		if err := put(tx.Bucket([]byte("audit")), attempt, map[string]interface{}{"action": "replay_exact_target", "target_id": id, "actor": actor, "evidence": evidence, "at": now.UTC()}); err != nil {
 			return err
 		}
-		if err := tx.Bucket([]byte("ready")).Delete(queueKey(t)); err != nil {
+		if err := deleteReady(tx, t); err != nil {
 			return err
 		}
 		t.State = Sending
@@ -529,6 +592,9 @@ func (s *Store) Finish(c Claim, state, outcome, evidence string, next time.Time)
 			return ErrFence
 		}
 		if !activeState(state) {
+			if err := changeProfileActiveCount(tx, t.ProfileID, -1); err != nil {
+				return err
+			}
 			if err := changeActiveCount(tx, -1); err != nil {
 				return err
 			}
@@ -539,7 +605,7 @@ func (s *Store) Finish(c Claim, state, outcome, evidence string, next time.Time)
 		t.UpdatedAt = time.Now().UTC()
 		if state == Retryable {
 			t.AvailableAt = next.UTC()
-			if err := tx.Bucket([]byte("ready")).Put(queueKey(t), []byte(t.ID)); err != nil {
+			if err := putReady(tx, t); err != nil {
 				return err
 			}
 		}
@@ -605,14 +671,41 @@ func (s *Store) Resolve(id, state, actor, evidence string) error {
 			return err
 		}
 		if activeState(t.State) && !activeState(state) {
+			if err := changeProfileActiveCount(tx, t.ProfileID, -1); err != nil {
+				return err
+			}
 			if err := changeActiveCount(tx, -1); err != nil {
 				return err
 			}
 		} else if !activeState(t.State) && activeState(state) {
+			if err := changeProfileActiveCount(tx, t.ProfileID, 1); err != nil {
+				return err
+			}
 			if err := changeActiveCount(tx, 1); err != nil {
 				return err
 			}
-			if activeCount(tx) > uint64(s.limits.MaxTargets) {
+			quota := activeCount(tx)
+			if t.ProfileID == "formal" {
+				test, err := profileActiveCount(tx, "test")
+				if err != nil {
+					return err
+				}
+				if quota < uint64(test) {
+					return errors.New("invalid profile quota counter")
+				}
+				quota -= uint64(test)
+			}
+			if t.ProfileID == "test" {
+				test, err := profileActiveCount(tx, "test")
+				if err != nil {
+					return err
+				}
+				quota = uint64(test)
+				if s.testActiveLimit > 0 && test > s.testActiveLimit {
+					return ErrCapacity
+				}
+			}
+			if quota > uint64(s.limits.MaxTargets) {
 				return ErrCapacity
 			}
 		}
@@ -622,7 +715,7 @@ func (s *Store) Resolve(id, state, actor, evidence string) error {
 		t.UpdatedAt = time.Now().UTC()
 		if state == Retryable {
 			t.AvailableAt = time.Now().UTC()
-			if err := tx.Bucket([]byte("ready")).Put(queueKey(t), []byte(id)); err != nil {
+			if err := putReady(tx, t); err != nil {
 				return err
 			}
 		}
@@ -659,7 +752,16 @@ func (s *Store) Status() (map[string]interface{}, error) {
 	if fi, statErr := os.Stat(s.path); statErr == nil {
 		storedBytes = fi.Size()
 	}
-	return map[string]interface{}{"version": Version, "owner": s.owner, "storage_write_failures": writeFailures, "last_storage_error": lastStorageError, "counts": counts, "active_targets": active, "active_target_limit": s.limits.MaxTargets, "stored_bytes": storedBytes, "storage_byte_limit": s.limits.MaxBytes, "completed_payload_retention": "48h", "completed_cleanup_batch": 200}, err
+	var testActive int
+	if err == nil {
+		err = s.db.View(func(tx *bolt.Tx) error { var e error; testActive, e = profileActiveCount(tx, "test"); return e })
+	}
+	formalActive := int64(active) - int64(testActive)
+	totalLimit := s.limits.MaxTargets
+	if s.testActiveLimit > 0 {
+		totalLimit += s.testActiveLimit
+	}
+	return map[string]interface{}{"version": Version, "owner": s.owner, "storage_write_failures": writeFailures, "last_storage_error": lastStorageError, "counts": counts, "active_targets": active, "active_target_limit": totalLimit, "test_active_targets": testActive, "formal_original_active_targets": formalActive, "test_active_target_limit": s.testActiveLimit, "formal_original_active_target_limit": s.limits.MaxTargets, "physical_storage_shared": true, "stored_bytes": storedBytes, "storage_byte_limit": s.limits.MaxBytes, "completed_payload_retention": "48h", "completed_cleanup_batch": 200}, err
 }
 func (s *Store) Check() error {
 	return s.db.View(func(tx *bolt.Tx) error {
@@ -717,7 +819,7 @@ func releaseDependents(tx *bolt.Tx, parent Target) error {
 		if err := put(targets, t.ID, t); err != nil {
 			return err
 		}
-		if err := tx.Bucket([]byte("ready")).Put(queueKey(t), []byte(t.ID)); err != nil {
+		if err := putReady(tx, t); err != nil {
 			return err
 		}
 		if err := blocked.Delete([]byte(t.ID)); err != nil {

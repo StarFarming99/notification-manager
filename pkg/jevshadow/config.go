@@ -36,6 +36,8 @@ const (
 type Config struct {
 	PatchInterval                             time.Duration
 	WriterControlToken                        string
+	CutoverReadToken                          string
+	FormalWriterDisabled                      bool
 	patchGate                                 *patchWriterGate
 	DeliveryScopes                            map[string]DeliveryScope
 	AnnotationProfiles                        map[string]struct{}
@@ -108,6 +110,12 @@ func ConfigFromEnv() (Config, error) {
 	}
 	config = config.withReceiptDefaults()
 	config.WriterControlToken = strings.TrimSpace(os.Getenv("JEV_EXECUTOR_WRITER_CONTROL_TOKEN"))
+	config.CutoverReadToken = strings.TrimSpace(os.Getenv("NM_CUTOVER_READ_TOKEN"))
+	config.FormalWriterDisabled, err = strconv.ParseBool(valueOrDefault("JEV_FORMAL_WRITER_DISABLED", "false"))
+	if err != nil {
+		return Config{}, fmt.Errorf("JEV_FORMAL_WRITER_DISABLED must be a boolean")
+	}
+
 	if raw := strings.TrimSpace(os.Getenv("JEV_EXECUTOR_PATCH_INTERVAL")); raw != "" {
 		config.PatchInterval, err = time.ParseDuration(raw)
 		if err != nil || config.PatchInterval < 100*time.Millisecond || config.PatchInterval > time.Minute {
@@ -160,6 +168,23 @@ func (c Config) validate() error {
 		for _, token := range business {
 			if token != "" && token == c.WriterControlToken {
 				return fmt.Errorf("executor writer control requires an independent credential")
+			}
+		}
+	}
+	if c.CutoverReadToken != "" {
+		if len(c.CutoverReadToken) < 32 {
+			return fmt.Errorf("cutover read credential requires at least 32 bytes")
+		}
+		business := []string{c.Token, c.AnnotationToken, c.FeedbackToken, c.WriterControlToken}
+		for _, name := range []string{"JEV_EXECUTOR_TOKEN", "JEV_CALLBACK_RELAY_TOKEN", "NM_TEST_INTAKE_TOKEN", "NM_FORMAL_INTAKE_TOKEN", "NM_PROFILE_CONTROL_TOKEN"} {
+			business = append(business, os.Getenv(name))
+		}
+		for _, scope := range c.DeliveryScopes {
+			business = append(business, scope.receiptToken, scope.annotationToken, scope.feedbackToken, os.Getenv(scope.ReceiptTokenEnv), os.Getenv(scope.AnnotationTokenEnv), os.Getenv(scope.FeedbackTokenEnv))
+		}
+		for _, token := range business {
+			if token != "" && token == c.CutoverReadToken {
+				return fmt.Errorf("cutover read credential must be independent from intake/writer/business credentials")
 			}
 		}
 	}

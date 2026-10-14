@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"time"
 
@@ -61,6 +62,20 @@ func New(logger log.Logger, notifierCtl *controller.Controller, alerts *store.Al
 		h.router.Post("/api/v2/test/verify", profiles.Guard("test", deny))
 		h.router.Post("/api/v2/test/notifications", profiles.Guard("test", deny))
 		h.router.Get("/internal/delivery-profiles", profiles.ControlGuard(h.handler.ProfileStatus))
+		h.router.Get("/internal/cutover-status", profiles.CutoverReadGuard(func(w http.ResponseWriter, r *http.Request) {
+			states, err := profiles.Store.ProfileStatus()
+			if err != nil {
+				http.Error(w, "profile status unavailable", 503)
+				return
+			}
+			status, err := profiles.Store.Status()
+			if err != nil {
+				http.Error(w, "spool status unavailable", 503)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"contract_version": 1, "profiles": states, "budgets": profiles.BudgetStatus(), "spool": status, "formal_compatibility": map[string]interface{}{"enabled": h.FormalCompatListenAddress != "" && h.compatError == nil && !profiles.Store.FormalDisabled(), "listen_address": h.FormalCompatListenAddress, "source_cidrs": h.FormalCompatSourceCIDRs, "legacy_api_semantics": "synchronous_platform_result", "source_identity": "direct_socket_only"}})
+		}))
 		h.router.Post("/internal/delivery-profiles/{profile}/{action}", profiles.ControlGuard(func(w http.ResponseWriter, r *http.Request) {
 			h.handler.ProfileControl(w, r, chi.URLParam(r, "profile"), chi.URLParam(r, "action"))
 		}))
