@@ -55,6 +55,9 @@ type Target struct {
 	UpdatedAt   time.Time       `json:"updated_at"`
 	Outcome     string          `json:"outcome,omitempty"`
 	Evidence    string          `json:"evidence,omitempty"`
+	// Prepared claims have not entered a platform send. A restart may safely
+	// requeue these; older sending records remain uncertain by default.
+	SendPrepared bool `json:"send_prepared,omitempty"`
 	// History becomes eligible after one referenced original target succeeds.
 	DependencyRevisions []string `json:"dependency_revisions,omitempty"`
 }
@@ -73,6 +76,7 @@ type Limits struct {
 	ReserveBytes uint64
 }
 type Store struct {
+	sendMu               sync.RWMutex
 	db                   *bolt.DB
 	path                 string
 	owner                string
@@ -191,8 +195,14 @@ func Open(path string, limits Limits) (*Store, error) {
 				active++
 			}
 			if t.State == Sending {
-				t.State = Unknown
-				t.Outcome = "previous_owner_interrupted"
+				if t.SendPrepared {
+					t.State = Retryable
+					t.Outcome = "previous_owner_pre_send_interrupted"
+					t.AvailableAt = time.Now().UTC()
+				} else {
+					t.State = Unknown
+					t.Outcome = "previous_owner_interrupted"
+				}
 				t.UpdatedAt = time.Now().UTC()
 				changes = append(changes, t)
 			}
@@ -206,6 +216,11 @@ func Open(path string, limits Limits) (*Store, error) {
 		for _, t := range changes {
 			if err := put(b, t.ID, t); err != nil {
 				return err
+			}
+			if t.State == Retryable {
+				if err := tx.Bucket([]byte("ready")).Put(queueKey(t), []byte(t.ID)); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -437,6 +452,7 @@ func (s *Store) Claim(now time.Time) (Claim, error) {
 			return err
 		}
 		t.State = Sending
+		t.SendPrepared = t.ProfileID != ""
 		t.Owner = s.owner
 		t.AttemptID = attempt
 		t.Attempts++
@@ -483,6 +499,7 @@ func (s *Store) ClaimForRecovery(id, actor, evidence string, now time.Time) (Cla
 			return err
 		}
 		t.State = Sending
+		t.SendPrepared = t.ProfileID != ""
 		t.Owner = s.owner
 		t.AttemptID = attempt
 		t.Attempts++

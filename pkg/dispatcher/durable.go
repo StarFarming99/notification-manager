@@ -81,48 +81,30 @@ func (d *Dispatcher) sendClaim(claim spool.Claim) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	err := d.waitSendBudget(ctx)
-	if err != nil {
+	interval := time.Duration(0)
+	if profiles := d.notifierCtl.DeliveryProfiles; profiles != nil {
+		interval = profiles.SendInterval
+	}
+	started := false
+	err := d.alerts.Durable.WithSendPermit(claim, interval, time.Now().UTC(), func() error {
+		started = true
+		return notify.SendFrozen(ctx, d.l, d.notifierCtl, claim.Target)
+	})
+	next := time.Now().Add(5 * time.Second)
+	var deferred *spool.SendBudgetDeferred
+	if errors.As(err, &deferred) {
+		next = deferred.AvailableAt
+	}
+	if err != nil && !started {
 		err = &utils.PreSendError{Err: err}
-	} else {
-		err = notify.SendFrozen(ctx, d.l, d.notifierCtl, claim.Target)
 	}
 	state, outcome := utils.DeliveryOutcome(err)
 	evidence := "attempt:" + claim.AttemptID
-	if err := d.alerts.Durable.Finish(claim, state, outcome, evidence, time.Now().Add(5*time.Second)); err != nil {
+	if err := d.alerts.Durable.Finish(claim, state, outcome, evidence, next); err != nil {
 		// A successful external send without a durable Ack must never be retried
 		// here. The persisted sending record is reconciled as unknown on restart.
 		_ = level.Error(d.l).Log("msg", "Original notification completion could not be persisted", "target_id", claim.Target.ID, "attempt_id", claim.AttemptID)
 		return
 	}
 	_ = level.Info(d.l).Log("msg", "Original notification target completed", "target_id", claim.Target.ID, "attempt_id", claim.AttemptID, "state", state)
-}
-
-// One reservation clock bounds automatic sends across all workers and retries.
-// The legacy memory pipeline retains its existing notification behavior.
-func (d *Dispatcher) waitSendBudget(ctx context.Context) error {
-	profiles := d.notifierCtl.DeliveryProfiles
-	if profiles == nil || profiles.SendInterval <= 0 {
-		return nil
-	}
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		d.sendBudgetMu.Lock()
-		wait := time.Until(d.nextSend)
-		if wait <= 0 {
-			d.nextSend = time.Now().Add(profiles.SendInterval)
-			d.sendBudgetMu.Unlock()
-			return nil
-		}
-		d.sendBudgetMu.Unlock()
-		timer := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
 }

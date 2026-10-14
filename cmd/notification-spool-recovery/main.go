@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/kubesphere/notification-manager/pkg/controller"
+	"github.com/kubesphere/notification-manager/pkg/deliveryprofiles"
 	spool "github.com/kubesphere/notification-manager/pkg/notification_spool"
 	"github.com/kubesphere/notification-manager/pkg/notify"
 	"github.com/kubesphere/notification-manager/pkg/utils"
@@ -96,13 +97,38 @@ func run() error {
 	if err := ctl.Run(); err != nil {
 		return err
 	}
+	profiles, err := deliveryprofiles.FromEnv(s)
+	if err != nil {
+		return err
+	}
+	ctl.DeliveryProfiles = profiles
 	claim, err := s.ClaimForRecovery(*target, *actor, *evidence, time.Now())
 	if err != nil {
 		return err
 	}
-	err = notify.SendFrozen(ctx, logger, ctl, claim.Target)
+	next := time.Now().Add(5 * time.Second)
+	interval := time.Duration(0)
+	if profiles != nil {
+		interval = profiles.SendInterval
+	}
+	started := false
+	if claim.Target.ProfileID != "" && profiles == nil {
+		err = &utils.PreSendError{Err: errors.New("profiled recovery requires original delivery profile configuration and send budget")}
+	} else {
+		err = s.WithSendPermit(claim, interval, time.Now().UTC(), func() error {
+			started = true
+			return notify.SendFrozen(ctx, logger, ctl, claim.Target)
+		})
+		var deferred *spool.SendBudgetDeferred
+		if errors.As(err, &deferred) {
+			next = deferred.AvailableAt
+		}
+		if err != nil && !started {
+			err = &utils.PreSendError{Err: err}
+		}
+	}
 	completion, outcome := utils.DeliveryOutcome(err)
-	if finishErr := s.Finish(claim, completion, outcome, "recovery-attempt:"+claim.AttemptID, time.Now().Add(5*time.Second)); finishErr != nil {
+	if finishErr := s.Finish(claim, completion, outcome, "recovery-attempt:"+claim.AttemptID, next); finishErr != nil {
 		return finishErr
 	}
 	return json.NewEncoder(os.Stdout).Encode(map[string]string{"target_id": claim.Target.ID, "attempt_id": claim.AttemptID, "state": completion})

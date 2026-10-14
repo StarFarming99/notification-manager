@@ -140,6 +140,10 @@ func (s *Store) ProfileVersion(id, version string) (DeliveryProfile, error) {
 // ControlProfile changes admission/delivery using one persisted CAS. Prepare
 // must be preceded by compatibility validation in the authenticated handler.
 func (s *Store) ControlProfile(id, action, version string, expected uint64, actor, evidence string) (ProfileState, error) {
+	// Once pause returns, every previously started bounded platform call has
+	// finished. Claimed work still waiting for its budget stays recoverable.
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 	var result ProfileState
 	if actor == "" || evidence == "" || len(actor) > 128 || len(evidence) > 512 {
 		return result, errors.New("bounded audit actor and evidence required")

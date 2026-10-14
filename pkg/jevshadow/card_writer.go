@@ -259,53 +259,55 @@ func (s *Service) applyPersistentAnnotation(
 			return fmt.Errorf("%w: %v", ErrInvalidPayload, renderHashErr)
 		}
 		resultID = requestID(messageID, idempotencyKey)
-		state.PatchSendState = patchSendSending
-		state.LastPatchError = ""
-		state.PendingPatch = &cardPatchIntent{
-			IdempotencyKey:     idempotencyKey,
-			PayloadHash:        payloadHash,
-			RequestID:          resultID,
-			ComponentKey:       componentKey,
-			Component:          component,
-			RenderedCard:       rendered,
-			RenderedCardHash:   renderedHash,
-			AnnotationRevision: component.AnnotationRevision,
-			StartedAt:          time.Now().UTC(),
-		}
-		if saveErr := s.cardStore.Save(&state); saveErr != nil {
-			return fmt.Errorf("%w: persist patch intent: %v", ErrCardWriterUnavailable, saveErr)
-		}
-
-		patchErr := patcher(ctx, messageID, rendered)
-		if patchErr != nil {
-			state.LastPatchError = boundedCardStateError(patchErr)
-			state.PatchSendState = classifyPatchFailure(patchErr)
-			if state.PatchSendState == patchSendFailed {
-				state.PendingPatch = nil
+		return s.writerGate.withAttempt(ctx, messageID, func() error {
+			state.PatchSendState = patchSendSending
+			state.LastPatchError = ""
+			state.PendingPatch = &cardPatchIntent{
+				IdempotencyKey:     idempotencyKey,
+				PayloadHash:        payloadHash,
+				RequestID:          resultID,
+				ComponentKey:       componentKey,
+				Component:          component,
+				RenderedCard:       rendered,
+				RenderedCardHash:   renderedHash,
+				AnnotationRevision: component.AnnotationRevision,
+				StartedAt:          time.Now().UTC(),
 			}
 			if saveErr := s.cardStore.Save(&state); saveErr != nil {
-				syncBindingFromCardState(binding, state, patcher)
-				return fmt.Errorf("%w: persist patch failure: %v", ErrPatchStateUnknown, saveErr)
+				return fmt.Errorf("%w: persist patch intent: %v", ErrCardWriterUnavailable, saveErr)
 			}
-			syncBindingFromCardState(binding, state, patcher)
-			if state.PatchSendState == patchSendUnknown {
-				return fmt.Errorf("%w: %v", ErrPatchStateUnknown, patchErr)
-			}
-			return patchErr
-		}
 
-		state.Annotations = annotations
-		state.AnnotationRevision = component.AnnotationRevision
-		state.AppliedKeys[idempotencyKey] = persistedAppliedRequest{PayloadHash: payloadHash, RequestID: resultID}
-		state.PatchSendState = patchSendConfirmed
-		state.PendingPatch = nil
-		state.LastPatchError = ""
-		if saveErr := s.cardStore.Save(&state); saveErr != nil {
+			patchErr := patcher(ctx, messageID, rendered)
+			if patchErr != nil {
+				state.LastPatchError = boundedCardStateError(patchErr)
+				state.PatchSendState = classifyPatchFailure(patchErr)
+				if state.PatchSendState == patchSendFailed {
+					state.PendingPatch = nil
+				}
+				if saveErr := s.cardStore.Save(&state); saveErr != nil {
+					syncBindingFromCardState(binding, state, patcher)
+					return fmt.Errorf("%w: persist patch failure: %v", ErrPatchStateUnknown, saveErr)
+				}
+				syncBindingFromCardState(binding, state, patcher)
+				if state.PatchSendState == patchSendUnknown {
+					return fmt.Errorf("%w: %v", ErrPatchStateUnknown, patchErr)
+				}
+				return patchErr
+			}
+
+			state.Annotations = annotations
+			state.AnnotationRevision = component.AnnotationRevision
+			state.AppliedKeys[idempotencyKey] = persistedAppliedRequest{PayloadHash: payloadHash, RequestID: resultID}
+			state.PatchSendState = patchSendConfirmed
+			state.PendingPatch = nil
+			state.LastPatchError = ""
+			if saveErr := s.cardStore.Save(&state); saveErr != nil {
+				syncBindingFromCardState(binding, state, patcher)
+				return fmt.Errorf("%w: persist confirmed patch: %v", ErrPatchStateUnknown, saveErr)
+			}
 			syncBindingFromCardState(binding, state, patcher)
-			return fmt.Errorf("%w: persist confirmed patch: %v", ErrPatchStateUnknown, saveErr)
-		}
-		syncBindingFromCardState(binding, state, patcher)
-		return nil
+			return nil
+		})
 	})
 	if err != nil {
 		return "", err

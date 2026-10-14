@@ -2,7 +2,6 @@ package dispatcher
 
 import (
 	"context"
-	"sync"
 	"time"
 
 	"github.com/go-kit/kit/log"
@@ -21,11 +20,9 @@ import (
 )
 
 type Dispatcher struct {
-	sendBudgetMu sync.Mutex
-	nextSend     time.Time
-	l            log.Logger
-	notifierCtl  *controller.Controller
-	alerts       *store.AlertStore
+	l           log.Logger
+	notifierCtl *controller.Controller
+	alerts      *store.AlertStore
 
 	scheduleTimeout time.Duration
 	wkrTimeout      time.Duration

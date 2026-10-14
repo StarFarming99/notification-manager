@@ -13,6 +13,7 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -62,6 +63,7 @@ type CardPatcher func(context.Context, string, map[string]interface{}) error
 type CardPatcherResolver func(context.Context, string, string) (CardPatcher, error)
 
 type Service struct {
+	writerGate    *patchWriterGate
 	scopeServices map[string]*Service
 	relay         *successRelay
 	config        Config
@@ -117,6 +119,18 @@ func New(logger log.Logger, config Config, client *http.Client) (*Service, error
 		cards:    make(map[string]*cardBinding),
 		patchers: make(map[string]CardPatcher),
 	}
+	if config.Enabled {
+		service.writerGate = config.patchGate
+		if service.writerGate == nil {
+			gate, err := newPatchWriterGate(config.CardStateDir, config.PatchInterval)
+			if err != nil {
+				_ = level.Error(logger).Log("msg", "Jev shadow adapter disabled because its writer control state could not be initialized", "error", err)
+				service.config.Enabled = false
+				return service, nil
+			}
+			service.writerGate = gate
+		}
+	}
 	if config.Enabled && len(config.DeliveryScopes) == 0 {
 		cardStore, err := newCardStateStore(logger, config.CardStateDir)
 		if err != nil {
@@ -150,6 +164,7 @@ func New(logger log.Logger, config Config, client *http.Client) (*Service, error
 				return nil, errors.New("all executor scopes must use the configured Feishu app")
 			}
 			childConfig := config
+			childConfig.patchGate = service.writerGate
 			childConfig.DeliveryScopes = nil
 			childConfig.expectedProfileID = scope.ProfileID
 			childConfig.expectedProfileVersion = scope.ProfileVersion
@@ -356,9 +371,27 @@ func (s *Service) HandleAnnotation(w http.ResponseWriter, r *http.Request, messa
 		return
 	}
 
-	requestID, err := s.applyAnnotation(r.Context(), messageID, idempotencyKey, component)
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if raw := r.Header.Get("X-Jev-Min-Update-Interval-Seconds"); raw != "" {
+		seconds, parseErr := strconv.ParseUint(raw, 10, 32)
+		if parseErr != nil || seconds == 0 || seconds > 3600 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid minimum update interval"})
+			return
+		}
+		ctx = context.WithValue(ctx, patchIntervalKey{}, time.Duration(seconds)*time.Second)
+	}
+	requestID, err := s.applyAnnotation(ctx, messageID, idempotencyKey, component)
 	if err != nil {
 		switch {
+		case errors.Is(err, ErrPatchWriterPaused):
+			w.Header().Set("Retry-After", "5")
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		case errors.As(err, new(*patchBudgetDeferred)):
+			var deferred *patchBudgetDeferred
+			_ = errors.As(err, &deferred)
+			w.Header().Set("Retry-After", strconv.Itoa(deferred.retrySeconds()))
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": err.Error()})
 		case errors.Is(err, ErrCardNotFound):
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		case errors.Is(err, ErrRevision):

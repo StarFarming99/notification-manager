@@ -64,6 +64,12 @@ func run() error {
 	defer cancel()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/jev/successful-deliveries", service.HandleSuccessfulDelivery(relayToken))
+	if config.WriterControlToken != "" {
+		if config.WriterControlToken == relayToken || !service.IndependentExecutorCredential(config.WriterControlToken) {
+			return errors.New("executor writer control requires an independent credential")
+		}
+		mux.HandleFunc("/internal/jev/writer-control", service.HandleWriterControl(config.WriterControlToken))
+	}
 	if service.FeedbackEnabled() {
 		callbackToken := os.Getenv("JEV_CALLBACK_RELAY_TOKEN")
 		if callbackToken == relayToken || !service.IndependentExecutorCredential(callbackToken) {

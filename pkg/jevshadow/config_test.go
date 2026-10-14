@@ -5,6 +5,44 @@ import (
 	"testing"
 )
 
+func TestWriterControlCredentialIsIndependentAcrossHistoricalScopes(t *testing.T) {
+	cfg := testConfig("http://jev.fixture.test/v1/delivery-receipts")
+	cfg.Token, cfg.AnnotationToken, cfg.FeedbackToken = strings.Repeat("r", 32), strings.Repeat("a", 32), strings.Repeat("f", 32)
+	cfg.WriterControlToken = strings.Repeat("w", 32)
+	if err := cfg.withReceiptDefaults().validate(); err != nil {
+		t.Fatal("independent writer control rejected", err)
+	}
+	for _, credential := range []string{cfg.Token, cfg.AnnotationToken, cfg.FeedbackToken} {
+		copy := cfg
+		copy.WriterControlToken = credential
+		if err := copy.withReceiptDefaults().validate(); err == nil || !strings.Contains(err.Error(), "independent") {
+			t.Fatal("direct business credential admitted")
+		}
+	}
+	for _, name := range []string{"JEV_EXECUTOR_TOKEN", "JEV_CALLBACK_RELAY_TOKEN", "NM_TEST_INTAKE_TOKEN", "NM_FORMAL_INTAKE_TOKEN", "NM_PROFILE_CONTROL_TOKEN"} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(name, cfg.WriterControlToken)
+			if err := cfg.withReceiptDefaults().validate(); err == nil {
+				t.Fatal("configured business credential reused")
+			}
+		})
+	}
+	cfg.DeliveryScopes = installedScopes(t)
+	for _, scope := range cfg.DeliveryScopes {
+		for _, credential := range []string{scope.receiptToken, scope.annotationToken, scope.feedbackToken} {
+			copy := cfg
+			copy.WriterControlToken = credential
+			if err := copy.withReceiptDefaults().validate(); err == nil || !strings.Contains(err.Error(), "independent") {
+				t.Fatal("historical scope credential reused")
+			}
+		}
+	}
+	cfg.WriterControlToken = ""
+	if err := cfg.withReceiptDefaults().validate(); err != nil {
+		t.Fatal("legacy executor without control credential rejected", err)
+	}
+}
+
 func setRequiredConfigEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv(envEnabled, "true")

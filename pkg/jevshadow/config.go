@@ -34,6 +34,9 @@ const (
 )
 
 type Config struct {
+	PatchInterval                             time.Duration
+	WriterControlToken                        string
+	patchGate                                 *patchWriterGate
 	DeliveryScopes                            map[string]DeliveryScope
 	AnnotationProfiles                        map[string]struct{}
 	annotationProfileEnabled                  bool
@@ -104,6 +107,13 @@ func ConfigFromEnv() (Config, error) {
 		return Config{}, fmt.Errorf("%s must be a boolean: %w", envFeedbackEnabled, err)
 	}
 	config = config.withReceiptDefaults()
+	config.WriterControlToken = strings.TrimSpace(os.Getenv("JEV_EXECUTOR_WRITER_CONTROL_TOKEN"))
+	if raw := strings.TrimSpace(os.Getenv("JEV_EXECUTOR_PATCH_INTERVAL")); raw != "" {
+		config.PatchInterval, err = time.ParseDuration(raw)
+		if err != nil || config.PatchInterval < 100*time.Millisecond || config.PatchInterval > time.Minute {
+			return Config{}, fmt.Errorf("JEV_EXECUTOR_PATCH_INTERVAL must be between 100ms and one minute")
+		}
+	}
 	if config.ReceiptMaxAttempts, err = positiveIntFromEnv(envReceiptMaxAttempts, config.ReceiptMaxAttempts); err != nil {
 		return Config{}, err
 	}
@@ -135,6 +145,24 @@ func ConfigFromEnv() (Config, error) {
 }
 
 func (c Config) validate() error {
+	if c.WriterControlToken != "" && len(c.WriterControlToken) < 32 {
+		return fmt.Errorf("executor writer control credential requires at least 32 bytes")
+	}
+	if c.WriterControlToken != "" {
+		business := []string{c.Token, c.AnnotationToken, c.FeedbackToken}
+		for _, name := range []string{"JEV_EXECUTOR_TOKEN", "JEV_CALLBACK_RELAY_TOKEN", "NM_TEST_INTAKE_TOKEN", "NM_FORMAL_INTAKE_TOKEN", "NM_PROFILE_CONTROL_TOKEN"} {
+			business = append(business, os.Getenv(name))
+		}
+		for _, scope := range c.DeliveryScopes {
+			business = append(business, scope.receiptToken, scope.annotationToken, scope.feedbackToken,
+				os.Getenv(scope.ReceiptTokenEnv), os.Getenv(scope.AnnotationTokenEnv), os.Getenv(scope.FeedbackTokenEnv))
+		}
+		for _, token := range business {
+			if token != "" && token == c.WriterControlToken {
+				return fmt.Errorf("executor writer control requires an independent credential")
+			}
+		}
+	}
 	if len(c.AnnotationProfiles) > 0 && c.expectedProfileID == "" {
 		for key := range c.AnnotationProfiles {
 			if _, ok := c.DeliveryScopes[key]; !ok {
