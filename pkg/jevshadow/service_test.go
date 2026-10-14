@@ -212,7 +212,7 @@ func TestDisabledConfigIsBackwardCompatible(t *testing.T) {
 	}
 }
 
-func TestRenderCompactClassificationWithFeedbackButtons(t *testing.T) {
+func TestRenderCompactClassificationWithoutCardFeedbackButtons(t *testing.T) {
 	actionReference := "signed-action-reference"
 	detailURL := "https://aiops.example.com/apps/alert-center/traces/J-1"
 	card, err := renderCard(
@@ -243,8 +243,8 @@ func TestRenderCompactClassificationWithFeedbackButtons(t *testing.T) {
 		t.Fatal(err)
 	}
 	elements := card["elements"].([]interface{})
-	if len(elements) != 4 {
-		t.Fatalf("expected divider, summary, feedback and detail actions, got %#v", elements)
+	if len(elements) != 3 {
+		t.Fatalf("expected divider, summary and detail action, got %#v", elements)
 	}
 	summary := elements[1].(map[string]interface{})["text"].(map[string]interface{})["content"].(string)
 	for _, expected := range []string{
@@ -256,15 +256,11 @@ func TestRenderCompactClassificationWithFeedbackButtons(t *testing.T) {
 			t.Fatalf("missing %q in compact summary: %s", expected, summary)
 		}
 	}
-	actions := elements[2].(map[string]interface{})["actions"].([]interface{})
-	if len(actions) != 2 {
-		t.Fatalf("expected two feedback buttons, got %#v", actions)
+	serialized, err := json.Marshal(card)
+	if err != nil || strings.Contains(string(serialized), "jev_feedback") || strings.Contains(string(serialized), actionReference) {
+		t.Fatalf("legacy action reference rendered a card accuracy control: %s (%v)", serialized, err)
 	}
-	value := actions[0].(map[string]interface{})["value"].(map[string]interface{})
-	if value["action"] != "jev_feedback" || value["correct_label"] != "accurate" {
-		t.Fatalf("unexpected feedback value: %#v", value)
-	}
-	detail := elements[3].(map[string]interface{})["actions"].([]interface{})[0].(map[string]interface{})
+	detail := elements[2].(map[string]interface{})["actions"].([]interface{})[0].(map[string]interface{})
 	if detail["url"] != detailURL {
 		t.Fatalf("unexpected detail URL: %#v", detail)
 	}
@@ -291,7 +287,7 @@ func TestRenderV2PoolClassificationExactlyAtCardBottom(t *testing.T) {
 		t.Fatalf("original header changed: %#v", card)
 	}
 	elements := card["elements"].([]interface{})
-	if len(elements) != 5 || elements[0].(map[string]interface{})["name"] != "original actions" {
+	if len(elements) != 4 || elements[0].(map[string]interface{})["name"] != "original actions" {
 		t.Fatalf("v2 annotation did not append after the original elements: %#v", elements)
 	}
 	summary := elements[2].(map[string]interface{})["text"].(map[string]interface{})["content"].(string)
@@ -302,11 +298,11 @@ func TestRenderV2PoolClassificationExactlyAtCardBottom(t *testing.T) {
 	if summary != want {
 		t.Fatalf("unexpected v2 pool summary:\n%s\nwant:\n%s", summary, want)
 	}
-	actions := elements[3].(map[string]interface{})["actions"].([]interface{})
-	if got := actions[0].(map[string]interface{})["value"].(map[string]interface{})["action_reference"]; got != *component.ActionReference {
-		t.Fatalf("feedback reference changed: %#v", got)
+	serialized, err := json.Marshal(card)
+	if err != nil || strings.Contains(string(serialized), "jev_feedback") || strings.Contains(string(serialized), *component.ActionReference) {
+		t.Fatalf("v2 card rendered an accuracy control: %s (%v)", serialized, err)
 	}
-	detail := elements[4].(map[string]interface{})["actions"].([]interface{})[0].(map[string]interface{})
+	detail := elements[3].(map[string]interface{})["actions"].([]interface{})[0].(map[string]interface{})
 	if detail["url"] != *component.TraceURL {
 		t.Fatalf("unexpected trace URL: %#v", detail)
 	}
@@ -679,7 +675,7 @@ func TestV2UpdateStablyReplacesSameMemberComponent(t *testing.T) {
 		t.Fatalf("expected two revisions to patch twice, got %d", len(patchedCards))
 	}
 	elements := patchedCards[1]["elements"].([]interface{})
-	if len(elements) != 5 {
+	if len(elements) != 4 {
 		t.Fatalf("same member set appended a second component: %#v", elements)
 	}
 	summary := elements[2].(map[string]interface{})["text"].(map[string]interface{})["content"].(string)
@@ -782,8 +778,11 @@ func TestRenderV2GroupAttributesDifferentJudgmentsToRedactedMembers(t *testing.T
 		t.Fatal(err)
 	}
 	elements := card["elements"].([]interface{})
+	if len(elements) != 6 {
+		t.Fatalf("expected two judgment summaries with detail links, got %d elements", len(elements))
+	}
 	poolSummary := elements[1].(map[string]interface{})["text"].(map[string]interface{})["content"].(string)
-	oncallSummary := elements[5].(map[string]interface{})["text"].(map[string]interface{})["content"].(string)
+	oncallSummary := elements[4].(map[string]interface{})["text"].(map[string]interface{})["content"].(string)
 	if !strings.Contains(poolSummary, "Member: m-5f3c41c5eb85") ||
 		!strings.Contains(poolSummary, "**Pool 92%**") {
 		t.Fatalf("pool judgment lost its member attribution: %s", poolSummary)

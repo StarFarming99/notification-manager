@@ -670,9 +670,6 @@ func renderCard(base map[string]interface{}, annotations map[string]AnnotationCo
 				},
 			},
 		)
-		if component.ActionReference != nil && *component.ActionReference != "" {
-			elements = append(elements, component.feedbackActions())
-		}
 		if detailURL := component.detailURL(); detailURL != nil && *detailURL != "" {
 			elements = append(elements, component.detailAction())
 		}
@@ -1337,33 +1334,6 @@ func (c AnnotationComponent) detailURL() *string {
 		return c.TraceURL
 	}
 	return c.DetailURL
-}
-
-func (c AnnotationComponent) feedbackActions() map[string]interface{} {
-	button := func(text, label, buttonType string) map[string]interface{} {
-		return map[string]interface{}{
-			"tag":  "button",
-			"type": buttonType,
-			"text": map[string]interface{}{
-				"tag":     "plain_text",
-				"content": text,
-			},
-			"value": map[string]interface{}{
-				"action":           "jev_feedback",
-				"dimension":        "overall",
-				"correct_label":    label,
-				"action_reference": *c.ActionReference,
-			},
-		}
-	}
-	return map[string]interface{}{
-		"tag":    "action",
-		"layout": "bisected",
-		"actions": []interface{}{
-			button("✅ 准确", "accurate", "primary"),
-			button("❌ 不准确", "inaccurate", "default"),
-		},
-	}
 }
 
 func (c AnnotationComponent) detailAction() map[string]interface{} {
