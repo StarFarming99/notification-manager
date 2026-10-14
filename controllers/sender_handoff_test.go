@@ -14,8 +14,10 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -50,8 +52,12 @@ func handoffFixture(t *testing.T, phase string) (*NotificationManagerReconciler,
 	}
 	oldRS := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "old-rs", Namespace: "monitoring", UID: "old-rs-uid", OwnerReferences: owner("Deployment", old.Name, old.UID)}}
 	newRS := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "new-rs", Namespace: "monitoring", UID: "new-rs-uid", OwnerReferences: owner("Deployment", d.Name, d.UID)}}
-	oldPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "old-pod", Namespace: "monitoring", UID: "old-pod-uid", Labels: oldLabels, OwnerReferences: owner("ReplicaSet", oldRS.Name, oldRS.UID)}, Spec: corev1.PodSpec{NodeName: "node1", Containers: old.Spec.Template.Spec.Containers}, Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.11", Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}, ContainerStatuses: []corev1.ContainerStatus{{Name: "notification-manager", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}}}}}}
+	oldPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "old-pod", Namespace: "monitoring", UID: "old-pod-uid", Labels: oldLabels, OwnerReferences: owner("ReplicaSet", oldRS.Name, oldRS.UID)}, Spec: corev1.PodSpec{NodeName: "node1", Containers: old.Spec.Template.Spec.Containers}, Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.11", Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}, ContainerStatuses: []corev1.ContainerStatus{{Name: "notification-manager", ContainerID: "containerd://local-fixture-notification-manager", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}}}}}}
 	newPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "new-pod", Namespace: "monitoring", UID: "new-pod-uid", Labels: h.Selector, OwnerReferences: owner("ReplicaSet", newRS.Name, newRS.UID)}, Spec: corev1.PodSpec{NodeName: "node1", Containers: d.Spec.Template.Spec.Containers}, Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.12", Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}}
+	for _, c := range newPod.Spec.Containers {
+		newPod.Status.ContainerStatuses = append(newPod.Status.ContainerStatuses, corev1.ContainerStatus{Name: c.Name, ContainerID: "containerd://local-fixture-" + c.Name, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}}})
+	}
+
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1", UID: "node-uid"}, Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}}}
 	holder := "node1"
 	renew := metav1.NewMicroTime(time.Now())
@@ -218,7 +224,17 @@ func TestManagedNormalExitRejectsUnknownNodeForcedAndMissingPod(t *testing.T) {
 				n.UID = "replacement-node"
 				_ = r.Update(ctx, &n)
 			case "forced":
-				normalTerminate(t, r, "old-pod", 0)
+				var p corev1.Pod
+				_ = r.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: "old-pod"}, &p)
+				zero := int64(0)
+				p.DeletionGracePeriodSeconds = &zero
+				_ = r.Update(ctx, &p)
+				var live v2beta2.NotificationManager
+				_ = r.Get(ctx, client.ObjectKey{Name: "notification-manager"}, &live)
+				state, _ := handoffState(&live)
+				state.OldPods[0].NormalDeleteRequestedAt = nil
+				state.OldPods[0].NormalDeleteResult = ""
+				_ = r.saveState(ctx, &live, state)
 			case "missing":
 				var p corev1.Pod
 				_ = r.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: "old-pod"}, &p)
@@ -580,6 +596,8 @@ func TestManagedRollbackWaitsForSealedExecutorAndKeepsItsFence(t *testing.T) {
 	d := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: h.ExecutorDeployment, Namespace: r.Namespace, UID: types.UID(h.ExecutorDeploymentUID)}, Spec: appsv1.DeploymentSpec{Replicas: &one, Selector: &metav1.LabelSelector{MatchLabels: labels}, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "executor", Image: "fixture"}}}}}}
 	rs := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "executor-rs", Namespace: r.Namespace, UID: "executor-rs-uid", OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: d.Name, UID: d.UID, Controller: &controller}}}}
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "executor-pod", Namespace: r.Namespace, UID: "executor-pod-uid", Labels: labels, OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rs.Name, UID: rs.UID, Controller: &controller}}}, Spec: corev1.PodSpec{NodeName: "node1", Containers: d.Spec.Template.Spec.Containers}}
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "executor", ContainerID: "containerd://local-fixture-executor", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}}}}
+
 	for _, obj := range []client.Object{d, rs, pod} {
 		if err := r.Create(ctx, obj); err != nil {
 			t.Fatal(err)
@@ -637,4 +655,121 @@ func TestManagedRollbackWaitsForSealedExecutorAndKeepsItsFence(t *testing.T) {
 	if *getDep(t, r, h.ExecutorDeployment).Spec.Replicas != 0 {
 		t.Fatal("executor automatically restarted with candidate test")
 	}
+}
+
+func TestManagedKubeletTerminalZeroGraceUsesSealedPlanAndRuntimeWitness(t *testing.T) {
+	r, _, h := handoffFixture(t, "stopped")
+	if err := reconcileHandoffTest(r); err != nil {
+		t.Fatal(err)
+	}
+	before := stateOf(t, r)
+	e := before.OldPods[0]
+	if e.ManagedNormalStopIntentAt == nil || e.ConfiguredGraceSeconds <= 0 || e.NormalDeleteResult != "acknowledged" {
+		t.Fatal("normal intent was not durable before stop")
+	}
+	normalTerminate(t, r, "old-pod", 0)
+	for i := 0; i < 3; i++ {
+		if err := reconcileHandoffTest(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setPhase(t, r, &h, "retired")
+	if err := reconcileHandoffTest(r); err != nil {
+		t.Fatal(err)
+	}
+	e = stateOf(t, r).OldPods[0]
+	if e.TerminatedAt == nil || e.ObservedGraceSeconds == nil || *e.ObservedGraceSeconds != 0 || e.NormalGraceSeconds != 30 || e.ContainerExits[0].ContainerID != e.ContainerIDs["notification-manager"] {
+		t.Fatal("zero-grace kubelet completion lacks independent runtime proof")
+	}
+	assertSelector(t, r, "nm-delivery-instance")
+}
+
+type deleteRecoveryClient struct {
+	client.Client
+	kind  string
+	calls int
+	first bool
+}
+
+func (c *deleteRecoveryClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	c.calls++
+	options := client.DeleteOptions{}
+	options.ApplyOptions(opts)
+	if options.GracePeriodSeconds == nil || *options.GracePeriodSeconds <= 0 || options.Preconditions == nil || options.Preconditions.UID == nil || options.Preconditions.ResourceVersion == nil {
+		return errors.New("missing positive grace/UID/RV delete preconditions")
+	}
+	if !c.first {
+		c.first = true
+		if c.kind == "conflict" {
+			return apierrors.NewConflict(schema.GroupResource{Resource: "pods"}, obj.GetName(), errors.New("synthetic concurrent RV change"))
+		}
+	}
+	if err := c.Client.Delete(ctx, obj, opts...); err != nil {
+		return err
+	}
+	if c.kind == "response-loss" && c.calls == 1 {
+		return errors.New("synthetic Delete response lost after API accepted")
+	}
+	return nil
+}
+func TestManagedNormalDeleteConflictAndResponseLossRestartRecovery(t *testing.T) {
+	for _, kind := range []string{"conflict", "response-loss"} {
+		t.Run(kind, func(t *testing.T) {
+			r, _, _ := handoffFixture(t, "stopped")
+			wrapped := &deleteRecoveryClient{Client: r.Client, kind: kind}
+			r.Client = wrapped
+			err := reconcileHandoffTest(r)
+			if kind == "conflict" && err == nil {
+				t.Fatal("conflict path untested")
+			}
+			if kind == "response-loss" && err != nil {
+				t.Fatal(err)
+			}
+			oldRequest := stateOf(t, r).OldStopRequestedAt.DeepCopy()
+			r = &NotificationManagerReconciler{Client: r.Client, Namespace: r.Namespace, Scheme: r.Scheme, Log: logr.Discard(), FormalReadyProbe: r.FormalReadyProbe}
+			if kind == "conflict" {
+				if err := reconcileHandoffTest(r); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var pod corev1.Pod
+			_ = r.Get(context.Background(), client.ObjectKey{Namespace: r.Namespace, Name: "old-pod"}, &pod)
+			zero := int64(0)
+			pod.DeletionGracePeriodSeconds = &zero
+			_ = r.Update(context.Background(), &pod)
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "notification-manager", ContainerID: "containerd://local-fixture-notification-manager", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, FinishedAt: metav1.Now()}}}}
+			_ = r.Status().Update(context.Background(), &pod)
+			for i := 0; i < 3; i++ {
+				if err := reconcileHandoffTest(r); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s := stateOf(t, r)
+			if s.OldExitVerifiedAt == nil || !s.OldStopRequestedAt.Equal(oldRequest) {
+				t.Fatal("restart forgot verified exit or reset gap clock")
+			}
+			if kind == "response-loss" && (wrapped.calls != 1 || s.OldPods[0].NormalDeleteResult != "response-unknown") {
+				t.Fatal("ambiguous Delete blindly resent or mislabeled ACK")
+			}
+		})
+	}
+}
+func TestManagedRuntimeContainerReplacementCannotBecomeExitProof(t *testing.T) {
+	r, _, h := handoffFixture(t, "stopped")
+	if err := reconcileHandoffTest(r); err != nil {
+		t.Fatal(err)
+	}
+	normalTerminate(t, r, "old-pod", 0)
+	var p corev1.Pod
+	_ = r.Get(context.Background(), client.ObjectKey{Namespace: r.Namespace, Name: "old-pod"}, &p)
+	p.Status.ContainerStatuses[0].ContainerID = "containerd://unsealed-replacement"
+	_ = r.Status().Update(context.Background(), &p)
+	setPhase(t, r, &h, "retired")
+	if err := reconcileHandoffTest(r); err == nil {
+		t.Fatal("replacement container was treated as sealed process")
+	}
+	if stateOf(t, r).ProcessUncertainty == "" {
+		t.Fatal("container replacement uncertainty not durable")
+	}
+	assertSelector(t, r, "notification-manager")
 }

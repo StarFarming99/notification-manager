@@ -16,6 +16,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -30,15 +31,23 @@ type SenderContainerExit struct {
 	FinishedAt  metav1.Time `json:"finished_at"`
 }
 type SenderPodEvidence struct {
-	Name                string                `json:"name"`
-	UID                 string                `json:"uid"`
-	NodeName            string                `json:"node_name,omitempty"`
-	NodeUID             string                `json:"node_uid,omitempty"`
-	TerminatedAt        *metav1.Time          `json:"terminated_at,omitempty"`
-	NodeReadyVerifiedAt *metav1.Time          `json:"node_ready_verified_at,omitempty"`
-	NodeLeaseRenewedAt  *metav1.MicroTime     `json:"node_lease_renewed_at,omitempty"`
-	NormalGraceSeconds  int64                 `json:"normal_grace_seconds,omitempty"`
-	ContainerExits      []SenderContainerExit `json:"container_exits,omitempty"`
+	Name                        string                `json:"name"`
+	UID                         string                `json:"uid"`
+	NodeName                    string                `json:"node_name,omitempty"`
+	NodeUID                     string                `json:"node_uid,omitempty"`
+	TerminatedAt                *metav1.Time          `json:"terminated_at,omitempty"`
+	NodeReadyVerifiedAt         *metav1.Time          `json:"node_ready_verified_at,omitempty"`
+	NodeLeaseRenewedAt          *metav1.MicroTime     `json:"node_lease_renewed_at,omitempty"`
+	NormalGraceSeconds          int64                 `json:"normal_grace_seconds,omitempty"`
+	ContainerExits              []SenderContainerExit `json:"container_exits,omitempty"`
+	ContainerIDs                map[string]string     `json:"container_ids"`
+	NormalDeleteRequestedAt     *metav1.Time          `json:"normal_delete_requested_at,omitempty"`
+	NormalDeleteGraceSeconds    int64                 `json:"normal_delete_grace_seconds,omitempty"`
+	NormalDeleteResourceVersion string                `json:"normal_delete_resource_version,omitempty"`
+	NormalDeleteResult          string                `json:"normal_delete_result,omitempty"`
+	ObservedGraceSeconds        *int64                `json:"observed_grace_seconds,omitempty"`
+	ManagedNormalStopIntentAt   *metav1.Time          `json:"managed_normal_stop_intent_at,omitempty"`
+	ConfiguredGraceSeconds      int64                 `json:"configured_grace_seconds,omitempty"`
 }
 type SenderHandoffState struct {
 	OperationID              string              `json:"operation_id"`
@@ -188,7 +197,17 @@ func (r *NotificationManagerReconciler) capturePods(ctx context.Context, d *apps
 		if err := r.nodeReachable(ctx, node.Name, string(node.UID)); err != nil {
 			return nil, err
 		}
-		result = append(result, SenderPodEvidence{Name: p.Name, UID: string(p.UID), NodeName: node.Name, NodeUID: string(node.UID)})
+		ids := map[string]string{}
+		for _, c := range p.Status.ContainerStatuses {
+			if c.ContainerID == "" {
+				return nil, errors.New("sender runtime container identity missing before stop")
+			}
+			ids[c.Name] = c.ContainerID
+		}
+		if len(ids) != len(p.Spec.Containers) {
+			return nil, errors.New("sender containers not fully observable before stop")
+		}
+		result = append(result, SenderPodEvidence{Name: p.Name, UID: string(p.UID), NodeName: node.Name, NodeUID: string(node.UID), ContainerIDs: ids})
 	}
 	if len(result) == 0 && d.Spec.Replicas != nil && *d.Spec.Replicas > 0 {
 		return nil, errors.New("sender has desired replicas but no verifiable Pods")
@@ -300,9 +319,18 @@ func (r *NotificationManagerReconciler) stopVerified(ctx context.Context, nm *v2
 		if p.DeletionTimestamp == nil {
 			return false, nil
 		}
-		if p.DeletionGracePeriodSeconds == nil || *p.DeletionGracePeriodSeconds <= 0 {
-			return false, errors.New("force deletion is not process termination evidence")
+		if e.ManagedNormalStopIntentAt == nil || e.ConfiguredGraceSeconds <= 0 || e.NormalDeleteRequestedAt == nil || e.NormalDeleteGraceSeconds <= 0 || (e.NormalDeleteResult != "acknowledged" && e.NormalDeleteResult != "response-unknown") {
+			return false, errors.New("sender lacks a persisted UID-fenced positive-grace normal Delete request")
 		}
+		// Kubelet may shorten the API deletion grace to zero after every process has
+		// ended. That mutable field is neither normal-exit proof nor force-exit proof.
+		// Only the sealed delete intent, matching container identities and fresh node
+		// witness may release this finalizer.
+		observed := int64(-1)
+		if p.DeletionGracePeriodSeconds != nil {
+			observed = *p.DeletionGracePeriodSeconds
+		}
+		e.ObservedGraceSeconds = &observed
 		if len(p.Status.ContainerStatuses) != len(p.Spec.Containers) {
 			return false, nil
 		}
@@ -320,6 +348,13 @@ func (r *NotificationManagerReconciler) stopVerified(ctx context.Context, nm *v2
 			}
 			if requested == nil || c.State.Terminated.FinishedAt.Time.Before(requested.Time.Add(-time.Second)) {
 				return false, errors.New("container termination predates guarded stop intent")
+			}
+			if e.ContainerIDs[c.Name] != c.ContainerID {
+				s.ProcessUncertainty = "runtime container identity changed after sealed stop intent"
+				if err := r.saveState(ctx, nm, s); err != nil {
+					return false, err
+				}
+				return false, errors.New(s.ProcessUncertainty)
 			}
 			terminated[c.Name] = true
 		}
@@ -340,7 +375,7 @@ func (r *NotificationManagerReconciler) stopVerified(ctx context.Context, nm *v2
 			}
 			renew := *lease.Spec.RenewTime
 			e.NodeLeaseRenewedAt = &renew
-			e.NormalGraceSeconds = *p.DeletionGracePeriodSeconds
+			e.NormalGraceSeconds = e.NormalDeleteGraceSeconds
 			e.ContainerExits = []SenderContainerExit{}
 			for _, c := range p.Status.ContainerStatuses {
 				ended := c.State.Terminated
@@ -524,7 +559,13 @@ func (r *NotificationManagerReconciler) reconcileHandoff(ctx context.Context, nm
 				return again, err
 			}
 		}
+		if err := r.sealManagedNormalStop(ctx, nm, s, s.OldPods); err != nil {
+			return fail(err)
+		}
 		if err := r.holdReplicas(ctx, &original, 0, ""); err != nil {
+			return fail(err)
+		}
+		if err := r.requestNormalDeletes(ctx, nm, s, s.OldPods); err != nil {
 			return fail(err)
 		}
 		if s.OldExitVerifiedAt == nil {
@@ -629,6 +670,9 @@ func (r *NotificationManagerReconciler) reconcileHandoff(ctx context.Context, nm
 				return again, err
 			}
 		}
+		if err := r.sealManagedNormalStop(ctx, nm, s, s.CandidatePods); err != nil {
+			return fail(err)
+		}
 		if executor != nil {
 			if s.ExecutorStopRequestedAt == nil {
 				if err := r.finalizeBeforeStop(ctx, s.ExecutorPods); err != nil {
@@ -640,12 +684,21 @@ func (r *NotificationManagerReconciler) reconcileHandoff(ctx context.Context, nm
 					return again, err
 				}
 			}
+			if err := r.sealManagedNormalStop(ctx, nm, s, s.ExecutorPods); err != nil {
+				return fail(err)
+			}
 			if err := r.holdExecutor(ctx, executor, 0, s.OperationID); err != nil {
+				return fail(err)
+			}
+			if err := r.requestNormalDeletes(ctx, nm, s, s.ExecutorPods); err != nil {
 				return fail(err)
 			}
 			if s.ExecutorExitVerifiedAt == nil {
 				// Candidate is held stopped while writer termination is being verified.
 				if err := r.holdReplicas(ctx, candidate, 0, s.OperationID); err != nil {
+					return fail(err)
+				}
+				if err := r.requestNormalDeletes(ctx, nm, s, s.CandidatePods); err != nil {
 					return fail(err)
 				}
 				if err := r.holdReplicas(ctx, &original, 0, ""); err != nil {
@@ -692,6 +745,9 @@ func (r *NotificationManagerReconciler) reconcileHandoff(ctx context.Context, nm
 			return again, r.saveState(ctx, nm, s)
 		}
 		if err := r.holdReplicas(ctx, candidate, 0, s.OperationID); err != nil {
+			return fail(err)
+		}
+		if err := r.requestNormalDeletes(ctx, nm, s, s.CandidatePods); err != nil {
 			return fail(err)
 		}
 		if s.CandidateExitVerifiedAt == nil {
@@ -880,4 +936,103 @@ func (r *NotificationManagerReconciler) holdExecutor(ctx context.Context, d *app
 		return nil
 	}
 	return r.Update(ctx, d)
+}
+
+// Preserve the normal positive-grace deletion protocol before sending a UID/RV
+// preconditioned Delete. Scale0 comes first so ReplicaSets cannot replace it.
+func (r *NotificationManagerReconciler) requestNormalDeletes(ctx context.Context, nm *v2beta2.NotificationManager, s *SenderHandoffState, evidence []SenderPodEvidence) error {
+	for i := range evidence {
+		e := &evidence[i]
+		if e.NormalDeleteResult == "acknowledged" || e.NormalDeleteResult == "response-unknown" {
+			continue
+		}
+		var p corev1.Pod
+		if err := r.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: e.Name}, &p); err != nil {
+			if e.TerminatedAt != nil && client.IgnoreNotFound(err) == nil {
+				continue
+			}
+			return err
+		}
+		if string(p.UID) != e.UID {
+			return errors.New("sender UID changed before normal Delete")
+		}
+		if p.DeletionTimestamp != nil && e.NormalDeleteRequestedAt == nil && (p.DeletionGracePeriodSeconds == nil || *p.DeletionGracePeriodSeconds <= 0) {
+			// A normally scaled-down Pod may already be terminal before the follow-up
+			// request. Still require sealed runtime identity and real kubelet exit;
+			// an API-zero-grace object containing a live process cannot bootstrap proof.
+			ended := len(p.Status.ContainerStatuses) == len(p.Spec.Containers)
+			for _, c := range p.Status.ContainerStatuses {
+				if c.State.Terminated == nil || c.ContainerID == "" || e.ContainerIDs[c.Name] != c.ContainerID {
+					ended = false
+				}
+			}
+			if !ended {
+				return errors.New("zero-grace sender still has an unproven live process")
+			}
+		}
+		grace := e.ConfiguredGraceSeconds
+		if e.ManagedNormalStopIntentAt == nil {
+			return errors.New("normal stop intent was not sealed before replicas were stopped")
+		}
+		if grace <= 0 {
+			return errors.New("managed stop requires positive configured Pod termination grace")
+		}
+		now := metav1.Now()
+		e.NormalDeleteRequestedAt = &now
+		e.NormalDeleteGraceSeconds = grace
+		e.NormalDeleteResourceVersion = p.ResourceVersion
+		e.NormalDeleteResult = "pending"
+		if err := r.saveState(ctx, nm, s); err != nil {
+			return err
+		}
+		uid := p.UID
+		rv := p.ResourceVersion
+		err := r.Delete(ctx, &p, &client.DeleteOptions{GracePeriodSeconds: &grace, Preconditions: &metav1.Preconditions{UID: &uid, ResourceVersion: &rv}})
+		if err == nil {
+			e.NormalDeleteResult = "acknowledged"
+		} else if apierrors.IsConflict(err) || apierrors.IsForbidden(err) || apierrors.IsInvalid(err) {
+			e.NormalDeleteResult = "rejected"
+		} else {
+			e.NormalDeleteResult = "response-unknown"
+		}
+		if saveErr := r.saveState(ctx, nm, s); saveErr != nil {
+			return saveErr
+		}
+		if err != nil && e.NormalDeleteResult != "response-unknown" {
+			return err
+		}
+	}
+	return nil
+}
+
+// This is the pre-stop plan, not a claim about when the later API Delete RPC
+// completed. ReplicaSet/kubelet deletion may finish before that RPC executes.
+func (r *NotificationManagerReconciler) sealManagedNormalStop(ctx context.Context, nm *v2beta2.NotificationManager, s *SenderHandoffState, evidence []SenderPodEvidence) error {
+	for i := range evidence {
+		e := &evidence[i]
+		if e.ManagedNormalStopIntentAt != nil {
+			continue
+		}
+		var p corev1.Pod
+		if err := r.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: e.Name}, &p); err != nil {
+			return err
+		}
+		if string(p.UID) != e.UID || p.DeletionTimestamp != nil {
+			return errors.New("cannot seal a normal stop plan for a changed/already-deleting sender")
+		}
+		grace := int64(30)
+		if p.Spec.TerminationGracePeriodSeconds != nil {
+			grace = *p.Spec.TerminationGracePeriodSeconds
+		}
+		if grace <= 0 {
+			return errors.New("sender has no positive configured normal termination grace")
+		}
+		now := metav1.Now()
+		e.ManagedNormalStopIntentAt = &now
+		e.ConfiguredGraceSeconds = grace
+		if err := r.saveState(ctx, nm, s); err != nil {
+			return err
+		}
+	}
+	return nil
 }
