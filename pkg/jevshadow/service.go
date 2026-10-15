@@ -90,6 +90,7 @@ type cardBinding struct {
 	baseSendState      string
 	annotationRevision int
 	annotations        map[string]AnnotationComponent
+	memberScope        *cardMemberScope
 	appliedKeys        map[string]appliedRequest
 	patchSendState     string
 	pendingPatch       *cardPatchIntent
@@ -292,11 +293,18 @@ func (s *Service) captureDurable(data *template.Data, receiver, destination, mes
 		return err
 	}
 	s.registerCardPatcher(receiver, destination, patcher)
-	if err := s.captureCardBinding(receiver, destination, messageID, cardCopy, patcher); err != nil {
-		return err
-	}
 	receipt, err := s.buildReceipt(data, receiver, destination, messageID, cardHash)
 	if err != nil {
+		return err
+	}
+	scope, err := s.cardScopeFromReceipt(data, receipt)
+	if err != nil {
+		return err
+	}
+	if scope != nil {
+		scope.Receiver = receiver
+	}
+	if err := s.captureCardBindingWithScope(receiver, destination, messageID, cardCopy, patcher, scope); err != nil {
 		return err
 	}
 	if s.outbox == nil {
@@ -475,7 +483,7 @@ func (s *Service) applyInMemoryAnnotation(ctx context.Context, messageID, idempo
 		annotations[key] = value
 	}
 	annotations[componentKey] = component
-	rendered, err := renderCard(binding.baseCard, annotations)
+	rendered, err := renderCardSummary(newCardRenderSnapshot(binding.baseCard, annotations, binding.memberScope, binding.senderApp, binding.messageID))
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrInvalidPayload, err)
 	}
@@ -646,7 +654,7 @@ func writeJSON(w http.ResponseWriter, status int, value interface{}) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-func renderCard(base map[string]interface{}, annotations map[string]AnnotationComponent) (map[string]interface{}, error) {
+func renderCardLegacy(base map[string]interface{}, annotations map[string]AnnotationComponent) (map[string]interface{}, error) {
 	card, err := cloneMap(base)
 	if err != nil {
 		return nil, err

@@ -173,7 +173,7 @@ func TestCardWriterRecoversInterruptedSendingAsUnknown(t *testing.T) {
 	}
 	componentKey := stableComponentKey(component.MemberEventIDs)
 	annotations := map[string]AnnotationComponent{componentKey: component}
-	rendered, err := renderCard(state.BaseCard, annotations)
+	rendered, err := renderCardLegacy(state.BaseCard, annotations)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -19,7 +19,8 @@ import (
 )
 
 const (
-	cardStateVersion       = 1
+	cardStateVersion       = 2
+	legacyCardStateVersion = 1
 	maxCardStateFileSize   = 32 * 1024 * 1024
 	baseSendConfirmed      = "confirmed"
 	patchSendNone          = "none"
@@ -42,6 +43,8 @@ type persistedAppliedRequest struct {
 }
 
 type cardPatchIntent struct {
+	RendererVersion    string                 `json:"renderer_version,omitempty"`
+	RenderSnapshot     *cardRenderSnapshot    `json:"render_snapshot,omitempty"`
 	IdempotencyKey     string                 `json:"idempotency_key"`
 	PayloadHash        string                 `json:"payload_hash"`
 	RequestID          string                 `json:"request_id"`
@@ -54,6 +57,7 @@ type cardPatchIntent struct {
 }
 
 type cardPersistentState struct {
+	MemberScope        *cardMemberScope                   `json:"member_scope,omitempty"`
 	Version            int                                `json:"version"`
 	MessageID          string                             `json:"message_id"`
 	Receiver           string                             `json:"receiver"`
@@ -252,7 +256,7 @@ func readCardStateFile(path string) (cardPersistentState, error) {
 }
 
 func validateCardPersistentState(state cardPersistentState) error {
-	if state.Version != cardStateVersion || strings.TrimSpace(state.MessageID) == "" {
+	if (state.Version != cardStateVersion && state.Version != legacyCardStateVersion) || strings.TrimSpace(state.MessageID) == "" {
 		return errors.New("invalid card state identity")
 	}
 	if state.Receiver == "" || state.Destination == "" || state.SenderApp == "" {
@@ -266,6 +270,11 @@ func validateCardPersistentState(state cardPersistentState) error {
 	}
 	if _, ok := state.BaseCard["elements"].([]interface{}); !ok {
 		return errors.New("persisted base card has no elements array")
+	}
+	if state.MemberScope != nil {
+		if err := validateCardScope(state.MemberScope, state); err != nil {
+			return err
+		}
 	}
 	if state.Annotations == nil || state.AppliedKeys == nil {
 		return errors.New("persisted card state maps are missing")
@@ -337,7 +346,27 @@ func validateCardPersistentState(state cardPersistentState) error {
 			annotations[key] = component
 		}
 		annotations[pending.ComponentKey] = pending.Component
-		expectedCard, err := renderCard(state.BaseCard, annotations)
+		var expectedCard map[string]interface{}
+		switch pending.RendererVersion {
+		case "", rendererLegacyMember:
+			if pending.RenderSnapshot != nil {
+				return errors.New("legacy patch must not have summary inputs")
+			}
+			expectedCard, err = renderCardLegacy(state.BaseCard, annotations)
+		case rendererCardSummary:
+			if pending.RenderSnapshot == nil {
+				return errors.New("summary patch is missing immutable inputs")
+			}
+			wantSnapshot := newCardRenderSnapshot(state.BaseCard, annotations, state.MemberScope, state.SenderApp, state.MessageID)
+			wantHash, hashErr := hashCanonical(wantSnapshot)
+			actualHash, actualErr := hashCanonical(pending.RenderSnapshot)
+			if hashErr != nil || actualErr != nil || wantHash != actualHash {
+				return errors.New("summary inputs do not match persisted revision")
+			}
+			expectedCard, err = renderCardSummary(*pending.RenderSnapshot)
+		default:
+			return errors.New("unsupported card renderer version")
+		}
 		if err != nil {
 			return errors.New("pending rendered card cannot be rebuilt")
 		}

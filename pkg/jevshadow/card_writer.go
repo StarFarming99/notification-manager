@@ -101,8 +101,13 @@ func (s *Service) captureCardBinding(
 	baseCard map[string]interface{},
 	patcher CardPatcher,
 ) error {
+	return s.captureCardBindingWithScope(receiver, destination, messageID, baseCard, patcher, nil)
+}
+
+func (s *Service) captureCardBindingWithScope(receiver, destination, messageID string, baseCard map[string]interface{}, patcher CardPatcher, scope *cardMemberScope) error {
 	now := time.Now().UTC()
 	state := cardPersistentState{
+		MemberScope:        scope,
 		Version:            cardStateVersion,
 		MessageID:          messageID,
 		Receiver:           receiver,
@@ -128,6 +133,15 @@ func (s *Service) captureCardBinding(
 					existing.Receiver != receiver || existing.Destination != destination {
 					return ErrRevision
 				}
+				if scope != nil && existing.MemberScope != nil {
+					oldScopeHash, _ := hashCanonical(existing.MemberScope)
+					newScopeHash, _ := hashCanonical(scope)
+					if oldScopeHash != newScopeHash {
+						return ErrRevision
+					}
+				}
+				// Legacy bindings remain scope-unknown. A replay must not invent
+				// the original receipt scope or modify an unresolved intent.
 				state = existing
 				return nil
 			}
@@ -250,7 +264,8 @@ func (s *Service) applyPersistentAnnotation(
 			annotations[key] = value
 		}
 		annotations[componentKey] = component
-		rendered, renderErr := renderCard(state.BaseCard, annotations)
+		renderSnapshot := newCardRenderSnapshot(state.BaseCard, annotations, state.MemberScope, state.SenderApp, state.MessageID)
+		rendered, renderErr := renderCardSummary(renderSnapshot)
 		if renderErr != nil {
 			return fmt.Errorf("%w: %v", ErrInvalidPayload, renderErr)
 		}
@@ -262,7 +277,10 @@ func (s *Service) applyPersistentAnnotation(
 		return s.writerGate.withAttempt(ctx, messageID, func() error {
 			state.PatchSendState = patchSendSending
 			state.LastPatchError = ""
+			state.Version = cardStateVersion
 			state.PendingPatch = &cardPatchIntent{
+				RendererVersion:    rendererCardSummary,
+				RenderSnapshot:     &renderSnapshot,
 				IdempotencyKey:     idempotencyKey,
 				PayloadHash:        payloadHash,
 				RequestID:          resultID,
@@ -343,6 +361,7 @@ func syncBindingFromCardState(binding *cardBinding, state cardPersistentState, p
 	binding.baseSendState = state.BaseSendState
 	binding.annotationRevision = state.AnnotationRevision
 	binding.annotations = state.Annotations
+	binding.memberScope = state.MemberScope
 	binding.appliedKeys = applied
 	binding.patchSendState = state.PatchSendState
 	binding.pendingPatch = state.PendingPatch

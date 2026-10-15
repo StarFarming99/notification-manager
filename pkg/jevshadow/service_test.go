@@ -215,7 +215,7 @@ func TestDisabledConfigIsBackwardCompatible(t *testing.T) {
 func TestRenderCompactClassificationWithoutCardFeedbackButtons(t *testing.T) {
 	actionReference := "signed-action-reference"
 	detailURL := "https://aiops.example.com/apps/alert-center/traces/J-1"
-	card, err := renderCard(
+	card, err := renderCardLegacy(
 		map[string]interface{}{"elements": []interface{}{}},
 		map[string]AnnotationComponent{
 			"event-1": {
@@ -271,7 +271,7 @@ func TestRenderCompactClassificationWithoutCardFeedbackButtons(t *testing.T) {
 
 func TestRenderV2PoolClassificationExactlyAtCardBottom(t *testing.T) {
 	component := validV2Component()
-	card, err := renderCard(
+	card, err := renderCardLegacy(
 		map[string]interface{}{
 			"header": map[string]interface{}{"title": "original title"},
 			"elements": []interface{}{
@@ -675,11 +675,11 @@ func TestV2UpdateStablyReplacesSameMemberComponent(t *testing.T) {
 		t.Fatalf("expected two revisions to patch twice, got %d", len(patchedCards))
 	}
 	elements := patchedCards[1]["elements"].([]interface{})
-	if len(elements) != 4 {
+	if len(elements) != 3 {
 		t.Fatalf("same member set appended a second component: %#v", elements)
 	}
 	summary := elements[2].(map[string]interface{})["text"].(map[string]interface{})["content"].(string)
-	if !strings.Contains(summary, "Pool 96%") || strings.Contains(summary, "Pool 92%") {
+	if !strings.Contains(summary, "建议入池2条") || strings.Contains(summary, "Member:") || service.cards["om-v2"].annotations[stableComponentKey(second.MemberEventIDs)].Routing.Probabilities["pool"] != 0.96 {
 		t.Fatalf("latest component did not replace the prior revision: %s", summary)
 	}
 }
@@ -770,7 +770,7 @@ func TestRenderV2GroupAttributesDifferentJudgmentsToRedactedMembers(t *testing.T
 	oncall.PolicyProposal = "oncall"
 	oncall.PolicyReasonCode = "routing_oncall"
 
-	card, err := renderCard(
+	card, err := renderCardLegacy(
 		map[string]interface{}{"elements": []interface{}{}},
 		map[string]AnnotationComponent{"a-pool": pool, "b-oncall": oncall},
 	)

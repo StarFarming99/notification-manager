@@ -133,7 +133,7 @@ func TestConservativePolicyAppendsWithoutChangingOriginalCard(t *testing.T) {
 	if err := json.Unmarshal(expectedBytes, &expectedActions); err != nil {
 		t.Fatal(err)
 	}
-	card, err := renderCard(map[string]interface{}{
+	card, err := renderCardLegacy(map[string]interface{}{
 		"header": map[string]interface{}{"title": "original title"},
 		"elements": []interface{}{
 			originalActions,
