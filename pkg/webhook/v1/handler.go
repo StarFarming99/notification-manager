@@ -299,7 +299,7 @@ func (h *HttpHandler) ListReceiverWithConfig(w http.ResponseWriter, r *http.Requ
 }
 
 func (h *HttpHandler) Verify(w http.ResponseWriter, r *http.Request) {
-	if h.rejectInstanceAdmission(w, true) {
+	if !spool.HasSynchronousIngress(r.Context(), h.alerts.Durable) && h.rejectInstanceAdmission(w, true) {
 		return
 	}
 
@@ -338,7 +338,7 @@ func (h *HttpHandler) Verify(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *HttpHandler) Notification(w http.ResponseWriter, r *http.Request) {
-	if h.rejectInstanceAdmission(w, true) {
+	if !spool.HasSynchronousIngress(r.Context(), h.alerts.Durable) && h.rejectInstanceAdmission(w, true) {
 		return
 	}
 
@@ -429,20 +429,8 @@ func (h *HttpHandler) send(parent context.Context, receivers []internal.Receiver
 		val[receiver] = alerts
 	}
 	send := func() error {
-		// This callback runs inside the atomic instance send permit. Bound the
-		// original synchronous request by the frozen release deadline as well as
-		// its original worker and caller budgets; never renew the operation.
-		if h.alerts.Durable != nil {
-			state, err := h.alerts.Durable.ReleaseStatus()
-			if err != nil {
-				return err
-			}
-			if state.Phase == "releasing" && !state.Deadline.IsZero() {
-				bounded, stop := context.WithDeadline(ctx, state.Deadline)
-				defer stop()
-				ctx = bounded
-			}
-		}
+		// Publication deadlines do not shorten the original caller/worker
+		// budget of a still-authoritative sender.
 		_, output, err := pipeline.Exec(ctx, h.logger, val)
 		if err != nil {
 			return err
@@ -456,6 +444,13 @@ func (h *HttpHandler) send(parent context.Context, receivers []internal.Receiver
 		}
 		_, _, err = notify.NewStage(h.notifierCtl).Exec(ctx, h.logger, output)
 		return err
+	}
+	if spool.HasSynchronousIngress(parent, h.alerts.Durable) {
+		snapshot, ok := deliveryprofiles.Snapshot(parent)
+		if !ok {
+			snapshot = nil
+		}
+		return h.alerts.Durable.WithSynchronousContextPermit(ctx, snapshot, send)
 	}
 	if snap, ok := deliveryprofiles.Snapshot(parent); ok && snap.ID == "formal" {
 		if !h.alerts.Accepting() {

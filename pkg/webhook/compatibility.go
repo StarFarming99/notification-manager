@@ -58,8 +58,13 @@ func (h *Webhook) compatibilityRouter(profiles *deliveryprofiles.Manager) (chi.R
 	router.Use(middleware.Recoverer)
 	router.Use(middleware.Timeout(2 * h.WebhookTimeout))
 	router.Post("/api/v2/alerts", wrap(h.handler.Alert))
-	router.Post("/api/v2/notifications", wrap(h.handler.Notification))
-	router.Post("/api/v2/verify", wrap(h.handler.Verify))
+	notification, verify := h.handler.Notification, h.handler.Verify
+	if h.InstanceControl != nil {
+		notification = h.InstanceControl.Synchronous(h.WorkerTimeout, true, notification)
+		verify = h.InstanceControl.Synchronous(h.WorkerTimeout, true, verify)
+	}
+	router.Post("/api/v2/notifications", wrap(notification))
+	router.Post("/api/v2/verify", wrap(verify))
 	router.Get("/receivers", wrap(h.handler.ListReceivers))
 	router.Get("/configs", wrap(h.handler.ListConfigs))
 	router.Get("/receiverWithConfig", wrap(h.handler.ListReceiverWithConfig))

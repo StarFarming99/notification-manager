@@ -57,6 +57,10 @@ func beginPair(t *testing.T, a, b *Store) {
 func exportRelease(t *testing.T, s *Store, final bool) ReleaseManifest {
 	t.Helper()
 	st, _ := s.ReleaseStatus()
+	if final && st.Phase == "draining" {
+		controlRelease(t, s, "freeze")
+		st, _ = s.ReleaseStatus()
+	}
 	m, err := s.ExportRelease(st.OperationID, st.Revision, final)
 	if err != nil {
 		t.Fatal(err)
@@ -181,6 +185,7 @@ func TestReleaseFrozenDeadlineCASReplayAndExportReadback(t *testing.T) {
 	if _, err := a.ControlRelease(changed); !errors.Is(err, ErrReleaseConflict) {
 		t.Fatal("deadline reset", err)
 	}
+	controlRelease(t, a, "freeze")
 	st, _ := a.ReleaseStatus()
 	m, err := a.ExportRelease(st.OperationID, st.Revision, true)
 	if err != nil {
@@ -227,27 +232,30 @@ func TestReleaseVerifiedTailOverlapDoesNotReplayAndPreservesLaterGeneration(t *t
 		t.Fatal("extra send", err)
 	}
 }
-func TestReleaseAmbiguousBufferedReturnIsExplicitlyRejectedBeforeAcceptance(t *testing.T) {
+func TestReleaseAmbiguousBufferedReturnIsDurablyAcceptedWithEvidence(t *testing.T) {
 	a, _ := releaseFixture(t, "old", "active")
 	defer a.Close()
 	b, _ := releaseFixture(t, "new", "standby")
 	defer b.Close()
-	submitGroup(t, a, "group", "A", time.Hour)
+	first, _ := submitGroup(t, a, "group", "A", time.Hour)
 	finishOne(t, a)
 	beginPair(t, a, b)
 	preseed(t, a, b)
 	submitGroup(t, b, "group", "B", time.Hour)
-	snap, _ := b.ProfileSnapshot("test")
 	before, _, _ := b.Snapshot()
-	if _, _, err := b.SubmitAMProfile("group", "A", []Target{profileTarget(snap)}, "", snap, time.Hour); !errors.Is(err, ErrAmbiguousGeneration) {
-		t.Fatal("ambiguous return silently swallowed or guessed", err)
-	}
+	returned, dup := submitGroup(t, b, "group", "A", time.Hour)
 	after, _, _ := b.Snapshot()
-	if len(before) != len(after) {
-		t.Fatal("rejected request became accepted")
+	if dup || len(after) != len(before)+1 || returned.AmbiguityReason == "" || len(returned.PossibleDuplicateOf) != 1 || returned.PossibleDuplicateOf[0] != first.ID {
+		t.Fatal("ambiguous candidate not durably accepted", returned, dup)
+	}
+	finalHandoff(t, a, b)
+	finishOne(t, b)
+	if c := finishOne(t, b); c.Target.IntakeID != returned.ID {
+		t.Fatal("accepted return lost")
 	}
 }
-func TestReleaseUnprovenTailOrderingBlocksImportWithoutMutatingBuffer(t *testing.T) {
+
+func TestReleaseUnprovenTailOrderingRetainsBothCandidatesWithoutBlocking(t *testing.T) {
 	a, _ := releaseFixture(t, "old", "active")
 	defer a.Close()
 	b, _ := releaseFixture(t, "new", "standby")
@@ -258,22 +266,20 @@ func TestReleaseUnprovenTailOrderingBlocksImportWithoutMutatingBuffer(t *testing
 	preseed(t, a, b)
 	submitGroup(t, a, "group", "old-tail", time.Hour)
 	finishOne(t, a)
-	submitGroup(t, b, "group", "new-tail", time.Hour)
-	controlRelease(t, a, "close-admission")
-	m := exportRelease(t, a, true)
-	st, _ := b.ReleaseStatus()
-	if _, err := b.ImportRelease(m, commandFor(t, b, "import")); err == nil {
-		t.Fatal("unproven order guessed")
+	local, _ := submitGroup(t, b, "group", "new-tail", time.Hour)
+	finalHandoff(t, a, b)
+	if c := finishOne(t, b); c.Target.IntakeID != local.ID {
+		t.Fatal("uncertain tail was swallowed")
 	}
-	now, _ := b.ReleaseStatus()
-	if now.Revision != st.Revision {
-		t.Fatal("failed import partially committed")
-	}
-	if _, err := b.Claim(time.Now()); !errors.Is(err, ErrReleaseGate) {
-		t.Fatal("failed import enabled sender")
+	intakes, _, _ := b.Snapshot()
+	for _, in := range intakes {
+		if in.ID == local.ID && in.AmbiguityReason != "cross_instance_order_unproven" {
+			t.Fatal("missing uncertain ordering provenance", in)
+		}
 	}
 }
-func TestReleaseUnknownPendingAndInFlightCannotRetire(t *testing.T) {
+
+func TestReleaseOnlyPhysicalInFlightCannotRetire(t *testing.T) {
 	for _, state := range []string{Pending, Retryable, Unknown, Sending} {
 		t.Run(state, func(t *testing.T) {
 			a, _ := releaseFixture(t, "old", "active")
@@ -295,12 +301,21 @@ func TestReleaseUnknownPendingAndInFlightCannotRetire(t *testing.T) {
 				}
 			}
 			controlRelease(t, a, "close-admission")
+			controlRelease(t, a, "freeze")
 			st, _ := a.ReleaseStatus()
-			if _, err := a.ExportRelease(st.OperationID, st.Revision, true); err == nil {
-				t.Fatal("unfinished final export allowed")
-			}
-			if _, err := a.ControlRelease(commandFor(t, a, "retire")); err == nil {
-				t.Fatal("unfinished retirement allowed")
+			_, err := a.ExportRelease(st.OperationID, st.Revision, true)
+			if state == Sending {
+				if err == nil {
+					t.Fatal("physical in-flight exported")
+				}
+				if _, err = a.ControlRelease(commandFor(t, a, "retire")); err == nil {
+					t.Fatal("physical in-flight retired")
+				}
+			} else {
+				if err != nil {
+					t.Fatal("historical work blocked transfer", err)
+				}
+				controlRelease(t, a, "retire")
 			}
 		})
 	}
@@ -361,7 +376,7 @@ func TestReleaseManifestTamperProtocolAndForgedProofRejected(t *testing.T) {
 		t.Fatal("forged retirement accepted")
 	}
 }
-func TestReleasePersistentSynchronousUncertaintyBlocksRetireAndNeedsEvidence(t *testing.T) {
+func TestReleasePersistentSynchronousUncertaintyMigratesWithoutReplay(t *testing.T) {
 	a, path := releaseFixture(t, "old", "active")
 	b, _ := releaseFixture(t, "new", "standby")
 	defer b.Close()
@@ -389,13 +404,15 @@ func TestReleasePersistentSynchronousUncertaintyBlocksRetireAndNeedsEvidence(t *
 		t.Fatal("sync unknown lost on restart")
 	}
 	deadline := time.Now().Add(time.Second)
-	if _, err = a.ControlRelease(ReleaseCommand{OperationID: "unsafe", ExpectedRevision: as.Revision, Action: "begin-active", PeerID: "new", Deadline: deadline, MaxSendDelayMillis: 900, SyncRemainingMillis: 100, Actor: "test", Evidence: "mock"}); err == nil {
-		t.Fatal("sync unknown ignored")
+	if _, err = a.ControlRelease(ReleaseCommand{OperationID: "transfer-unknown", ExpectedRevision: as.Revision, Action: "begin-active", PeerID: "new", Deadline: deadline, MaxSendDelayMillis: 900, SyncRemainingMillis: 100, Actor: "test", Evidence: "mock"}); err != nil {
+		t.Fatal("historical sync unknown blocked future release", err)
 	}
 	if err = a.ResolveSynchronousAttempt(rows[0].ID, "test", "mock platform receipt manually checked", true); err != nil {
 		t.Fatal(err)
 	}
-	beginPair(t, a, b)
+	if attempts, _ := a.SynchronousAttempts(); len(attempts) != 1 || attempts[0].ID != rows[0].ID {
+		t.Fatal("original synchronous attempt disappeared")
+	}
 }
 func TestReleaseSameGroupDeliveryDoesNotOvertakeFiring(t *testing.T) {
 	s, _ := releaseFixture(t, "active", "active")
@@ -417,7 +434,7 @@ func TestReleaseSameGroupDeliveryDoesNotOvertakeFiring(t *testing.T) {
 		t.Fatal("resolved not released")
 	}
 }
-func TestReleaseSendDelayAndSyncBudgetActuallyGate(t *testing.T) {
+func TestReleaseExpiredBudgetDoesNotRevokeBusinessPermits(t *testing.T) {
 	a, _ := releaseFixture(t, "old", "active")
 	defer a.Close()
 	b, _ := releaseFixture(t, "new", "standby")
@@ -430,8 +447,11 @@ func TestReleaseSendDelayAndSyncBudgetActuallyGate(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.AdmissionAllowed(false); !errors.Is(err, ErrReleaseDeadline) {
-		t.Fatal("buffer delay exceeded silently", err)
+	if err := b.AdmissionAllowed(false); err != nil {
+		t.Fatal("budget revoked durable admission", err)
+	}
+	if state, _ := b.ReleaseStatus(); !state.DeadlineExceeded {
+		t.Fatal("budget miss not visible")
 	}
 	if err := a.update(func(tx *bolt.Tx) error {
 		st, _ := releaseRead(tx)
@@ -440,8 +460,8 @@ func TestReleaseSendDelayAndSyncBudgetActuallyGate(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.AdmissionAllowed(true); !errors.Is(err, ErrReleaseDeadline) {
-		t.Fatal("sync minimum remaining ignored", err)
+	if err := a.AdmissionAllowed(true); err != nil {
+		t.Fatal("release budget revoked legitimate sender", err)
 	}
 }
 func TestReleaseFreshRepeatAfterWindowIsRetained(t *testing.T) {
@@ -542,7 +562,7 @@ func TestReleaseCannotRecycleUnactivatedRetiredStandbyWithUnusedOldProof(t *test
 		t.Fatal("same operation restarted budget")
 	}
 }
-func TestReleaseLegacyGrouplessAMManifestIsExplicitlyUnsupported(t *testing.T) {
+func TestReleaseLegacyGrouplessAMManifestIsCarriedWithoutInventingGeneration(t *testing.T) {
 	a, _ := releaseFixture(t, "old", "active")
 	defer a.Close()
 	b, _ := releaseFixture(t, "new", "standby")
@@ -559,17 +579,27 @@ func TestReleaseLegacyGrouplessAMManifestIsExplicitlyUnsupported(t *testing.T) {
 		in.AMGroup = false
 		in.DedupeKey = ""
 		in.Generation = 0
+		in.IdentityOrigin = ""
+		in.ReceptionSequence = 0
+		in.ReceptionInstance = ""
+		in.DeliveryOrder = 0
 		raw, _ = json.Marshal(in)
 		m.Buckets["intakes"][id] = raw
 	}
 	m.MAC = ""
 	m.SnapshotChecksum = manifestChecksum(m)
 	m.MAC = a.releaseMAC(m)
-	if _, err := b.ImportRelease(m, commandFor(t, b, "import")); !errors.Is(err, ErrLegacyAMMetadata) {
-		t.Fatal("legacy AM metadata guessed or silently accepted", err)
+	importRelease(t, b, m)
+	intakes, targets, err := b.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(intakes) != 1 || len(targets) != 1 || intakes[0].IdentityOrigin != "legacy-unsequenced" || intakes[0].Generation != 0 || intakes[0].AMGroup || intakes[0].ReceptionSequence != 0 || intakes[0].DedupeKey != "" || targets[0].State != Delivered {
+		t.Fatal("legacy facts invented or discarded", intakes, targets)
 	}
 }
-func TestReleaseAmbiguityIsAHardOperationGate(t *testing.T) {
+
+func TestReleaseHistoricalAmbiguityDiagnosticDoesNotBlockLaterHandoff(t *testing.T) {
 	a, _ := releaseFixture(t, "old", "active")
 	defer a.Close()
 	b, _ := releaseFixture(t, "new", "standby")
@@ -579,29 +609,24 @@ func TestReleaseAmbiguityIsAHardOperationGate(t *testing.T) {
 	beginPair(t, a, b)
 	preseed(t, a, b)
 	submitGroup(t, b, "group", "B", time.Hour)
-	snap, _ := b.ProfileSnapshot("test")
-	_, _, err := b.SubmitAMProfile("group", "A", []Target{profileTarget(snap)}, "", snap, time.Hour)
-	if !errors.Is(err, ErrAmbiguousGeneration) {
+	returned, _ := submitGroup(t, b, "group", "A", time.Hour)
+	// Keep a previous-version rejected-admission fact as historical evidence.
+	if err := b.update(func(tx *bolt.Tx) error {
+		return put(tx.Bucket([]byte("meta")), "release-ambiguity:release-test", uint64(1))
+	}); err != nil {
 		t.Fatal(err)
 	}
+	finalHandoff(t, a, b)
+	finishOne(t, b)
+	if c := finishOne(t, b); c.Target.IntakeID != returned.ID {
+		t.Fatal("ambiguity fact blocked unrelated or new work")
+	}
 	st, _ := b.ReleaseStatus()
-	if st.AmbiguousAdmissions != 1 || st.RejectedAmbiguousAdmissionsTotal != 1 {
-		t.Fatal("missing persistent unresolved gate", st)
-	}
-	controlRelease(t, a, "close-admission")
-	importRelease(t, b, exportRelease(t, a, true))
-	proof := controlRelease(t, a, "retire").RetirementProof
-	c := commandFor(t, b, "activate")
-	c.Proof = proof
-	if _, err = b.ControlRelease(c); !errors.Is(err, ErrAmbiguousGeneration) {
-		t.Fatal("ambiguous operation falsely activated", err)
-	}
-	controlRelease(t, b, "close-admission")
-	st, _ = b.ReleaseStatus()
-	if _, err = b.ExportRelease(st.OperationID, st.Revision, true); !errors.Is(err, ErrAmbiguousGeneration) {
-		t.Fatal("ambiguity falsely finalized", err)
+	if st.AmbiguousAdmissions != 1 {
+		t.Fatal("old diagnostic was erased", st)
 	}
 }
+
 func TestReleaseImportCannotOverwriteFormalStartupFence(t *testing.T) {
 	a, _ := releaseFixture(t, "old", "active")
 	defer a.Close()
@@ -755,49 +780,28 @@ func TestReleaseSeenOperationCannotResetBudgetAfterAnotherRelease(t *testing.T) 
 		t.Fatal("old operation reused with new deadline", err)
 	}
 }
-func TestReleaseExpiredReturningNeverActivatesButExistingActiveKeepsSending(t *testing.T) {
+func TestReleaseExpiredReturningCanUseExactUnconsumedProof(t *testing.T) {
 	a, _ := releaseFixture(t, "old", "active")
 	defer a.Close()
 	b, _ := releaseFixture(t, "new", "standby")
 	defer b.Close()
-	beginPair(t, a, b)
+	deadline := beginTimedPair(t, a, b, 100*time.Millisecond)
 	preseed(t, a, b)
 	finalHandoff(t, a, b)
 	controlRelease(t, b, "close-admission")
 	reverse := exportRelease(t, b, true)
-	p := controlRelease(t, b, "retire").RetirementProof
+	proof := controlRelease(t, b, "retire").RetirementProof
 	controlRelease(t, a, "rollback-standby")
 	importRelease(t, a, reverse)
-	if err := a.update(func(tx *bolt.Tx) error {
-		st, _ := releaseRead(tx)
-		st.Deadline = time.Now().Add(-time.Second)
-		st.ImportedChecksum = reverse.SnapshotChecksum
-		return releasePut(tx, st)
-	}); err != nil {
+	time.Sleep(time.Until(deadline) + 5*time.Millisecond)
+	if err := a.AdmissionAllowed(false); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.AdmissionAllowed(false); !errors.Is(err, ErrReleaseDeadline) {
-		t.Fatal("expired returning buffered indefinitely", err)
+	activateRelease(t, a, proof)
+	state, _ := a.ReleaseStatus()
+	if !state.DeadlineExceeded || !state.Deadline.Equal(deadline) {
+		t.Fatal("expired recovery reset deadline")
 	}
-	// Resign a valid synthetic peer fence for the same expired frozen deadline;
-	// expiry alone must prevent activating, even with otherwise valid proof.
-	st, _ := a.ReleaseStatus()
-	p.Deadline = st.Deadline
-	p.MAC = ""
-	p.MAC = a.releaseMAC(*p)
-	c := commandFor(t, a, "activate")
-	c.Proof = p
-	if _, err := a.ControlRelease(c); !errors.Is(err, ErrReleaseDeadline) {
-		t.Fatal("expired returning activated", err)
-	}
-	if err := b.update(func(tx *bolt.Tx) error {
-		st, _ := releaseRead(tx)
-		st.Phase = "active"
-		st.Deadline = time.Now().Add(-time.Hour)
-		return releasePut(tx, st)
-	}); err != nil {
-		t.Fatal(err)
-	}
-	submitGroup(t, b, "active-after-release", "notification", time.Hour)
-	finishOne(t, b)
+	submitGroup(t, a, "after-return", "new", time.Hour)
+	finishOne(t, a)
 }

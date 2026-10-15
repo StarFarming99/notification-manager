@@ -142,7 +142,7 @@ func cleanupSynchronousAttempts(tx *bolt.Tx, retention time.Duration, batch int,
 			return err
 		}
 	}
-	return nil
+	return cleanupForwardAttempts(tx, retention, batch, now)
 }
 func recoverSynchronousAttempts(tx *bolt.Tx) error {
 	meta := tx.Bucket([]byte("meta"))
@@ -171,4 +171,24 @@ func recoverSynchronousAttempts(tx *bolt.Tx) error {
 		}
 	}
 	return nil
+}
+
+// Only physically in-flight calls prevent a final snapshot. Completed unknown
+// attempts remain immutable reconciliation facts and are never replayed.
+func syncSending(tx *bolt.Tx) (int, error) {
+	n := 0
+	err := tx.Bucket([]byte("meta")).ForEach(func(k, v []byte) error {
+		if !strings.HasPrefix(string(k), "release-sync:") {
+			return nil
+		}
+		var attempt SynchronousAttempt
+		if err := json.Unmarshal(v, &attempt); err != nil {
+			return err
+		}
+		if attempt.State == Sending {
+			n++
+		}
+		return nil
+	})
+	return n, err
 }

@@ -21,11 +21,15 @@ const maxTransferBytes = 64 << 20
 type Manager struct {
 	store                   *spool.Store
 	readToken, controlToken string
+	syncKey                 []byte
+	syncPeer                *SyncPeer
+	syncClient              *http.Client
 }
 
 // New configures the persisted instance identity before any admission or send.
-// The protocol key authenticates cross-ledger exports and retirement proofs;
-// it grants neither HTTP read access nor write access by itself.
+// The protocol key authenticates cross-ledger exports, retirement proofs and
+// the narrowly scoped single-hop synchronous peer route. General HTTP read and
+// control authority still require their independent credentials.
 func New(db *spool.Store, id, mode, readToken, controlToken string, proofKey []byte) (*Manager, error) {
 	if db == nil {
 		return nil, errors.New("instance release requires the local durable notification store")
@@ -36,7 +40,7 @@ func New(db *spool.Store, id, mode, readToken, controlToken string, proofKey []b
 	if err := db.ConfigureRelease(id, mode, proofKey); err != nil {
 		return nil, err
 	}
-	return &Manager{store: db, readToken: readToken, controlToken: controlToken}, nil
+	return &Manager{store: db, readToken: readToken, controlToken: controlToken, syncKey: append([]byte(nil), proofKey...)}, nil
 }
 
 func credentialFile(name string) (string, error) {
@@ -67,7 +71,7 @@ func credentialFile(name string) (string, error) {
 func FromEnv(db *spool.Store) (*Manager, error) {
 	id := os.Getenv("NM_INSTANCE_ID")
 	if id == "" {
-		for _, name := range []string{"NM_INSTANCE_INITIAL_MODE", "NM_INSTANCE_READ_TOKEN_FILE", "NM_INSTANCE_CONTROL_TOKEN_FILE", "NM_INSTANCE_PROTOCOL_KEY_FILE"} {
+		for _, name := range []string{"NM_INSTANCE_INITIAL_MODE", "NM_INSTANCE_READ_TOKEN_FILE", "NM_INSTANCE_CONTROL_TOKEN_FILE", "NM_INSTANCE_PROTOCOL_KEY_FILE", "NM_INSTANCE_SYNC_PEER_ID", "NM_INSTANCE_SYNC_PEER_URL", "NM_INSTANCE_SYNC_ALLOW_HTTP"} {
 			if os.Getenv(name) != "" {
 				return nil, errors.New("instance release configuration is incomplete")
 			}
@@ -91,7 +95,17 @@ func FromEnv(db *spool.Store) (*Manager, error) {
 		}
 		values = append(values, value)
 	}
-	return New(db, id, os.Getenv("NM_INSTANCE_INITIAL_MODE"), values[0], values[1], []byte(values[2]))
+	manager, err := New(db, id, os.Getenv("NM_INSTANCE_INITIAL_MODE"), values[0], values[1], []byte(values[2]))
+	if err != nil {
+		return nil, err
+	}
+	peerURL, peerID := os.Getenv("NM_INSTANCE_SYNC_PEER_URL"), os.Getenv("NM_INSTANCE_SYNC_PEER_ID")
+	if peerURL != "" || peerID != "" {
+		if err := manager.ConfigureSynchronousPeer(SyncPeer{ID: peerID, URL: peerURL, AllowHTTP: os.Getenv("NM_INSTANCE_SYNC_ALLOW_HTTP") == "true"}, nil); err != nil {
+			return nil, err
+		}
+	}
+	return manager, nil
 }
 
 func (m *Manager) guard(token string, next http.HandlerFunc) http.HandlerFunc {
@@ -171,7 +185,25 @@ func (m *Manager) Status(w http.ResponseWriter, r *http.Request) {
 		reply(w, nil, err)
 		return
 	}
-	reply(w, map[string]interface{}{"state": state, "spool": status, "delivery_profile_independent": true, "transfer_bytes": transferBytes, "transfer_limit_bytes": spool.MaxReleaseTransferBytes}, nil)
+	attempts, err := m.store.ForwardAttempts()
+	if err != nil {
+		reply(w, nil, err)
+		return
+	}
+	inFlight, unknown := 0, 0
+	for _, attempt := range attempts {
+		if attempt.State == spool.Sending {
+			inFlight++
+		}
+		if attempt.State == spool.Unknown {
+			unknown++
+		}
+	}
+	peerID, peerURL := "", ""
+	if m.syncPeer != nil {
+		peerID, peerURL = m.syncPeer.ID, m.syncPeer.URL
+	}
+	reply(w, map[string]interface{}{"state": state, "spool": status, "capabilities": map[string]string{"single_active_release": "nm-local-bluegreen-continuity-v2", "synchronous_peer": "fixed-peer-single-hop-v1"}, "delivery_profile_independent": true, "transfer_bytes": transferBytes, "transfer_limit_bytes": spool.MaxReleaseTransferBytes, "synchronous_forwarding": map[string]interface{}{"configured": m.syncPeer != nil, "peer_id": peerID, "peer_url": peerURL, "single_hop": true, "retry_after_not_sent_millis": 100, "in_flight": inFlight, "unknown": unknown, "attempts": attempts}}, nil)
 }
 
 func (m *Manager) Control(w http.ResponseWriter, r *http.Request) {

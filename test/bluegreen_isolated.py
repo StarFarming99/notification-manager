@@ -281,6 +281,7 @@ print(json.dumps([c,b]))'''
 
     def handoff(self, source, destination):
         self.command(source,'close-admission',destination)
+        self.command(source,'freeze',destination)
         checksum = self.transfer(source,destination,True)
         old = self.command(source,'retire',destination)
         self.command(destination,'activate',source,old['retirement_proof'])

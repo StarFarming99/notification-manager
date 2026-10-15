@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -73,6 +72,15 @@ type Intake struct {
 	AcceptedAt     time.Time `json:"accepted_at"`
 	TargetIDs      []string  `json:"target_ids"`
 	TerminalReason string    `json:"terminal_reason,omitempty"`
+	// These are observations, not a claimed Alertmanager notification identity.
+	IdentityOrigin      string   `json:"identity_origin,omitempty"`
+	ReceptionSequence   uint64   `json:"reception_sequence,omitempty"`
+	ReceptionInstance   string   `json:"reception_instance,omitempty"`
+	AmbiguityReason     string   `json:"ambiguity_reason,omitempty"`
+	PossibleDuplicateOf []string `json:"possible_duplicate_of,omitempty"`
+	// DeliveryOrder is a local handoff scheduling order. The original observed
+	// Generation and acceptance facts are never rewritten during import.
+	DeliveryOrder uint64 `json:"delivery_order,omitempty"`
 }
 
 type Limits struct {
@@ -247,7 +255,13 @@ func Open(path string, limits Limits) (*Store, error) {
 		if err := recoverSynchronousAttempts(tx); err != nil {
 			return err
 		}
+		if err := recoverForwardAttempts(tx); err != nil {
+			return err
+		}
 		if err := rebuildGroupOrder(tx); err != nil {
+			return err
+		}
+		if err := rebuildDeliveredLifecycleIndex(tx); err != nil {
 			return err
 		}
 		// Rebuild only the secondary lane index, retaining every frozen target.
@@ -289,7 +303,9 @@ func (s *Store) SubmitProfile(key, requestHash string, targets []Target, termina
 
 // SubmitAMProfile deduplicates only the current receiver/group generation. A
 // changed group may return to an older delivered payload without losing its
-// legitimate notification. Unfinished/uncertain older intents stay fenced.
+// legitimate notification. Content returns with uncertain peer identity are
+// durably accepted as new candidates, with a link to the old intent. The old
+// unknown attempt itself is never retried by this admission.
 func (s *Store) SubmitAMProfile(groupKey, requestHash string, targets []Target, terminalReason string, snapshot ProfileSnapshot, window time.Duration) (Intake, bool, error) {
 	return s.submit(groupKey, requestHash, targets, terminalReason, &snapshot, window, true)
 }
@@ -335,40 +351,7 @@ func (s *Store) submit(key, requestHash string, targets []Target, terminalReason
 		intakes, dedupe := tx.Bucket([]byte("intakes")), tx.Bucket([]byte("dedupe"))
 		if key != "" {
 			previous := dedupe.Get([]byte(key))
-			// A delayed peer retry must not replay an older in-flight or unknown send.
-			if group {
-				historical := dedupe.Get([]byte(key + ":intent:" + requestHash))
-				// Older ledgers retain canonical intent indexes without group metadata.
-				// Preserve exact historical uncertainty without guessing the current group
-				// or suppressing a delivered content return after an intervening change.
-				if historical == nil {
-					if split := strings.LastIndex(key, ":am-group:"); split >= 0 {
-						historical = dedupe.Get([]byte(key[:split] + ":am:" + requestHash))
-					}
-				}
-				if historical != nil {
-					var old Intake
-					if err := json.Unmarshal(intakes.Get(historical), &old); err != nil {
-						return err
-					}
-					if current := dedupe.Get([]byte(key)); current != nil && string(current) != old.ID {
-						if st, e := releaseRead(tx); e != nil {
-							return e
-						} else if st.Phase == "buffering" || st.Phase == "standby" || st.Phase == "returning" {
-							return ErrAmbiguousGeneration
-						}
-					}
-					incomplete, err := intakeIncomplete(tx, old)
-					if err != nil {
-						return err
-					}
-					if incomplete {
-						result = old
-						duplicate = true
-						return nil
-					}
-				}
-			}
+
 			if previous != nil {
 				if err := json.Unmarshal(intakes.Get(previous), &result); err != nil {
 					return err
@@ -382,7 +365,7 @@ func (s *Store) submit(key, requestHash string, targets []Target, terminalReason
 					if err != nil {
 						return err
 					}
-					if window <= 0 || incomplete || time.Now().Before(result.AcceptedAt.Add(window)) {
+					if window <= 0 || time.Now().Before(result.AcceptedAt.Add(window)) || (!group && incomplete) {
 						duplicate = true
 						return nil
 					}
@@ -434,6 +417,11 @@ func (s *Store) submit(key, requestHash string, targets []Target, terminalReason
 			}
 		}
 		result = Intake{ID: id, DedupeKey: key, AMGroup: group, Generation: generation, WindowMillis: window.Milliseconds(), RequestHash: requestHash, AcceptedAt: now, TerminalReason: terminalReason}
+		if group {
+			if err := recordAMObservation(tx, &result); err != nil {
+				return err
+			}
+		}
 		seen := make(map[string]bool)
 		for _, t := range targets {
 			if err := validateProfileTarget(tx, t); err != nil {
@@ -495,32 +483,6 @@ func (s *Store) submit(key, requestHash string, targets []Target, terminalReason
 		}
 		return nil
 	})
-	if errors.Is(err, ErrAmbiguousGeneration) {
-		_ = s.update(func(tx *bolt.Tx) error {
-			meta := tx.Bucket([]byte("meta"))
-			var n uint64
-			if raw := meta.Get([]byte("instance-release-ambiguous-admissions")); raw != nil {
-				if e := json.Unmarshal(raw, &n); e != nil {
-					return e
-				}
-			}
-			if st, e := releaseRead(tx); e != nil {
-				return e
-			} else if st.OperationID != "" {
-				key := "release-ambiguity:" + st.OperationID
-				var pending uint64
-				if raw := meta.Get([]byte(key)); raw != nil {
-					if e := json.Unmarshal(raw, &pending); e != nil {
-						return e
-					}
-				}
-				if e := put(meta, key, pending+1); e != nil {
-					return e
-				}
-			}
-			return put(meta, "instance-release-ambiguous-admissions", n+1)
-		})
-	}
 	return result, duplicate, err
 }
 
@@ -536,7 +498,13 @@ func (s *Store) ClaimProfile(id string, now time.Time) (Claim, error) {
 }
 func (s *Store) claim(now time.Time, lane string) (Claim, error) {
 	var claim Claim
+	changed := false
 	err := s.update(func(tx *bolt.Tx) error {
+		recovered, err := recoverExpiredSender(tx, now)
+		if err != nil {
+			return err
+		}
+		changed = recovered
 		if err := releaseSending(tx, now); err != nil {
 			return err
 		}
@@ -560,6 +528,12 @@ func (s *Store) claim(now time.Time, lane string) (Claim, error) {
 			if t.AvailableAt.After(now) {
 				break
 			}
+			if suppressed, err := suppressTerminalTarget(tx, &t); err != nil {
+				return err
+			} else if suppressed {
+				changed = true
+				continue
+			}
 			paused, err := profileDeliveryPaused(tx, t)
 			if err != nil {
 				return err
@@ -576,6 +550,9 @@ func (s *Store) claim(now time.Time, lane string) (Claim, error) {
 			break
 		}
 		if k == nil {
+			if changed {
+				return nil
+			}
 			return ErrEmpty
 		}
 		if t.State != Pending && t.State != Retryable {
@@ -600,6 +577,9 @@ func (s *Store) claim(now time.Time, lane string) (Claim, error) {
 		claim = Claim{Target: t, Owner: s.owner, AttemptID: attempt}
 		return nil
 	})
+	if err == nil && claim.Target.ID == "" {
+		err = ErrEmpty
+	}
 	return claim, err
 }
 
@@ -687,6 +667,9 @@ func (s *Store) Finish(c Claim, state, outcome, evidence string, next time.Time)
 			return err
 		}
 		if state == Delivered {
+			if err := recordDeliveredLifecycle(tx, t); err != nil {
+				return err
+			}
 			return releaseDependents(tx, t)
 		}
 		return nil

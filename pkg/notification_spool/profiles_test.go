@@ -115,7 +115,7 @@ func TestProfileImmutableVersionAndFence(t *testing.T) {
 func TestBoundedIntentDedupeSurvivesRestartAndAllowsRepeat(t *testing.T) {
 	s, path, profiles := profileFixture(t)
 	snap, _ := s.ProfileSnapshot("test")
-	first, dup, err := s.SubmitProfile("am:stable", "stable", []Target{profileTarget(snap)}, "", snap, 80*time.Millisecond)
+	first, dup, err := s.SubmitProfile("am:stable", "stable", []Target{profileTarget(snap)}, "", snap, time.Hour)
 	if err != nil || dup {
 		t.Fatal(err)
 	}
@@ -138,12 +138,23 @@ func TestBoundedIntentDedupeSurvivesRestartAndAllowsRepeat(t *testing.T) {
 		t.Fatal(err)
 	}
 	snap, _ = s.ProfileSnapshot("test")
-	second, dup, err := s.SubmitProfile("am:stable", "stable", []Target{profileTarget(snap)}, "", snap, 80*time.Millisecond)
+	second, dup, err := s.SubmitProfile("am:stable", "stable", []Target{profileTarget(snap)}, "", snap, time.Hour)
 	if err != nil || !dup || second.ID != first.ID {
 		t.Fatal("restart/ACK loss duplicated intent", second, dup, err)
 	}
-	time.Sleep(100 * time.Millisecond)
-	third, dup, err := s.SubmitProfile("am:stable", "stable", []Target{profileTarget(snap)}, "", snap, 80*time.Millisecond)
+	// Advance the persisted observation rather than making an 80ms restart
+	// assumption about local filesystem scheduling under parallel builds.
+	if err := s.update(func(tx *bolt.Tx) error {
+		var stored Intake
+		if err := json.Unmarshal(tx.Bucket([]byte("intakes")).Get([]byte(first.ID)), &stored); err != nil {
+			return err
+		}
+		stored.AcceptedAt = time.Now().UTC().Add(-2 * time.Hour)
+		return put(tx.Bucket([]byte("intakes")), stored.ID, stored)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	third, dup, err := s.SubmitProfile("am:stable", "stable", []Target{profileTarget(snap)}, "", snap, time.Hour)
 	if err != nil || dup || third.ID == first.ID {
 		t.Fatal("legitimate repeat swallowed", third, dup, err)
 	}

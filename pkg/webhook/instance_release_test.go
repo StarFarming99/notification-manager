@@ -56,6 +56,11 @@ func instanceFixture(t *testing.T, mode, endpoint string) (*Webhook, *spool.Stor
 			t.Fatal(err)
 		}
 		if mode == "retired" {
+			command.ExpectedRevision, command.Action = state.Revision, "freeze"
+			state, err = db.ControlRelease(command)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if _, err = db.ExportRelease(command.OperationID, state.Revision, true); err != nil {
 				t.Fatal(err)
 			}
@@ -82,7 +87,7 @@ func TestInstanceStandbyReceivesAMButNeverReportsSynchronousBufferAsSuccess(t *t
 				w := httptest.NewRecorder()
 				h.router.ServeHTTP(w, httptest.NewRequest("POST", "/api/v2/"+api, strings.NewReader(string(body))))
 				want := 503
-				if mode == "active" {
+				if mode == "active" || mode == "draining" {
 					want = 200
 				}
 				if w.Code != want || strings.Contains(w.Body.String(), "accepted for durable") {
@@ -96,7 +101,7 @@ func TestInstanceStandbyReceivesAMButNeverReportsSynchronousBufferAsSuccess(t *t
 			if len(rows) != 0 {
 				t.Fatal("synchronous API secretly persisted an unsent job", rows)
 			}
-			if mode == "active" && sends.Load()-before != 2 || mode != "active" && sends.Load() != before {
+			if (mode == "active" || mode == "draining") && sends.Load()-before != 2 || (mode != "active" && mode != "draining") && sends.Load() != before {
 				t.Fatal("instance send fence was bypassed", mode, sends.Load()-before)
 			}
 			w := httptest.NewRecorder()
@@ -178,7 +183,7 @@ func TestInstanceEndpointsAreIndependentOfProfileAndProbeCredentials(t *testing.
 	}
 }
 
-func TestSynchronousUncertainPlatformResultBlocksReleaseUntilAuditedReconciliation(t *testing.T) {
+func TestSynchronousUncertainPlatformResultIsIsolatedAndAuditedWithoutReplay(t *testing.T) {
 	var sends atomic.Int32
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sends.Add(1)
@@ -202,8 +207,8 @@ func TestSynchronousUncertainPlatformResultBlocksReleaseUntilAuditedReconciliati
 	r.Header.Set("Authorization", "Bearer "+strings.Repeat("c", 32))
 	w = httptest.NewRecorder()
 	h.router.ServeHTTP(w, r)
-	if w.Code != 409 {
-		t.Fatal("unsafe release started despite unknown result", w.Code, w.Body.String())
+	if w.Code != 200 {
+		t.Fatal("historical unknown blocked unrelated release", w.Code, w.Body.String())
 	}
 	r = httptest.NewRequest("GET", "/internal/instance/synchronous", nil)
 	r.Header.Set("Authorization", "Bearer "+strings.Repeat("c", 32))

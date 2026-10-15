@@ -42,7 +42,7 @@ func TestAMGroupDeliveredStateReturnCreatesNewGeneration(t *testing.T) {
 		t.Fatal("current generation lost after restart", dup, err)
 	}
 }
-func TestAMGroupInterleavedPendingAndUnknownPeerNeverReplays(t *testing.T) {
+func TestAMGroupInterleavedUnknownReturnIsNewCandidateNotOldAttemptReplay(t *testing.T) {
 	s, _, _ := profileFixture(t)
 	defer s.Close()
 	snap, _ := s.ProfileSnapshot("test")
@@ -52,8 +52,12 @@ func TestAMGroupInterleavedPendingAndUnknownPeerNeverReplays(t *testing.T) {
 		t.Fatal(err)
 	}
 	late, dup, err := s.SubmitAMProfile("group", "A", []Target{profileTarget(snap)}, "", snap, 12*time.Hour)
-	if err != nil || !dup || late.ID != a.ID {
-		t.Fatal("old pending intent duplicated", dup, err)
+	if err != nil || dup || late.ID == a.ID || late.AmbiguityReason != "content_return_or_delayed_peer" || len(late.PossibleDuplicateOf) != 1 || late.PossibleDuplicateOf[0] != a.ID {
+		t.Fatal("ambiguous return was not independently accepted with provenance", dup, err, late)
+	}
+	peer, dup, err := s.SubmitAMProfile("group", "A", []Target{profileTarget(snap)}, "", snap, 12*time.Hour)
+	if err != nil || !dup || peer.ID != late.ID {
+		t.Fatal("certain current duplicate was not deduplicated", dup, err)
 	}
 	claim, err := s.Claim(time.Now())
 	if err != nil {
@@ -62,17 +66,25 @@ func TestAMGroupInterleavedPendingAndUnknownPeerNeverReplays(t *testing.T) {
 	if err := s.Finish(claim, Unknown, "response_lost", "mock", time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	late, dup, err = s.SubmitAMProfile("group", "A", []Target{profileTarget(snap)}, "", snap, 12*time.Hour)
-	if err != nil || !dup || late.ID != a.ID {
-		t.Fatal("uncertain old intent replayed", dup, err)
+	var sends []string
+	for range 2 {
+		c, err := s.Claim(time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		sends = append(sends, c.Target.IntakeID)
+		if err := s.Finish(c, Delivered, "confirmed", "new-candidate-receipt", time.Now()); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if _, err := s.Claim(time.Now()); err != nil {
-		t.Fatal(err)
+	if sends[0] == a.ID || sends[1] == a.ID || sends[0] == sends[1] {
+		t.Fatal("old unknown attempt replayed", sends)
 	}
 	if _, err := s.Claim(time.Now()); !errors.Is(err, ErrEmpty) {
 		t.Fatal("extra send queued", err)
 	}
 }
+
 func TestAMConcurrentPeersUseOneGenerationAndSeparateGroups(t *testing.T) {
 	s, _, _ := profileFixture(t)
 	defer s.Close()
@@ -152,7 +164,8 @@ func TestLegacyAMGenerationSeedRequiresPausedCASAndRetainsExactWork(t *testing.T
 // B are both delivered, a late peer's old A has exactly the same observable
 // request as a valid unsilence/state-return A. Preserve the valid update; this
 // test documents that arbitrary delayed delivered-peer exactly-once cannot be
-// proven. Promotion needs ordered single-peer admission or explicit accounting.
+// proven. The accepted return is retained as a separately auditable candidate;
+// a possible boundary duplicate does not block unrelated notifications.
 func TestDeliveredLatePeerIndistinguishableFromLegitimateReturn(t *testing.T) {
 	s, _, _ := profileFixture(t)
 	defer s.Close()
@@ -180,7 +193,7 @@ func TestDeliveredLatePeerIndistinguishableFromLegitimateReturn(t *testing.T) {
 	}
 }
 
-func TestLegacyUpgradePreservesHistoricalUnknownButAllowsReconciledReturn(t *testing.T) {
+func TestLegacyUpgradePreservesHistoricalUnknownAndAcceptsIndependentReturn(t *testing.T) {
 	s, _, _ := profileFixture(t)
 	defer s.Close()
 	snap, _ := s.ProfileSnapshot("test")
@@ -218,19 +231,24 @@ func TestLegacyUpgradePreservesHistoricalUnknownButAllowsReconciledReturn(t *tes
 		t.Fatal(err)
 	}
 	snap, _ = s.ProfileSnapshot("test")
-	key := "test:v1:am-group:" + groupHash
-	late, dup, err := s.SubmitAMProfile(key, aHash, []Target{profileTarget(snap)}, "", snap, 12*time.Hour)
-	if err != nil || !dup || late.ID != a.ID {
-		t.Fatal("old unknown historical target was replayed", dup, err)
+	fresh, dup, err := s.SubmitAMProfile("test:v1:am-group:"+groupHash, aHash, []Target{profileTarget(snap)}, "", snap, 12*time.Hour)
+	if err != nil || dup || fresh.ID == a.ID || len(fresh.PossibleDuplicateOf) != 1 || fresh.PossibleDuplicateOf[0] != a.ID {
+		t.Fatal("valid legacy return swallowed or provenance lost", dup, err)
 	}
-	if _, err = s.Claim(time.Now()); !errors.Is(err, ErrEmpty) {
-		t.Fatal("old unknown became sendable", err)
+	c, err := s.Claim(time.Now())
+	if err != nil || c.Target.IntakeID != fresh.ID {
+		t.Fatal("new candidate not independently sendable", err)
 	}
-	if err = s.Resolve(aClaim.Target.ID, Delivered, "operator", "exact platform receipt A confirmed"); err != nil {
+	if err = s.Finish(c, Delivered, "confirmed", "new return", time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	fresh, dup, err := s.SubmitAMProfile(key, aHash, []Target{profileTarget(snap)}, "", snap, 12*time.Hour)
-	if err != nil || dup || fresh.ID == a.ID {
-		t.Fatal("reconciled valid A return swallowed", dup, err)
+	_, rows, err := s.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.IntakeID == a.ID && (row.State != Unknown || row.Attempts != 1 || row.AttemptID != aClaim.AttemptID) {
+			t.Fatal("legacy unknown facts mutated", row)
+		}
 	}
 }

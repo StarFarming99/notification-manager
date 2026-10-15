@@ -26,3 +26,20 @@ rc7 executable. c62's unprofiled durable APIs already returned queue acceptance;
 that behavior is not the original synchronous success contract being preserved.
 Full migration acceptance remains BLOCKED by c62 bootstrap and indistinguishable
 same-start AM generations. This runner never authorizes a deployment or takeover.
+
+## October 15 repair follow-up entry points
+
+The full `bluegreen_isolated.py` execution and the original delivery report
+preserve the first prototype's acceptance contract. Its original c62-online and
+unknown-blocking assertions are historical, not the current repair acceptance.
+Use the original `8bf56b6` source archive to reproduce that complete old matrix.
+The shared fixture's handoff helper now uses the explicit CAS `freeze` required
+by the repaired protocol.
+
+The current focused legacy test is `test/bluegreen_c62_restart.py`: ordinary
+stop-before-start on the same synthetic Bolt path, pending recovery, unchanged
+unknown attempts, followed by a capable-version handoff. Future network release
+acceptance uses `tests/bluegreen_kubernetes.py` in `zilliztech/vdc-deploy-prod`,
+with actual NM binaries and a dedicated local kind kubeconfig. Docker proxy and
+fake-client fixtures do not substitute for that Kubernetes data-plane evidence.
+No entry point authorizes a production or UAT operation.

@@ -44,6 +44,7 @@ type ReleaseState struct {
 	DeadlineExceeded                 bool             `json:"deadline_exceeded,omitempty"`
 	KeyFingerprint                   string           `json:"-"`
 	SynchronousUnresolved            int              `json:"synchronous_unresolved"`
+	SynchronousInFlight              int              `json:"synchronous_in_flight"`
 	AmbiguousAdmissions              uint64           `json:"ambiguous_admissions"`
 }
 type ReleaseCommand struct {
@@ -107,6 +108,9 @@ func (s *Store) ReleaseStatus() (ReleaseState, error) {
 		st, e = releaseRead(tx)
 		if e == nil {
 			st.SynchronousUnresolved, e = syncUnresolved(tx)
+			if e == nil {
+				st.SynchronousInFlight, e = syncSending(tx)
+			}
 			if raw := tx.Bucket([]byte("meta")).Get([]byte("instance-release-ambiguous-admissions")); raw != nil && e == nil {
 				e = json.Unmarshal(raw, &st.RejectedAmbiguousAdmissionsTotal)
 			}
@@ -157,6 +161,9 @@ func (s *Store) ConfigureRelease(id, mode string, key []byte) error {
 		if err := meta.Put([]byte("instance-release-key"), []byte(fingerprint)); err != nil {
 			return err
 		}
+		if err := markLegacyAMIntakes(tx); err != nil {
+			return err
+		}
 		return releasePut(tx, st)
 	})
 	if err == nil {
@@ -173,17 +180,11 @@ func releaseAdmission(tx *bolt.Tx, synchronous bool, now time.Time) error {
 		return nil
 	}
 	switch st.Phase {
-	case "active", "releasing":
-		if synchronous && st.Phase == "releasing" && now.Add(time.Duration(st.SyncRemainingMillis)*time.Millisecond).After(st.Deadline) {
-			return ErrReleaseDeadline
-		}
+	case "active", "releasing", "cancelling":
 		return nil
 	case "standby", "buffering", "returning":
 		if synchronous {
 			return ErrReleaseGate
-		}
-		if limit := bufferDeadline(st); !limit.IsZero() && now.After(limit) {
-			return ErrReleaseDeadline
 		}
 		return nil
 	default:
@@ -201,10 +202,7 @@ func releaseSending(tx *bolt.Tx, now time.Time) error {
 	switch st.Phase {
 	case "active":
 		return nil
-	case "releasing", "draining":
-		if now.After(st.Deadline) {
-			return ErrReleaseDeadline
-		}
+	case "releasing", "draining", "cancelling":
 		return nil
 	default:
 		return ErrReleaseGate
@@ -341,15 +339,20 @@ func (s *Store) ControlReleaseContext(ctx context.Context, c ReleaseCommand) (Re
 			if st.OperationID != c.OperationID {
 				return ErrReleaseConflict
 			}
-			if st.Phase == "releasing" || st.Phase == "active" {
+			if st.Phase == "releasing" || st.Phase == "active" || st.Phase == "cancelling" {
 				st.Phase = "draining"
 			} else if st.Phase == "buffering" || st.Phase == "standby" {
 				st.Phase = "buffer-closed"
-			} else if st.Phase != "draining" && st.Phase != "buffer-closed" {
+			} else if st.Phase != "draining" && st.Phase != "buffer-closed" && st.Phase != "frozen" {
 				return ErrReleaseConflict
 			}
+		case "freeze":
+			if st.OperationID != c.OperationID || (st.Phase != "draining" && st.Phase != "frozen") {
+				return ErrReleaseConflict
+			}
+			st.Phase = "frozen"
 		case "retire":
-			if st.OperationID != c.OperationID || (st.Phase != "draining" && st.Phase != "buffer-closed") || st.ExportedChecksum == "" {
+			if st.OperationID != c.OperationID || (st.Phase != "frozen" && st.Phase != "buffer-closed") || st.ExportedChecksum == "" {
 				return ErrReleaseConflict
 			}
 			if err := releaseSafe(tx, st.NeverActivated); err != nil {
@@ -369,9 +372,6 @@ func (s *Store) ControlReleaseContext(ctx context.Context, c ReleaseCommand) (Re
 			p := *c.Proof
 			if !s.proofValid(p) || p.ProtocolVersion != ReleaseProtocolVersion || p.OperationID != st.OperationID || p.InstanceID != st.PeerID || p.SuccessorID != st.InstanceID || p.SnapshotChecksum != st.ImportedChecksum || !p.Deadline.Equal(st.Deadline) {
 				return errors.New("retirement proof does not match imported final state")
-			}
-			if now.After(bufferDeadline(st)) {
-				return ErrReleaseDeadline
 			}
 			proofKey := "release-peer-proof:" + p.InstanceID
 			var consumed uint64
@@ -399,9 +399,34 @@ func (s *Store) ControlReleaseContext(ctx context.Context, c ReleaseCommand) (Re
 			st.ExportedChecksum = ""
 			st.RetirementProof = nil
 		case "cancel":
-			// Cancellation does not discharge successor buffers. A signed successor
-			// retirement with an imported reverse snapshot is required before resuming.
-			return errors.New("cancel requires reverse state transfer and authenticated retirement proof")
+			if err := prepareCancellation(tx, &st, c, now); err != nil {
+				return err
+			}
+		case "cancel-complete":
+			if st.Phase != "cancelling" || st.OperationID != c.OperationID || st.ImportedChecksum == "" || c.Proof == nil {
+				return ErrReleaseConflict
+			}
+			p := *c.Proof
+			if !s.proofValid(p) || p.ProtocolVersion != ReleaseProtocolVersion || p.OperationID != st.OperationID || p.InstanceID != st.PeerID || p.SuccessorID != st.InstanceID || p.SnapshotChecksum != st.ImportedChecksum || !p.Deadline.Equal(st.Deadline) {
+				return errors.New("cancel proof does not match returned buffer")
+			}
+			proofKey := "release-peer-proof:" + p.InstanceID
+			var consumed uint64
+			if raw := tx.Bucket([]byte("meta")).Get([]byte(proofKey)); raw != nil {
+				if err := json.Unmarshal(raw, &consumed); err != nil {
+					return err
+				}
+			}
+			if p.FenceRevision <= consumed {
+				return errors.New("retirement proof was already consumed or superseded")
+			}
+			if err := put(tx.Bucket([]byte("meta")), proofKey, p.FenceRevision); err != nil {
+				return err
+			}
+			st.Phase = "active"
+			if err := put(tx.Bucket([]byte("meta")), "release-cancel-complete:"+st.OperationID, map[string]interface{}{"peer": st.PeerID, "checksum": st.ImportedChecksum, "proof_revision": p.FenceRevision}); err != nil {
+				return err
+			}
 		default:
 			return errors.New("unsupported instance release action")
 		}
@@ -424,38 +449,46 @@ func (s *Store) ControlReleaseContext(ctx context.Context, c ReleaseCommand) (Re
 	})
 	return result, err
 }
+
+// releaseSafe protects physical sends, not the repair of historical outcomes.
+// Pending/retry/unknown/dead-letter facts migrate unchanged. A never-active
+// successor can return only its own zero-attempt buffers, not stale preseed rows.
 func releaseSafe(tx *bolt.Tx, buffered bool) error {
-	if st, err := releaseRead(tx); err != nil {
-		return err
-	} else if err := releaseAmbiguity(tx, st.OperationID); err != nil {
-		return err
-	}
-	if n, err := syncUnresolved(tx); err != nil {
+	if n, err := syncSending(tx); err != nil {
 		return err
 	} else if n > 0 {
-		return errors.New("uncertain synchronous platform attempt blocks retirement")
+		return errors.New("in-flight synchronous platform attempt blocks retirement")
+	}
+	base := map[string]bool{}
+	if buffered {
+		st, err := releaseRead(tx)
+		if err != nil {
+			return err
+		}
+		base, err = inheritedIntakes(tx, st)
+		if err != nil {
+			return err
+		}
 	}
 	return tx.Bucket([]byte("targets")).ForEach(func(_, raw []byte) error {
 		var t Target
 		if err := json.Unmarshal(raw, &t); err != nil {
 			return err
 		}
-		if t.State == Unknown || t.State == Sending {
-			return errors.New("unresolved or in-flight target blocks state retirement")
+		if buffered && base[t.IntakeID] {
+			return nil
 		}
-		if t.State == Pending || t.State == Retryable {
-			if !buffered || t.State != Pending || t.Attempts != 0 {
-				return errors.New("unfinished target blocks state retirement")
-			}
+		if t.State == Sending {
+			return errors.New("in-flight target blocks state retirement")
 		}
-		if t.State == DeadLetter && t.Outcome != "operator_reconciled" {
-			return errors.New("unreconciled dead letter blocks state retirement")
+		if buffered && t.Attempts != 0 {
+			return errors.New("buffer has a local send attempt")
 		}
 		return nil
 	})
 }
 func exportedMeta(k string) bool {
-	return strings.HasPrefix(k, "profile:") || strings.HasPrefix(k, "profile-state:") || k == "profile-send-next-at" || k == "formal-send-next-at" || strings.HasPrefix(k, "release-sync:") || strings.HasPrefix(k, "release-ambiguity:")
+	return strings.HasPrefix(k, "profile:") || strings.HasPrefix(k, "profile-state:") || k == "profile-send-next-at" || k == "formal-send-next-at" || strings.HasPrefix(k, "release-sync:") || strings.HasPrefix(k, "release-ambiguity:") || strings.HasPrefix(k, "release-forward:")
 }
 func manifestChecksum(m ReleaseManifest) string {
 	m.MAC = ""
@@ -473,6 +506,7 @@ func (s *Store) ExportReleaseContext(ctx context.Context, operation string, expe
 	if err := ctx.Err(); err != nil {
 		return m, err
 	}
+
 	err := s.update(func(tx *bolt.Tx) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -499,8 +533,15 @@ func (s *Store) ExportReleaseContext(ctx context.Context, operation string, expe
 			return errors.New("release transfer exceeds supported bounded protocol size")
 		}
 		if final {
-			if st.Phase != "draining" && st.Phase != "buffer-closed" {
+			if st.Phase != "frozen" && st.Phase != "buffer-closed" {
 				return ErrReleaseGate
+			}
+			if st.ExportedChecksum != "" {
+				raw := tx.Bucket([]byte("meta")).Get([]byte("release-export:" + operation + ":" + st.ExportedChecksum))
+				if raw == nil {
+					return errors.New("persisted final snapshot missing")
+				}
+				return json.Unmarshal(raw, &m)
 			}
 			if err := releaseSafe(tx, st.NeverActivated); err != nil {
 				return err
@@ -519,6 +560,11 @@ func (s *Store) ExportReleaseContext(ctx context.Context, operation string, expe
 				return err
 			}
 			m.Buckets[name] = rows
+		}
+		if final && st.NeverActivated {
+			if err := filterBufferedManifest(tx, &m, st); err != nil {
+				return err
+			}
 		}
 		m.SnapshotChecksum = manifestChecksum(m)
 		m.MAC = s.releaseMAC(m)
@@ -693,8 +739,21 @@ func (s *Store) ImportReleaseContext(ctx context.Context, m ReleaseManifest, c R
 		if err := validateCommand(st, c); err != nil {
 			return err
 		}
-		if c.Action != "import" || st.OperationID != m.OperationID || st.PeerID != m.SourceID || st.InstanceID != m.DestinationID || !st.Deadline.Equal(m.Deadline) || (st.Phase != "buffering" && st.Phase != "returning" && st.Phase != "buffer-closed") {
+		if c.Action == "cancel-import" {
+			if err := validateCancelledBuffer(m); err != nil {
+				return err
+			}
+			if err := prepareCancellation(tx, &st, c, time.Now().UTC()); err != nil {
+				return err
+			}
+		}
+		if (c.Action != "import" && c.Action != "cancel-import") || st.OperationID != m.OperationID || st.PeerID != m.SourceID || st.InstanceID != m.DestinationID || !st.Deadline.Equal(m.Deadline) || (st.Phase != "buffering" && st.Phase != "returning" && st.Phase != "buffer-closed" && !(st.Phase == "cancelling" && m.Final && m.BufferedOnly)) {
 			return ErrReleaseConflict
+		}
+		if st.Phase == "cancelling" {
+			if err := validateCancelledBuffer(m); err != nil {
+				return err
+			}
 		}
 		if !m.Final && st.ImportedChecksum != "" {
 			return errors.New("preseed may only be imported once")
@@ -724,13 +783,15 @@ func (s *Store) ImportReleaseContext(ctx context.Context, m ReleaseManifest, c R
 				}
 			}
 		}
-		for key, id := range m.Buckets["dedupe"] {
-			if strings.Contains(key, ":am-group:") && !strings.Contains(key, ":intent:") {
-				var in Intake
-				if json.Unmarshal(m.Buckets["intakes"][string(id)], &in) != nil || !in.AMGroup || in.DedupeKey != key || in.Generation == 0 {
-					return ErrLegacyAMMetadata
-				}
-			}
+		inherited, err := inheritedIntakes(tx, st)
+		if err != nil {
+			return err
+		}
+		for id := range sourceIDs {
+			inherited[id] = true
+		}
+		if err := put(meta, "release-inherited:"+st.OperationID, inherited); err != nil {
+			return err
 		}
 		if !m.Final {
 			for id := range sourceIDs {
@@ -740,82 +801,12 @@ func (s *Store) ImportReleaseContext(ctx context.Context, m ReleaseManifest, c R
 				return err
 			}
 		}
-		// Non-AM stable idempotency keys are exact request identities. AM group
-		// histories require an ordered suffix/prefix overlap from the frozen base.
-		for key, sourceID := range m.Buckets["dedupe"] {
-			if strings.Contains(key, ":intent:") {
-				continue
-			}
-			localID := localDedupe[key]
-			if localID == nil || string(localID) == string(sourceID) {
-				continue
-			}
-			var src, loc Intake
-			if json.Unmarshal(m.Buckets["intakes"][string(sourceID)], &src) != nil || json.Unmarshal(localIntakes[string(localID)], &loc) != nil {
-				return errors.New("invalid dedupe reference")
-			}
-			if !src.AMGroup && !loc.AMGroup {
-				if sourceIDs[loc.ID] {
-					continue
-				}
-				if err := confirmAlias(loc, src, localTargets, m.Buckets["targets"]); err != nil {
-					return err
-				}
-				continue
-			}
-			if !src.AMGroup || !loc.AMGroup || src.DedupeKey != key || loc.DedupeKey != key {
-				return errors.New("legacy AM generation metadata cannot prove handoff ordering")
-			}
-			var a, b []Intake
-			for _, i := range orderedIntakes(m.Buckets["intakes"], key) {
-				if !baseIDs[i.ID] {
-					a = append(a, i)
-				}
-			}
-			for _, i := range orderedIntakes(localIntakes, key) {
-				if !baseIDs[i.ID] && !sourceIDs[i.ID] {
-					b = append(b, i)
-				}
-			}
-			if len(b) == 0 {
-				continue
-			}
-			if len(baseIDs) == 0 {
-				return errors.New("AM overlap requires a frozen preseed baseline")
-			}
-			if len(a) == 0 {
-				continue
-			}
-			overlap := 0
-			for n := 1; n <= len(a) && n <= len(b); n++ {
-				matches := true
-				for j := 0; j < n; j++ {
-					if !sameBoundary(a[len(a)-n+j], b[j]) {
-						matches = false
-						break
-					}
-				}
-				if matches {
-					overlap = n
-				}
-			}
-			if overlap == 0 {
-				return errors.New("AM generations have unproven cross-instance order")
-			}
-			nextGeneration := src.Generation
-			for j := range b {
-				if j < overlap {
-					predecessor := a[len(a)-overlap+j]
-					if err := confirmAlias(b[j], predecessor, localTargets, m.Buckets["targets"]); err != nil {
-						return err
-					}
-					b[j].Generation = predecessor.Generation
-				} else {
-					nextGeneration++
-					b[j].Generation = nextGeneration
-				}
-				raw, _ := json.Marshal(b[j])
-				localIntakes[b[j].ID] = raw
+		if err := validateReleaseDedupe(m); err != nil {
+			return err
+		}
+		if st.Phase != "cancelling" {
+			if err := reconcileAMHistories(tx, m, baseIDs, localIntakes, localTargets, localDedupe, sourceIDs); err != nil {
+				return err
 			}
 		}
 		for name, rows := range m.Buckets {
@@ -823,6 +814,20 @@ func (s *Store) ImportReleaseContext(ctx context.Context, m ReleaseManifest, c R
 				return errors.New("unsupported release snapshot bucket")
 			}
 			for key, value := range rows {
+				if st.Phase == "cancelling" && name == "intakes" && localIntakes[key] != nil {
+					var prior, incoming Intake
+					if json.Unmarshal(localIntakes[key], &prior) != nil || json.Unmarshal(value, &incoming) != nil || !sameCancelledIntake(prior, incoming) {
+						return errors.New("cancel intake identity conflict")
+					}
+					continue
+				}
+				if st.Phase == "cancelling" && name == "targets" && localTargets[key] != nil {
+					var prior, incoming Target
+					if json.Unmarshal(localTargets[key], &prior) != nil || json.Unmarshal(value, &incoming) != nil || targetIdentity(prior) != targetIdentity(incoming) {
+						return errors.New("cancel target identity conflict")
+					}
+					continue
+				}
 				if name == "meta" {
 					if !exportedMeta(key) {
 						return errors.New("manifest attempted to replace instance fence")
@@ -836,6 +841,13 @@ func (s *Store) ImportReleaseContext(ctx context.Context, m ReleaseManifest, c R
 					if prior := meta.Get([]byte(key)); prior != nil && strings.HasPrefix(key, "profile:") && string(prior) != string(value) {
 						return errors.New("immutable delivery profile conflict")
 					}
+				}
+				if name == "meta" && strings.HasPrefix(key, "release-forward:") {
+					merged, err := mergeForwardReference(tx, key, value, st.InstanceID)
+					if err != nil {
+						return err
+					}
+					value = merged
 				}
 				if err := tx.Bucket([]byte(name)).Put([]byte(key), value); err != nil {
 					return err
@@ -876,6 +888,17 @@ func (s *Store) ImportReleaseContext(ctx context.Context, m ReleaseManifest, c R
 			if err := tx.Bucket([]byte("dedupe")).Put([]byte(key), id); err != nil {
 				return err
 			}
+		}
+		if err := markLegacyAMIntakes(tx); err != nil {
+			return err
+		}
+		if st.Phase == "cancelling" {
+			if err := reorderCancelledBuffer(tx, sourceIDs); err != nil {
+				return err
+			}
+		}
+		if err := reconcileLifecycleOrder(tx); err != nil {
+			return err
 		}
 		if err := rebuildReleaseIndexes(tx); err != nil {
 			return err
@@ -995,54 +1018,91 @@ func (s *Store) StringReleaseStatus() string {
 	}
 	return fmt.Sprintf("%s:%s:%d", st.InstanceID, st.Phase, st.Revision)
 }
+func groupOrder(i Intake) uint64 {
+	if i.DeliveryOrder != 0 {
+		return i.DeliveryOrder
+	}
+	return i.Generation
+}
 func groupOrderKey(i Intake) string {
-	return fmt.Sprintf("am-order:%s:%020d", Hash([]byte(i.DedupeKey)), i.Generation)
+	return fmt.Sprintf("am-order:%s:%020d", Hash([]byte(i.DedupeKey)), groupOrder(i))
 }
 func groupDeliveryBlocked(tx *bolt.Tx, t Target) (bool, error) {
-	if st, err := releaseRead(tx); err != nil {
-		return false, err
-	} else if st.InstanceID == "" {
-		return false, nil
-	}
-	var i Intake
-	if err := json.Unmarshal(tx.Bucket([]byte("intakes")).Get([]byte(t.IntakeID)), &i); err != nil {
+	st, err := releaseRead(tx)
+	if err != nil || st.InstanceID == "" {
 		return false, err
 	}
-	if !i.AMGroup || i.DedupeKey == "" {
+	var current Intake
+	if err := json.Unmarshal(tx.Bucket([]byte("intakes")).Get([]byte(t.IntakeID)), &current); err != nil {
+		return false, err
+	}
+	if !current.AMGroup || current.DedupeKey == "" || current.IdentityOrigin == "legacy-unsequenced" {
 		return false, nil
 	}
-	prefix := []byte("am-order:" + Hash([]byte(i.DedupeKey)) + ":")
-	limit := groupOrderKey(i)
-	meta := tx.Bucket([]byte("meta"))
-	watermarkKey := "am-completed:" + Hash([]byte(i.DedupeKey))
-	var watermark uint64
-	if raw := meta.Get([]byte(watermarkKey)); raw != nil {
-		if err := json.Unmarshal(raw, &watermark); err != nil {
-			return false, err
-		}
-	}
-	c := meta.Cursor()
-	for k, v := c.Seek([]byte(fmt.Sprintf("%s%020d", prefix, watermark+1))); k != nil && strings.HasPrefix(string(k), string(prefix)) && string(k) < limit; k, v = c.Next() {
+	prefix := "am-order:" + Hash([]byte(current.DedupeKey)) + ":"
+	limit := groupOrderKey(current)
+	cursor := tx.Bucket([]byte("meta")).Cursor()
+	for k, v := cursor.Seek([]byte(prefix)); k != nil && strings.HasPrefix(string(k), prefix) && string(k) < limit; k, v = cursor.Next() {
 		var prior Intake
 		if err := json.Unmarshal(tx.Bucket([]byte("intakes")).Get(v), &prior); err != nil {
 			return false, err
 		}
-		if incomplete, err := intakeLifecycleUnsettled(tx, prior); err != nil {
-			return false, err
-		} else if incomplete {
-			if err := put(meta, watermarkKey, watermark); err != nil {
+		for _, id := range prior.TargetIDs {
+			var target Target
+			if err := json.Unmarshal(tx.Bucket([]byte("targets")).Get([]byte(id)), &target); err != nil {
 				return false, err
 			}
-			return true, nil
+			if target.State != Pending && target.State != Retryable && target.State != Sending {
+				continue
+			}
+			if target.ProfileID == t.ProfileID && target.Receiver == t.Receiver && target.Channel == t.Channel && target.Destination == t.Destination && lifecycleOverlap(target.Payload, t.Payload) {
+				return true, nil
+			}
 		}
-		if prior.Generation > watermark {
-			watermark = prior.Generation
-		}
-	}
-	if err := put(meta, watermarkKey, watermark); err != nil {
-		return false, err
 	}
 	return false, nil
+}
+
+// Frozen payloads normally contain exact alert IDs/labels and startsAt. Legacy
+// renders without these facts conservatively retain same-group ordering only.
+func lifecycleOverlap(left, right json.RawMessage) bool {
+	identities := func(raw json.RawMessage) map[string]bool {
+		var value struct {
+			Data struct {
+				Alerts []struct {
+					ID       string            `json:"id"`
+					Labels   map[string]string `json:"labels"`
+					StartsAt time.Time         `json:"startsAt"`
+				} `json:"alerts"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(raw, &value) != nil || len(value.Data.Alerts) == 0 {
+			return nil
+		}
+		keys := map[string]bool{}
+		for _, alert := range value.Data.Alerts {
+			if alert.StartsAt.IsZero() || (alert.ID == "" && len(alert.Labels) == 0) {
+				return nil
+			}
+			identity := alert.ID
+			if len(alert.Labels) > 0 {
+				encoded, _ := json.Marshal(alert.Labels)
+				identity = Hash(encoded)
+			}
+			keys[identity+":"+alert.StartsAt.UTC().Format(time.RFC3339Nano)] = true
+		}
+		return keys
+	}
+	a, b := identities(left), identities(right)
+	if len(a) == 0 || len(b) == 0 {
+		return true
+	}
+	for key := range a {
+		if b[key] {
+			return true
+		}
+	}
+	return false
 }
 
 func rebuildGroupOrder(tx *bolt.Tx) error {
@@ -1066,7 +1126,7 @@ func rebuildGroupOrder(tx *bolt.Tx) error {
 		if err := json.Unmarshal(raw, &i); err != nil {
 			return err
 		}
-		if !i.AMGroup || i.DedupeKey == "" {
+		if !i.AMGroup || i.DedupeKey == "" || i.IdentityOrigin == "legacy-unsequenced" {
 			return nil
 		}
 		return meta.Put([]byte(groupOrderKey(i)), []byte(i.ID))
@@ -1137,9 +1197,6 @@ func releaseAmbiguity(tx *bolt.Tx, operation string) error {
 	var n uint64
 	if err := json.Unmarshal(raw, &n); err != nil {
 		return err
-	}
-	if n > 0 {
-		return ErrAmbiguousGeneration
 	}
 	return nil
 }

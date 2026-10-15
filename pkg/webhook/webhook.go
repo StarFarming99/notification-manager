@@ -61,6 +61,21 @@ func New(logger log.Logger, notifierCtl *controller.Controller, alerts *store.Al
 	h.router.Get("/configs", h.handler.ListConfigs)
 	h.router.Get("/receiverWithConfig", h.handler.ListReceiverWithConfig)
 	formalAlert, formalVerify, formalNotification := h.handler.Alert, h.handler.Verify, h.handler.Notification
+	if instance := h.InstanceControl; instance != nil {
+		regular := map[string]http.HandlerFunc{"/api/v2/verify": h.handler.Verify, "/api/v2/notifications": h.handler.Notification}
+		compatibility := map[string]http.HandlerFunc{}
+		if profiles := notifierCtl.DeliveryProfiles; profiles != nil {
+			for path, handler := range regular {
+				regular[path] = profiles.Guard("formal", handler)
+				if h.FormalCompatListenAddress != "" {
+					compatibility[path] = profiles.FormalCompatibility(handler)
+				}
+			}
+		}
+		h.router.Post("/internal/instance/synchronous/forward", instance.ForwardSynchronous(regular, compatibility))
+		formalVerify = instance.Synchronous(h.WorkerTimeout, false, formalVerify)
+		formalNotification = instance.Synchronous(h.WorkerTimeout, false, formalNotification)
+	}
 	if profiles := notifierCtl.DeliveryProfiles; profiles != nil {
 		profiles.RecordAdmissionFailure = h.handler.RecordProfileAdmissionFailure
 		formalAlert = profiles.Guard("formal", formalAlert)
@@ -170,7 +185,11 @@ func (h *Webhook) runServer(ctx context.Context, address string, handler http.Ha
 		select {
 		case <-ctx.Done():
 			// Shutdown needs a fresh bounded context; ctx is already cancelled.
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			shutdownGrace := h.WorkerTimeout + 5*time.Second
+			if shutdownGrace < 10*time.Second {
+				shutdownGrace = 10 * time.Second
+			}
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 			defer cancel()
 			if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 				// Error from closing listeners, or context timeout:
