@@ -65,6 +65,10 @@ type Target struct {
 
 type Intake struct {
 	ID             string    `json:"id"`
+	DedupeKey      string    `json:"dedupe_key,omitempty"`
+	AMGroup        bool      `json:"am_group,omitempty"`
+	Generation     uint64    `json:"generation,omitempty"`
+	WindowMillis   int64     `json:"window_millis,omitempty"`
 	RequestHash    string    `json:"request_hash"`
 	AcceptedAt     time.Time `json:"accepted_at"`
 	TargetIDs      []string  `json:"target_ids"`
@@ -77,6 +81,8 @@ type Limits struct {
 	ReserveBytes uint64
 }
 type Store struct {
+	releaseMu            sync.RWMutex
+	releaseKey           []byte
 	sendMu               sync.RWMutex
 	testSendMu           sync.RWMutex
 	formalSendMu         sync.RWMutex
@@ -238,6 +244,12 @@ func Open(path string, limits Limits) (*Store, error) {
 				}
 			}
 		}
+		if err := recoverSynchronousAttempts(tx); err != nil {
+			return err
+		}
+		if err := rebuildGroupOrder(tx); err != nil {
+			return err
+		}
 		// Rebuild only the secondary lane index, retaining every frozen target.
 		return rebuildLaneIndex(tx)
 	})
@@ -314,6 +326,9 @@ func (s *Store) submit(key, requestHash string, targets []Target, terminalReason
 		return result, false, err
 	}
 	err = s.update(func(tx *bolt.Tx) error {
+		if err := releaseAdmission(tx, false, time.Now().UTC()); err != nil {
+			return err
+		}
 		if err := checkProfileAdmission(tx, snapshot); err != nil {
 			return err
 		}
@@ -335,6 +350,13 @@ func (s *Store) submit(key, requestHash string, targets []Target, terminalReason
 					var old Intake
 					if err := json.Unmarshal(intakes.Get(historical), &old); err != nil {
 						return err
+					}
+					if current := dedupe.Get([]byte(key)); current != nil && string(current) != old.ID {
+						if st, e := releaseRead(tx); e != nil {
+							return e
+						} else if st.Phase == "buffering" || st.Phase == "standby" || st.Phase == "returning" {
+							return ErrAmbiguousGeneration
+						}
 					}
 					incomplete, err := intakeIncomplete(tx, old)
 					if err != nil {
@@ -401,7 +423,17 @@ func (s *Store) submit(key, requestHash string, targets []Target, terminalReason
 			return ErrCapacity
 		}
 		now := time.Now().UTC()
-		result = Intake{ID: id, RequestHash: requestHash, AcceptedAt: now, TerminalReason: terminalReason}
+		generation := uint64(1)
+		if group {
+			var prev Intake
+			if raw := dedupe.Get([]byte(key)); raw != nil {
+				if err := json.Unmarshal(intakes.Get(raw), &prev); err != nil {
+					return err
+				}
+				generation = prev.Generation + 1
+			}
+		}
+		result = Intake{ID: id, DedupeKey: key, AMGroup: group, Generation: generation, WindowMillis: window.Milliseconds(), RequestHash: requestHash, AcceptedAt: now, TerminalReason: terminalReason}
 		seen := make(map[string]bool)
 		for _, t := range targets {
 			if err := validateProfileTarget(tx, t); err != nil {
@@ -445,6 +477,11 @@ func (s *Store) submit(key, requestHash string, targets []Target, terminalReason
 		if err := changeActiveCount(tx, len(targets)); err != nil {
 			return err
 		}
+		if group {
+			if err := tx.Bucket([]byte("meta")).Put([]byte(groupOrderKey(result)), []byte(id)); err != nil {
+				return err
+			}
+		}
 		if err := put(intakes, id, result); err != nil {
 			return err
 		}
@@ -458,6 +495,32 @@ func (s *Store) submit(key, requestHash string, targets []Target, terminalReason
 		}
 		return nil
 	})
+	if errors.Is(err, ErrAmbiguousGeneration) {
+		_ = s.update(func(tx *bolt.Tx) error {
+			meta := tx.Bucket([]byte("meta"))
+			var n uint64
+			if raw := meta.Get([]byte("instance-release-ambiguous-admissions")); raw != nil {
+				if e := json.Unmarshal(raw, &n); e != nil {
+					return e
+				}
+			}
+			if st, e := releaseRead(tx); e != nil {
+				return e
+			} else if st.OperationID != "" {
+				key := "release-ambiguity:" + st.OperationID
+				var pending uint64
+				if raw := meta.Get([]byte(key)); raw != nil {
+					if e := json.Unmarshal(raw, &pending); e != nil {
+						return e
+					}
+				}
+				if e := put(meta, key, pending+1); e != nil {
+					return e
+				}
+			}
+			return put(meta, "instance-release-ambiguous-admissions", n+1)
+		})
+	}
 	return result, duplicate, err
 }
 
@@ -474,6 +537,9 @@ func (s *Store) ClaimProfile(id string, now time.Time) (Claim, error) {
 func (s *Store) claim(now time.Time, lane string) (Claim, error) {
 	var claim Claim
 	err := s.update(func(tx *bolt.Tx) error {
+		if err := releaseSending(tx, now); err != nil {
+			return err
+		}
 		q := tx.Bucket([]byte("ready"))
 		prefix := []byte(nil)
 		if lane != "*" {
@@ -499,6 +565,11 @@ func (s *Store) claim(now time.Time, lane string) (Claim, error) {
 				return err
 			}
 			if paused {
+				continue
+			}
+			if blocked, err := groupDeliveryBlocked(tx, t); err != nil {
+				return err
+			} else if blocked {
 				continue
 			}
 			k = key
@@ -540,6 +611,9 @@ func (s *Store) ClaimForRecovery(id, actor, evidence string, now time.Time) (Cla
 		return claim, errors.New("bounded recovery actor and evidence required")
 	}
 	err := s.update(func(tx *bolt.Tx) error {
+		if err := releaseSending(tx, now); err != nil {
+			return err
+		}
 		b := tx.Bucket([]byte("targets"))
 		var t Target
 		if err := json.Unmarshal(b.Get([]byte(id)), &t); err != nil {

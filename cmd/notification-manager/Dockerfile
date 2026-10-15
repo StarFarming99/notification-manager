@@ -13,7 +13,7 @@ COPY go.sum go.sum
 RUN GOPROXY=$GOPROXY go mod download
 
 # Copy the go source
-COPY cmd/notification-manager/main.go main.go
+COPY cmd/notification-manager/ cmd/notification-manager/
 COPY cmd/jev-annotation-executor/ cmd/jev-annotation-executor/
 COPY cmd/notification-spool-recovery/ cmd/notification-spool-recovery/
 COPY cmd/operator/main.go cmd/operator/main.go
@@ -22,7 +22,7 @@ COPY pkg/ pkg/
 COPY apis/ apis/
 
 # Build
-RUN CGO_ENABLED=0 GO111MODULE=on go build -trimpath -ldflags="-s -w" -o notification-manager main.go \
+RUN CGO_ENABLED=0 GO111MODULE=on go build -trimpath -ldflags="-s -w" -o notification-manager ./cmd/notification-manager \
  && CGO_ENABLED=0 GO111MODULE=on go build -trimpath -ldflags="-s -w" -o jev-annotation-executor ./cmd/jev-annotation-executor \
  && CGO_ENABLED=0 GO111MODULE=on go build -trimpath -ldflags="-s -w" -o notification-spool-recovery ./cmd/notification-spool-recovery \
  && CGO_ENABLED=0 GO111MODULE=on go build -trimpath -ldflags="-s -w" -o notification-manager-operator ./cmd/operator

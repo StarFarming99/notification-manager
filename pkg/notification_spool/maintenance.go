@@ -48,6 +48,12 @@ func (s *Store) CleanupCompleted(retention time.Duration, batch int, now time.Ti
 	}
 	cleaned := 0
 	err := s.update(func(tx *bolt.Tx) error {
+		if err := cleanupReleaseCaches(tx, retention, batch, now); err != nil {
+			return err
+		}
+		if err := cleanupSynchronousAttempts(tx, retention, batch, now); err != nil {
+			return err
+		}
 		meta, intakes, targets := tx.Bucket([]byte("meta")), tx.Bucket([]byte("intakes")), tx.Bucket([]byte("targets"))
 		cursor := intakes.Cursor()
 		last := meta.Get([]byte("cleanup_cursor"))

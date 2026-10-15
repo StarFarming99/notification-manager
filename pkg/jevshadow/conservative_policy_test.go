@@ -3,6 +3,7 @@ package jevshadow
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -120,10 +121,22 @@ func TestConservativePolicyDoesNotWeakenExistingThresholdVerification(t *testing
 
 func TestConservativePolicyAppendsWithoutChangingOriginalCard(t *testing.T) {
 	component := conservativeComponent()
+	originalActions := map[string]interface{}{
+		"tag": "action", "actions": []interface{}{
+			map[string]interface{}{"tag": "button", "value": map[string]interface{}{"action": "ack", "alert_id": "original-alert"}},
+			map[string]interface{}{"tag": "button", "value": map[string]interface{}{"action": "group", "alert_id": "original-alert"}},
+			map[string]interface{}{"tag": "button", "value": map[string]interface{}{"action": "silence", "alert_id": "original-alert"}},
+		},
+	}
+	expectedBytes, _ := json.Marshal(originalActions)
+	var expectedActions interface{}
+	if err := json.Unmarshal(expectedBytes, &expectedActions); err != nil {
+		t.Fatal(err)
+	}
 	card, err := renderCard(map[string]interface{}{
 		"header": map[string]interface{}{"title": "original title"},
 		"elements": []interface{}{
-			map[string]interface{}{"tag": "action", "name": "original callback actions"},
+			originalActions,
 		},
 	}, map[string]AnnotationComponent{"event-1": component})
 	if err != nil {
@@ -133,11 +146,15 @@ func TestConservativePolicyAppendsWithoutChangingOriginalCard(t *testing.T) {
 		t.Fatal("original header changed")
 	}
 	elements := card["elements"].([]interface{})
-	if len(elements) != 5 || elements[0].(map[string]interface{})["name"] != "original callback actions" {
+	if len(elements) != 4 || !reflect.DeepEqual(elements[0], expectedActions) {
 		t.Fatalf("original callback actions changed: %#v", elements)
 	}
 	summary := elements[2].(map[string]interface{})["text"].(map[string]interface{})["content"].(string)
 	if !strings.Contains(summary, "Policy: Oncall · Conservative policy · Critical evidence missing") {
 		t.Fatalf("missing conservative decision: %s", summary)
+	}
+	details := elements[3].(map[string]interface{})["actions"].([]interface{})
+	if len(details) != 1 || details[0].(map[string]interface{})["url"] != "https://aiops.example.com/apps/alert-center/traces/J-v2-1" {
+		t.Fatalf("unexpected detail or card-feedback actions: %#v", details)
 	}
 }

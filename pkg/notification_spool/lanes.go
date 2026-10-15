@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sync"
+	"time"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -142,6 +143,16 @@ func (s *Store) FormalDisabled() bool { return s.formalDisabled }
 // WithProfilePermit preserves synchronous original API results and closes the
 // pause race. It never enters the test clock and does not claim a queued send.
 func (s *Store) WithProfilePermit(snap ProfileSnapshot, send func() error) error {
+	s.releaseMu.RLock()
+	defer s.releaseMu.RUnlock()
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		if err := releaseAdmission(tx, true, time.Now().UTC()); err != nil {
+			return err
+		}
+		return releaseSending(tx, time.Now().UTC())
+	}); err != nil {
+		return err
+	}
 	mu := s.profileSendMutex(snap.ID)
 	mu.RLock()
 	defer mu.RUnlock()
@@ -151,5 +162,5 @@ func (s *Store) WithProfilePermit(snap ProfileSnapshot, send func() error) error
 	if err := s.db.View(func(tx *bolt.Tx) error { return checkProfileAdmission(tx, &snap) }); err != nil {
 		return err
 	}
-	return send()
+	return s.synchronousAttempt(snap.ID, send)
 }

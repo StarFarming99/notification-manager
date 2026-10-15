@@ -30,6 +30,12 @@ func (h *HttpHandler) recordAdmissionFailure(err error, groupHash string) {
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		class = "admission_deadline"
 	}
+	if errors.Is(err, spool.ErrAmbiguousGeneration) {
+		class = "instance_generation_ambiguous"
+	}
+	if errors.Is(err, spool.ErrReleaseGate) || errors.Is(err, spool.ErrReleaseDeadline) {
+		class = "instance_release_gate"
+	}
 	h.admissionMu.Lock()
 	if h.admissionFailures == nil {
 		h.admissionFailures = map[string]uint64{}

@@ -81,9 +81,11 @@ type SenderHandoffState struct {
 	MaxGapSeconds            int64               `json:"max_gap_seconds"`
 	LastError                string              `json:"last_error,omitempty"`
 	// Old rc7 memory work cannot be enumerated. Never claim a zero-loss drain.
-	ProcessUncertainty string              `json:"process_uncertainty,omitempty"`
-	UnexpectedPods     []SenderPodEvidence `json:"unexpected_pods,omitempty"`
-	LossCount          *int64              `json:"loss_count"`
+	ProcessUncertainty string                  `json:"process_uncertainty,omitempty"`
+	UnexpectedPods     []SenderPodEvidence     `json:"unexpected_pods,omitempty"`
+	LossCount          *int64                  `json:"loss_count"`
+	PreservedTest      *PreservedTestReference `json:"preserved_test,omitempty"`
+	TestContinuity     string                  `json:"test_continuity"`
 }
 
 func handoffState(nm *v2beta2.NotificationManager) (*SenderHandoffState, error) {
@@ -489,6 +491,11 @@ func (r *NotificationManagerReconciler) reconcileHandoff(ctx context.Context, nm
 		if h.Phase != "stopped" {
 			return again, errors.New("managed handoff must start with stopped, not an unproven retired/rollback")
 		}
+		if profiledCandidate(candidate) || h.PreservedTest != nil {
+			if err := r.preservedTestReady(ctx, h.PreservedTest, &original, candidate); err != nil {
+				return again, err
+			}
+		}
 		if err := r.formalReady(ctx, candidate, nm); err != nil {
 			return again, err
 		}
@@ -503,6 +510,11 @@ func (r *NotificationManagerReconciler) reconcileHandoff(ctx context.Context, nm
 			return again, errors.New("sealed sender replica counts missing")
 		}
 		s = &SenderHandoffState{OperationID: h.OperationID, CandidateUID: h.DeploymentUID, CandidateName: h.Deployment, CandidateSelector: h.Selector, OriginalUID: h.OriginalDeploymentUID, StableServiceUID: h.StableServiceUID, OriginalReplicas: *original.Spec.Replicas, CandidateReplicas: *candidate.Spec.Replicas, Stage: "stop-requested", StartedAt: metav1.Now(), OldPods: oldPods, StopTimeoutSeconds: h.StopTimeoutSeconds, MaxGapSeconds: h.MaxGapSeconds}
+		s.PreservedTest = h.PreservedTest
+		s.TestContinuity = "legacy_unverified"
+		if h.PreservedTest != nil {
+			s.TestContinuity = "independent_test_sender_verified"
+		}
 		if executor != nil {
 			s.ExecutorName = h.ExecutorDeployment
 			s.ExecutorUID = h.ExecutorDeploymentUID
@@ -514,6 +526,9 @@ func (r *NotificationManagerReconciler) reconcileHandoff(ctx context.Context, nm
 	}
 	if s.OperationID != h.OperationID || s.CandidateUID != h.DeploymentUID || s.CandidateName != h.Deployment || s.ExecutorName != h.ExecutorDeployment || s.ExecutorUID != h.ExecutorDeploymentUID || !reflect.DeepEqual(s.CandidateSelector, h.Selector) || s.OriginalUID != h.OriginalDeploymentUID || s.StableServiceUID != h.StableServiceUID || s.StopTimeoutSeconds != h.StopTimeoutSeconds || s.MaxGapSeconds != h.MaxGapSeconds {
 		return again, errors.New("handoff immutable operation/identity/budget differs from persistent state")
+	}
+	if !reflect.DeepEqual(s.PreservedTest, h.PreservedTest) {
+		return again, errors.New("protected test sender differs from persistent sealed handoff identity")
 	}
 	if s.ProcessUncertainty != "" {
 		// Keep the sealed stop intent enforced while waiting for manual recovery.
@@ -546,6 +561,13 @@ func (r *NotificationManagerReconciler) reconcileHandoff(ctx context.Context, nm
 		return again, err
 	}
 	if h.Phase == "stopped" || h.Phase == "retired" {
+		if profiledCandidate(candidate) || s.PreservedTest != nil {
+			if err := r.preservedTestReady(ctx, s.PreservedTest, &original, candidate); err != nil {
+				s.TestContinuity = "blocked"
+				return fail(err)
+			}
+			s.TestContinuity = "independent_test_sender_verified"
+		}
 		if s.RollbackStartedAt != nil {
 			return fail(errors.New("rolled-back operation cannot reactivate formal sender"))
 		}
@@ -634,6 +656,16 @@ func (r *NotificationManagerReconciler) reconcileHandoff(ctx context.Context, nm
 		return again, r.saveState(ctx, nm, s)
 	}
 	if h.Phase == "rollback" || h.Phase == "test-restored" {
+		// Test-health drift must be reported without blocking the existing safe
+		// production rollback and its normal process-exit proof.
+		if s.PreservedTest != nil {
+			s.TestContinuity = "independent_test_sender_verified"
+			if err := r.preservedTestReady(ctx, s.PreservedTest, &original, candidate); err != nil {
+				s.TestContinuity = "blocked"
+			}
+		} else if profiledCandidate(candidate) {
+			s.TestContinuity = "legacy_shared_test_not_continuous"
+		}
 		if s.RollbackStartedAt == nil {
 			if h.Phase != "rollback" {
 				return fail(errors.New("test restoration requires completed managed rollback"))
@@ -724,6 +756,25 @@ func (r *NotificationManagerReconciler) reconcileHandoff(ctx context.Context, nm
 		if h.Phase == "test-restored" {
 			if s.RolledBackAt == nil || s.CandidateExitVerifiedAt == nil {
 				return fail(errors.New("candidate test restoration requires completed rollback exit proof"))
+			}
+			if s.PreservedTest != nil {
+				if s.TestContinuity != "independent_test_sender_verified" {
+					return fail(errors.New("independent test sender must remain Ready; formal candidate is not its replacement"))
+				}
+				if err := r.holdReplicas(ctx, candidate, 0, s.OperationID); err != nil {
+					return fail(err)
+				}
+				if err := r.holdReplicas(ctx, &original, s.OriginalReplicas, ""); err != nil {
+					return fail(err)
+				}
+				if !deploymentReady(&original) {
+					return fail(errors.New("original backend not Ready"))
+				}
+				s.Stage, s.LastError = "test-restored", ""
+				if err := r.createManagedHandoffService(ctx, nm, h, *r.makeCommonLabels(nm)); err != nil {
+					return fail(err)
+				}
+				return again, r.saveState(ctx, nm, s)
 			}
 			if !formalDisabled(candidate) {
 				return fail(errors.New("test restoration requires NM_FORMAL_DISABLED=true durable startup fence"))

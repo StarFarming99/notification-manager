@@ -13,6 +13,7 @@ import (
 	"github.com/kubesphere/notification-manager/pkg/controller"
 	"github.com/kubesphere/notification-manager/pkg/deliveryprofiles"
 	"github.com/kubesphere/notification-manager/pkg/dispatcher"
+	"github.com/kubesphere/notification-manager/pkg/instancecontrol"
 	"github.com/kubesphere/notification-manager/pkg/jevshadow"
 	feishunotifier "github.com/kubesphere/notification-manager/pkg/notify/notifier/feishu"
 	"github.com/kubesphere/notification-manager/pkg/store"
@@ -173,6 +174,11 @@ func Main() int {
 		return 1
 	}
 	defer alerts.FinalClose()
+	instance, err := instancecontrol.FromEnv(alerts.Durable)
+	if err != nil {
+		_ = level.Error(logger).Log("msg", "Instance release protocol failed to initialize", "error", err)
+		return 1
+	}
 	ctl.DeliveryProfiles, err = deliveryprofiles.FromEnv(alerts.Durable)
 	if err != nil {
 		_ = level.Error(logger).Log("msg", "Delivery profiles failed to initialize", "error", err)
@@ -190,6 +196,7 @@ func Main() int {
 			WorkerTimeout:             *wkrTimeout,
 			FormalCompatListenAddress: os.Getenv("NM_FORMAL_COMPAT_LISTEN_ADDRESS"),
 			FormalCompatSourceCIDRs:   splitNonempty(os.Getenv("NM_FORMAL_COMPAT_SOURCE_CIDRS")),
+			InstanceControl:           instance,
 		})
 
 	if err := webhook.PrepareInitialProfiles(ctlCtx); err != nil {

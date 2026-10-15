@@ -11,6 +11,7 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/kubesphere/notification-manager/pkg/controller"
+	"github.com/kubesphere/notification-manager/pkg/instancecontrol"
 	"github.com/kubesphere/notification-manager/pkg/store"
 	v1 "github.com/kubesphere/notification-manager/pkg/webhook/v1"
 )
@@ -21,6 +22,7 @@ type Options struct {
 	WorkerTimeout             time.Duration
 	FormalCompatListenAddress string
 	FormalCompatSourceCIDRs   []string
+	InstanceControl           *instancecontrol.Manager
 }
 
 type Webhook struct {
@@ -46,6 +48,15 @@ func New(logger log.Logger, notifierCtl *controller.Controller, alerts *store.Al
 	// h.router.Use(middleware.Logger)
 	h.router.Use(middleware.Recoverer)
 	h.router.Use(middleware.Timeout(2 * h.WebhookTimeout))
+	if instance := h.InstanceControl; instance != nil {
+		h.router.Get("/internal/instance", instance.ReadGuard(instance.Status))
+		h.router.Post("/internal/instance/control", instance.ControlGuard(instance.Control))
+		h.router.Post("/internal/instance/export", instance.ControlGuard(instance.Export))
+		h.router.Get("/internal/instance/export", instance.ControlGuard(instance.ReadExport))
+		h.router.Post("/internal/instance/import", instance.ControlGuard(instance.Import))
+		h.router.Get("/internal/instance/synchronous", instance.ControlGuard(instance.SynchronousAttempts))
+		h.router.Post("/internal/instance/synchronous/resolve", instance.ControlGuard(instance.ResolveSynchronous))
+	}
 	h.router.Get("/receivers", h.handler.ListReceivers)
 	h.router.Get("/configs", h.handler.ListConfigs)
 	h.router.Get("/receiverWithConfig", h.handler.ListReceiverWithConfig)

@@ -138,6 +138,10 @@ func (h *HttpHandler) ServeFormalReadiness(w http.ResponseWriter, _ *http.Reques
 		http.Error(w, "formal unavailable", 503)
 		return
 	}
+	// Receive-ready standby is deliberately not a formal send-ready proof.
+	if h.rejectInstanceAdmission(w, true) {
+		return
+	}
 	snap, err := profiles.Store.ProfileSnapshot("formal")
 	if err != nil {
 		http.Error(w, "formal profile not active", 503)

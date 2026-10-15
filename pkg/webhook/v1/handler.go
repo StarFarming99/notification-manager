@@ -59,6 +59,9 @@ func (h *HttpHandler) Alert(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		_ = r.Body.Close()
 	}()
+	if h.rejectInstanceAdmission(w, false) {
+		return
+	}
 
 	// Parse alerts sent through Alertmanager webhook, more detail please refer to
 	// https://github.com/prometheus/alertmanager/blob/master/template/template.go#L231
@@ -139,6 +142,11 @@ func (h *HttpHandler) Alert(w http.ResponseWriter, r *http.Request) {
 			groupHash, _ := CanonicalAMGroup(raw)
 			h.recordAdmissionFailure(err, groupHash)
 			w.Header().Set("Retry-After", "1")
+			if errors.Is(err, spool.ErrAmbiguousGeneration) {
+				w.Header().Set("X-NM-Rejection-Code", "instance_generation_ambiguous")
+				h.handle(w, &response{http.StatusServiceUnavailable, "Notification generation is ambiguous across release; retry and reconciliation required"})
+				return
+			}
 			h.handle(w, &response{http.StatusServiceUnavailable, "Notification frozen plan could not be persisted"})
 			return
 		}
@@ -186,6 +194,9 @@ func (h *HttpHandler) ServeHealthCheck(w http.ResponseWriter, _ *http.Request) {
 func (h *HttpHandler) ServeReadinessCheck(w http.ResponseWriter, _ *http.Request) {
 	if !h.alerts.Accepting() {
 		h.handle(w, &response{http.StatusServiceUnavailable, "Original notification intake stopping"})
+		return
+	}
+	if h.rejectInstanceAdmission(w, false) {
 		return
 	}
 	if profiles := h.notifierCtl.DeliveryProfiles; profiles != nil {
@@ -288,6 +299,9 @@ func (h *HttpHandler) ListReceiverWithConfig(w http.ResponseWriter, r *http.Requ
 }
 
 func (h *HttpHandler) Verify(w http.ResponseWriter, r *http.Request) {
+	if h.rejectInstanceAdmission(w, true) {
+		return
+	}
 
 	m := make(map[string]interface{})
 	if err := utils.JsonDecode(io.LimitReader(r.Body, 2<<20), &m); err != nil {
@@ -316,20 +330,17 @@ func (h *HttpHandler) Verify(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	requestRaw, _ := json.Marshal(m)
-	if msg := h.send(r.Context(), receivers, alerts, constants.Verify, r.Header.Get("Idempotency-Key"), spool.Hash(requestRaw)); msg != "" {
-		h.handle(w, &response{http.StatusBadRequest, msg})
-		return
-	}
-
-	if h.alerts.Durable != nil && !formalAPI(r.Context()) {
-		h.handle(w, &response{http.StatusOK, "Verification notification accepted for durable delivery"})
+	if err := h.send(r.Context(), receivers, alerts, constants.Verify); err != nil {
+		h.sendFailure(w, err)
 		return
 	}
 	h.handle(w, &response{http.StatusOK, "Verify successfully"})
 }
 
 func (h *HttpHandler) Notification(w http.ResponseWriter, r *http.Request) {
+	if h.rejectInstanceAdmission(w, true) {
+		return
+	}
 
 	m := make(map[string]interface{})
 	if err := utils.JsonDecode(io.LimitReader(r.Body, 2<<20), &m); err != nil {
@@ -361,14 +372,8 @@ func (h *HttpHandler) Notification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	requestRaw, _ := json.Marshal(m)
-	if msg := h.send(r.Context(), receivers, d.Alerts, constants.Notification, r.Header.Get("Idempotency-Key"), spool.Hash(requestRaw)); msg != "" {
-		h.handle(w, &response{http.StatusBadRequest, msg})
-		return
-	}
-
-	if h.alerts.Durable != nil && !formalAPI(r.Context()) {
-		h.handle(w, &response{http.StatusOK, "Notification accepted for durable delivery"})
+	if err := h.send(r.Context(), receivers, d.Alerts, constants.Notification); err != nil {
+		h.sendFailure(w, err)
 		return
 	}
 	h.handle(w, &response{http.StatusOK, "Send alerts successfully"})
@@ -410,15 +415,10 @@ func (h *HttpHandler) getReceiversFromRequest(m map[string]interface{}) ([]inter
 	return receivers, nil
 }
 
-func (h *HttpHandler) send(parent context.Context, receivers []internal.Receiver, alerts template.Alerts, seq, key, hash string) string {
-	if h.alerts.Durable != nil && !formalAPI(parent) {
-		_, err := h.acceptDurable(parent, alerts, receivers, key, hash)
-		if err != nil {
-			h.recordAdmissionFailure(err, "")
-			return "Original notification durable intake unavailable"
-		}
-		return ""
-	}
+// Notification and Verify retain the original synchronous platform-result
+// contract. Buffering an Alertmanager webhook does not authorize reporting
+// these APIs successful before their actual platform request has completed.
+func (h *HttpHandler) send(parent context.Context, receivers []internal.Receiver, alerts template.Alerts, seq string) error {
 	ctx, cancel := context.WithTimeout(parent, h.wkrTimeout)
 	ctx = context.WithValue(ctx, "seq", seq)
 	defer cancel()
@@ -429,6 +429,20 @@ func (h *HttpHandler) send(parent context.Context, receivers []internal.Receiver
 		val[receiver] = alerts
 	}
 	send := func() error {
+		// This callback runs inside the atomic instance send permit. Bound the
+		// original synchronous request by the frozen release deadline as well as
+		// its original worker and caller budgets; never renew the operation.
+		if h.alerts.Durable != nil {
+			state, err := h.alerts.Durable.ReleaseStatus()
+			if err != nil {
+				return err
+			}
+			if state.Phase == "releasing" && !state.Deadline.IsZero() {
+				bounded, stop := context.WithDeadline(ctx, state.Deadline)
+				defer stop()
+				ctx = bounded
+			}
+		}
 		_, output, err := pipeline.Exec(ctx, h.logger, val)
 		if err != nil {
 			return err
@@ -443,22 +457,40 @@ func (h *HttpHandler) send(parent context.Context, receivers []internal.Receiver
 		_, _, err = notify.NewStage(h.notifierCtl).Exec(ctx, h.logger, output)
 		return err
 	}
-	var err error
 	if snap, ok := deliveryprofiles.Snapshot(parent); ok && snap.ID == "formal" {
 		if !h.alerts.Accepting() {
-			return "Notification intake is stopping"
+			return errors.New("notification intake is stopping")
 		}
-		// Keep original synchronous sending/error semantics. A paused profile cannot
-		// admit a late API call and no test backlog or test clock is involved.
-		err = h.alerts.Durable.WithProfilePermit(*snap, send)
-	} else {
-		err = send()
+		// WithProfilePermit holds the instance and profile boundaries together.
+		// Do not nest another instance RLock: a queued release writer could
+		// otherwise deadlock a nested read lock during an in-flight API call.
+		return h.alerts.Durable.WithProfilePermit(*snap, send)
 	}
-	if err != nil {
-		return err.Error()
+	if h.alerts.Durable != nil {
+		return h.alerts.Durable.WithInstancePermit(true, send)
 	}
+	return send()
+}
 
-	return ""
+func (h *HttpHandler) rejectInstanceAdmission(w http.ResponseWriter, synchronous bool) bool {
+	if h.alerts.Durable == nil {
+		return false
+	}
+	if err := h.alerts.Durable.AdmissionAllowed(synchronous); err != nil {
+		w.Header().Set("Retry-After", "1")
+		h.handle(w, &response{http.StatusServiceUnavailable, "Instance release gate is not accepting this request; retry required"})
+		return true
+	}
+	return false
+}
+
+func (h *HttpHandler) sendFailure(w http.ResponseWriter, err error) {
+	if errors.Is(err, spool.ErrReleaseGate) || errors.Is(err, spool.ErrReleaseDeadline) {
+		w.Header().Set("Retry-After", "1")
+		h.handle(w, &response{http.StatusServiceUnavailable, "Instance release gate prevented platform sending; retry required"})
+		return
+	}
+	h.handle(w, &response{http.StatusBadRequest, err.Error()})
 }
 
 // acceptDurable executes the original pipeline only as far as aggregation. The
@@ -559,9 +591,4 @@ func (h *HttpHandler) acceptDurable(parent context.Context, alerts template.Aler
 	}
 	intake, _, err := h.alerts.Durable.Submit(key, hash, targets, terminal)
 	return intake, err
-}
-
-func formalAPI(ctx context.Context) bool {
-	snap, ok := deliveryprofiles.Snapshot(ctx)
-	return ok && snap.ID == "formal"
 }

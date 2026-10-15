@@ -18,10 +18,15 @@ func (e *SendBudgetDeferred) Error() string { return "notification send budget n
 // unprofiled legacy sends keep their existing throughput. Pause waits for any
 // call already inside this boundary and prevents every later claimed send.
 func (s *Store) WithSendPermit(c Claim, interval time.Duration, now time.Time, send func() error) error {
+	s.releaseMu.RLock()
+	defer s.releaseMu.RUnlock()
 	mu := s.profileSendMutex(c.Target.ProfileID)
 	mu.RLock()
 	defer mu.RUnlock()
 	err := s.update(func(tx *bolt.Tx) error {
+		if err := releaseSending(tx, now); err != nil {
+			return err
+		}
 		b := tx.Bucket([]byte("targets"))
 		var t Target
 		if err := json.Unmarshal(b.Get([]byte(c.Target.ID)), &t); err != nil {

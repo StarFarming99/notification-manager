@@ -88,6 +88,12 @@ func (d *Dispatcher) durableWorkerLane(lane string) {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
+		if errors.Is(err, spool.ErrReleaseGate) || errors.Is(err, spool.ErrReleaseDeadline) {
+			// A receive-ready standby or persistently retired instance is a normal
+			// protocol state. It must not claim work, emit send errors, or spin.
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
 		if err != nil {
 			_ = level.Error(d.l).Log("msg", "Original notification claim failed")
 			time.Sleep(time.Second)

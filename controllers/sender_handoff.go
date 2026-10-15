@@ -35,9 +35,10 @@ type SenderHandoff struct {
 	StopTimeoutSeconds    int64             `json:"stop_timeout_seconds"`
 	MaxGapSeconds         int64             `json:"max_gap_seconds"`
 	// Kept for older clients; free text never substitutes for process evidence.
-	ExecutorDeployment    string `json:"executor_deployment,omitempty"`
-	ExecutorDeploymentUID string `json:"executor_deployment_uid,omitempty"`
-	DrainEvidence         string `json:"drain_evidence,omitempty"`
+	ExecutorDeployment    string                  `json:"executor_deployment,omitempty"`
+	ExecutorDeploymentUID string                  `json:"executor_deployment_uid,omitempty"`
+	DrainEvidence         string                  `json:"drain_evidence,omitempty"`
+	PreservedTest         *PreservedTestReference `json:"preserved_test,omitempty"`
 }
 
 func handoffIntent(nm *v2beta2.NotificationManager) (*SenderHandoff, error) {
