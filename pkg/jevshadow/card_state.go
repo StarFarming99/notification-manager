@@ -57,23 +57,24 @@ type cardPatchIntent struct {
 }
 
 type cardPersistentState struct {
-	MemberScope        *cardMemberScope                   `json:"member_scope,omitempty"`
-	Version            int                                `json:"version"`
-	MessageID          string                             `json:"message_id"`
-	Receiver           string                             `json:"receiver"`
-	Destination        string                             `json:"destination"`
-	SenderApp          string                             `json:"sender_app"`
-	BaseCard           map[string]interface{}             `json:"base_card"`
-	BaseRevision       int                                `json:"base_revision"`
-	BaseSendState      string                             `json:"base_send_state"`
-	AnnotationRevision int                                `json:"annotation_revision"`
-	Annotations        map[string]AnnotationComponent     `json:"annotations"`
-	AppliedKeys        map[string]persistedAppliedRequest `json:"applied_keys"`
-	PatchSendState     string                             `json:"patch_send_state"`
-	PendingPatch       *cardPatchIntent                   `json:"pending_patch,omitempty"`
-	LastPatchError     string                             `json:"last_patch_error,omitempty"`
-	CreatedAt          time.Time                          `json:"created_at"`
-	UpdatedAt          time.Time                          `json:"updated_at"`
+	ConfirmedRendererVersion string                             `json:"confirmed_renderer_version,omitempty"`
+	MemberScope              *cardMemberScope                   `json:"member_scope,omitempty"`
+	Version                  int                                `json:"version"`
+	MessageID                string                             `json:"message_id"`
+	Receiver                 string                             `json:"receiver"`
+	Destination              string                             `json:"destination"`
+	SenderApp                string                             `json:"sender_app"`
+	BaseCard                 map[string]interface{}             `json:"base_card"`
+	BaseRevision             int                                `json:"base_revision"`
+	BaseSendState            string                             `json:"base_send_state"`
+	AnnotationRevision       int                                `json:"annotation_revision"`
+	Annotations              map[string]AnnotationComponent     `json:"annotations"`
+	AppliedKeys              map[string]persistedAppliedRequest `json:"applied_keys"`
+	PatchSendState           string                             `json:"patch_send_state"`
+	PendingPatch             *cardPatchIntent                   `json:"pending_patch,omitempty"`
+	LastPatchError           string                             `json:"last_patch_error,omitempty"`
+	CreatedAt                time.Time                          `json:"created_at"`
+	UpdatedAt                time.Time                          `json:"updated_at"`
 }
 
 type cardStateStore struct {
@@ -261,6 +262,12 @@ func validateCardPersistentState(state cardPersistentState) error {
 	}
 	if state.Receiver == "" || state.Destination == "" || state.SenderApp == "" {
 		return errors.New("card state is missing writer identity")
+	}
+	if state.ConfirmedRendererVersion != "" && state.ConfirmedRendererVersion != rendererLegacyMember && state.ConfirmedRendererVersion != rendererCardSummary {
+		return errors.New("invalid confirmed renderer version")
+	}
+	if state.ConfirmedRendererVersion != "" && state.AnnotationRevision == 0 {
+		return errors.New("confirmed renderer has no annotation revision")
 	}
 	if state.BaseRevision < 1 || state.AnnotationRevision < 0 || state.BaseSendState != baseSendConfirmed {
 		return errors.New("invalid card state revision or base send state")

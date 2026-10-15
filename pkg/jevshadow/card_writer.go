@@ -314,6 +314,7 @@ func (s *Service) applyPersistentAnnotation(
 			}
 
 			state.Annotations = annotations
+			state.ConfirmedRendererVersion = rendererCardSummary
 			state.AnnotationRevision = component.AnnotationRevision
 			state.AppliedKeys[idempotencyKey] = persistedAppliedRequest{PayloadHash: payloadHash, RequestID: resultID}
 			state.PatchSendState = patchSendConfirmed

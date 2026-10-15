@@ -68,7 +68,25 @@ func (s *Service) HandleAnnotationStatus(w http.ResponseWriter, r *http.Request,
 		w.WriteHeader(503)
 		return
 	}
-	writeJSON(w, 200, map[string]interface{}{
+	projection := r.URL.Query().Get("projection")
+	if projection != "" && projection != rendererCardSummary {
+		writeJSON(w, 400, map[string]string{"error": "unsupported annotation projection"})
+		return
+	}
+	var projectionData map[string]interface{}
+	if projection == rendererCardSummary {
+		if scope := state.MemberScope; scope != nil && (scope.PermissionDomain != selected.config.PermissionDomain || scope.ProfileID != id || scope.ProfileVersion != version || scope.CardOwnerID != selected.config.CardOwnerID || (scope.ExecutionDomain != "" && scope.ExecutionDomain != selected.config.ExecutionDomain)) {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		offset, limit, parseErr := cardProjectionPage(r)
+		if parseErr != nil {
+			writeJSON(w, 400, map[string]string{"error": parseErr.Error()})
+			return
+		}
+		projectionData = selected.confirmedCardProjection(state, offset, limit)
+	}
+	out := map[string]interface{}{
 		"profile_id": id, "profile_version": version, "card_owner_id": selected.config.CardOwnerID,
 		"sender_app": app, "message_id": messageID, "base_revision": state.BaseRevision,
 		"requested_annotation_revision": revision, "annotation_revision": state.AnnotationRevision,
@@ -76,5 +94,9 @@ func (s *Service) HandleAnnotationStatus(w http.ResponseWriter, r *http.Request,
 		"base_card_hash": baseHash, "annotation_payload_hash": payloadHash, "request_id": requestID,
 		"confirmed":  revision > 0 && payloadHash != "" && requestID != "" && state.AnnotationRevision >= revision,
 		"updated_at": state.UpdatedAt,
-	})
+	}
+	if projectionData != nil {
+		out["card_projection"] = projectionData
+	}
+	writeJSON(w, 200, out)
 }

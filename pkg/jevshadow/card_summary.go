@@ -24,6 +24,7 @@ const (
 // It is captured from the exact successfully delivered Alert set, using the
 // same canonical identity functions as the receipt. It never parses card text.
 type cardMemberScope struct {
+	ExecutionDomain       string            `json:"execution_domain,omitempty"`
 	ExpectedCardBindingID string            `json:"expected_card_binding_id"`
 	PermissionDomain      string            `json:"permission_domain"`
 	ProfileID             string            `json:"profile_id"`
@@ -75,7 +76,7 @@ func (s *Service) cardScopeFromReceipt(data *template.Data, receipt deliveryRece
 		id := occurrenceV2(episode, alert)
 		actual[id] = cardScopeMember{EventID: id, EpisodeID: episode, Fingerprint: alert.ID, StartsAt: alert.StartsAt.UTC(), Status: alert.Status}
 	}
-	scope := &cardMemberScope{ExpectedCardBindingID: cardBindingID(receipt.SenderApp, receipt.MessageID), PermissionDomain: receipt.PermissionDomain, ProfileID: receipt.ProfileID, ProfileVersion: receipt.ProfileVersion,
+	scope := &cardMemberScope{ExecutionDomain: receipt.ExecutionDomain, ExpectedCardBindingID: cardBindingID(receipt.SenderApp, receipt.MessageID), PermissionDomain: receipt.PermissionDomain, ProfileID: receipt.ProfileID, ProfileVersion: receipt.ProfileVersion,
 		CardOwnerID: receipt.CardOwnerID, SenderApp: receipt.SenderApp, Receiver: "", Destination: receipt.Destination,
 		BaseRevision: receipt.BaseCardRevision, BaseCardHash: receipt.BaseCardSnapshotHash, Complete: true, Members: make([]cardScopeMember, 0, len(receipt.Members))}
 	seen := make(map[string]bool)
