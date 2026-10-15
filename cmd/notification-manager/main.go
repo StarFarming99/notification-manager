@@ -219,30 +219,46 @@ func Main() int {
 
 	termCh := make(chan os.Signal, 1)
 	signal.Notify(termCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(termCh)
+	stop := func() {
+		_ = alerts.Close()
+		cancelHttp()
+		cancelFeedback()
+	}
+	httpStopped, dispatcherStopped := false, false
 
-	for {
+	// Dispatcher handoff can finish immediately on a retired generation.
+	// Its completion does not imply that synchronous HTTP forwarding drained.
+	// Keep the controller and ledger alive until both owners have exited.
+	for !httpStopped || !dispatcherStopped {
 		select {
 		case <-termCh:
 			_ = level.Info(logger).Log("msg", "Received SIGTERM, exiting gracefully...")
-			_ = alerts.Close()
-			cancelHttp()
-			cancelFeedback()
+			stop()
 		case err := <-feedbackCh:
 			if err != nil {
 				_ = level.Error(logger).Log("msg", "Jev feedback listener exited", "error", err)
 			}
 			feedbackCh = nil
 		case err := <-srvCh:
+			srvCh = nil
+			httpStopped = true
 			if err != nil {
 				_ = level.Error(logger).Log("msg", "Abnormal exit", "error", err.Error())
 			}
-			_ = alerts.Close()
-			_ = level.Info(logger).Log("msg", "Store closed")
-		case <-dispCh:
+			stop()
+			_ = level.Info(logger).Log("msg", "HTTP server drained")
+		case err := <-dispCh:
+			dispCh = nil
+			dispatcherStopped = true
+			if err != nil {
+				_ = level.Error(logger).Log("msg", "Dispatcher exit failed", "error", err.Error())
+			}
+			stop()
 			_ = level.Info(logger).Log("msg", "Dispatcher closed")
-			return 0
 		}
 	}
+	return 0
 }
 
 func main() {
