@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -198,6 +199,69 @@ func TestNativeLifecycleStatusOnlyAssessmentUsesExactlyBoundGroupDetail(t *testi
 	state, _ := s.cardStore.Load("om-native-group")
 	if state.GroupComponent == nil || state.GroupComponent.AssessmentID == nil || *state.GroupComponent.AssessmentID != assessment {
 		t.Fatal("status-only group subject not retained")
+	}
+}
+
+func TestNativeGroupRoundedTwoDecimalDistributionContract(t *testing.T) {
+	values := func(a, b, c, d float64) map[string]float64 {
+		return map[string]float64{"all_can_wait": a, "needs_action": b, "needs_member_verification": c, "insufficient_evidence": d}
+	}
+	cases := []struct {
+		name, decision string
+		values         map[string]float64
+		valid          bool
+	}{
+		{"sum-099", "needs_action", values(.33, .33, .33, 0), true},
+		{"sum-100", "needs_action", values(.25, .25, .25, .25), true},
+		{"sum-101", "needs_action", values(.34, .34, .33, 0), true},
+		{"sum-098", "needs_action", values(.32, .33, .33, 0), false},
+		{"sum-102", "needs_action", values(.34, .34, .34, 0), false},
+		{"not-two-decimals-even-sum-one", "needs_member_verification", values(.333, .333, .334, 0), false},
+		{"not-max-choice", "all_can_wait", values(.1, .8, .05, .05), false},
+		{"nan", "needs_action", values(.1, math.NaN(), .1, .1), false},
+		{"infinite", "needs_action", values(.1, math.Inf(1), .1, .1), false},
+		{"out-of-range", "needs_action", values(-.01, 1.01, 0, 0), false},
+		{"unknown-choice", "wrong", values(.25, .25, .25, .25), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateGroupDistribution(&GroupRiskResult{Decision: tc.decision, Probabilities: tc.values})
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%v err=%v", tc.valid, err)
+			}
+		})
+	}
+	extra := values(.25, .25, .25, .25)
+	extra["extra"] = 0
+	if err := validateGroupDistribution(&GroupRiskResult{Decision: "needs_action", Probabilities: extra}); err == nil {
+		t.Fatal("extra probability accepted")
+	}
+	delete(extra, "extra")
+	delete(extra, "all_can_wait")
+	if err := validateGroupDistribution(&GroupRiskResult{Decision: "needs_action", Probabilities: extra}); err == nil {
+		t.Fatal("missing probability accepted")
+	}
+}
+
+func TestNativeGroupRoundedDistributionStaysOriginalInConfirmedState(t *testing.T) {
+	s, cfg, snapshot, calls, last := nativeGroupFixture(t, 2)
+	c := nativeGroupComponent(snapshot, "om-native-group", 1, 0)
+	c.GroupResult.Probabilities = map[string]float64{"all_can_wait": .33, "needs_action": .33, "needs_member_verification": .33, "insufficient_evidence": 0}
+	if _, err := s.applyGroupAnnotation(context.Background(), "om-native-group", "rounded-group-distribution", c); err != nil {
+		t.Fatal(err)
+	}
+	state, _ := s.cardStore.Load("om-native-group")
+	if state.GroupComponent.GroupResult.Probabilities["needs_action"] != .33 || calls.Load() != 1 {
+		t.Fatal("group result changed during storage")
+	}
+	text := nativeCardText(t, *last)
+	if !strings.Contains(text, "合计99%") || strings.Count(text, "组概率：") != 1 {
+		t.Fatal(text)
+	}
+	projection := nativeProjection(t, s, cfg)
+	if path := os.Getenv("JEV_GROUP_ROUNDED_PROJECTION_OUTPUT"); path != "" {
+		raw, _ := json.MarshalIndent(projection, "", "  ")
+		_ = os.WriteFile(path, append(raw, '\n'), 0600)
 	}
 }
 func TestNativeGroupMixedLifecycleAllowsOnlyMatchingRiskEpoch(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -43,6 +44,35 @@ type GroupRiskResult struct {
 	Probabilities      map[string]float64 `json:"probabilities"`
 	ExceptionMemberIDs []string           `json:"exception_member_ids"`
 }
+
+// Group probabilities preserve TypeSafe's explicit two-decimal response. They
+// are never renormalized: only 0.99/1.00/1.01 totals whose rounding intervals can
+// contain one are accepted. Keep the legacy component validator unchanged.
+func validateGroupDistribution(result *GroupRiskResult) error {
+	if result == nil || len(result.Probabilities) != len(groupDecisions) {
+		return ErrInvalidPayload
+	}
+	chosen, ok := result.Probabilities[result.Decision]
+	if !ok || !validProbability(chosen) {
+		return ErrInvalidPayload
+	}
+	totalCents := 0
+	lower, upper := 0.0, 0.0
+	for _, choice := range groupDecisions {
+		value, ok := result.Probabilities[choice]
+		if !ok || !validProbability(value) || chosen < value || math.Abs(value*100-math.Round(value*100)) > 1e-9 {
+			return ErrInvalidPayload
+		}
+		totalCents += int(math.Round(value * 100))
+		lower += math.Max(0, value-0.005)
+		upper += math.Min(1, value+0.005)
+	}
+	if totalCents < 99 || totalCents > 101 || lower > 1+1e-9 || upper < 1-1e-9 {
+		return ErrInvalidPayload
+	}
+	return nil
+}
+
 type GroupLifecycleMember struct {
 	EventID           string  `json:"event_id"`
 	EpisodeID         string  `json:"episode_id"`
@@ -211,7 +241,7 @@ func (c GroupAnnotationComponent) validate(snapshot *FinalSnapshot, messageID st
 			return ErrInvalidPayload
 		}
 		result := c.GroupResult
-		if err := validateChoiceAnswer(&ChoiceAnswer{Choice: result.Decision, Probabilities: result.Probabilities}, groupDecisions); err != nil {
+		if err := validateGroupDistribution(result); err != nil {
 			return err
 		}
 		if result.PolicyAction != "pool_candidate" && result.PolicyAction != "oncall" && result.PolicyAction != "original" {
@@ -489,6 +519,13 @@ func renderGroupCard(snapshot groupRenderSnapshot) (map[string]interface{}, erro
 		}
 		lines = append(lines, "**Jev 组判断："+conclusion+"**", fmt.Sprintf("覆盖%d条成员 · 有效firing %d条 · 已恢复%d条 · 待核对%d条 · 异常成员%d条", c.MemberCount, c.ActiveMemberCount, c.ResolvedMemberCount, c.MemberCount-c.ActiveMemberCount-c.ResolvedMemberCount, len(c.GroupResult.ExceptionMemberIDs)))
 		lines = append(lines, fmt.Sprintf("组概率：可等待 %s · 需处理 %s · 待核实 %s · 证据不足 %s", formatProbability(c.GroupResult.Probabilities["all_can_wait"]), formatProbability(c.GroupResult.Probabilities["needs_action"]), formatProbability(c.GroupResult.Probabilities["needs_member_verification"]), formatProbability(c.GroupResult.Probabilities["insufficient_evidence"])))
+		total := 0.0
+		for _, choice := range groupDecisions {
+			total += c.GroupResult.Probabilities[choice]
+		}
+		if math.Abs(total-1) > 1e-9 {
+			lines = append(lines, fmt.Sprintf("概率为两位小数舍入值，合计%.0f%%，保持原始数值。", total*100))
+		}
 		lines = append(lines, "配置："+c.Versions.Template+" / "+c.Versions.Policy)
 	}
 	lines = append(lines, "证据截止："+c.AsOf, "仍按原告警流程通知")
