@@ -87,8 +87,25 @@ func (h *HttpHandler) Alert(w http.ResponseWriter, r *http.Request) {
 		h.handle(w, &response{http.StatusServiceUnavailable, "Notification intake is stopping"})
 		return
 	}
+	// Only the server-authenticated profile may opt into new group metadata.
+	// Client-provided references are discarded rather than trusted as AM facts.
+	var amRef *template.AMInputReference
+	if snap, ok := deliveryprofiles.Snapshot(r.Context()); ok {
+		if shadow := h.notifierCtl.GetJevShadow(); shadow != nil && shadow.GroupModeForProfile(snap.ID, snap.Version, snap.CardOwnerID) {
+			var original struct {
+				Receiver    string      `json:"receiver"`
+				GroupKey    string      `json:"groupKey"`
+				GroupLabels template.KV `json:"groupLabels"`
+				ExternalURL string      `json:"externalURL"`
+			}
+			if json.Unmarshal(raw, &original) == nil {
+				amRef = &template.AMInputReference{SchemaVersion: "am-input-v1", ReferenceKind: "raw_payload_sha256", RequestSHA256: spool.Hash(raw), Receiver: original.Receiver, GroupKey: original.GroupKey, GroupLabels: original.GroupLabels, ExternalURL: original.ExternalURL}
+			}
+		}
+	}
 	cluster := h.notifierCtl.GetCluster()
 	for _, alert := range data.Alerts {
+		alert.AMInputRefs = nil
 		if alert.Labels == nil {
 			alert.Labels = template.KV{}
 		}
@@ -104,6 +121,9 @@ func (h *HttpHandler) Alert(w http.ResponseWriter, r *http.Request) {
 		}
 
 		alert.ID = utils.Hash(alert)
+		if amRef != nil {
+			alert.AMInputRefs = []template.AMInputReference{amRef.Clone()}
+		}
 		if h.alerts.Durable != nil {
 			continue
 		}

@@ -1,6 +1,7 @@
 package template
 
 import (
+	"encoding/json"
 	"sort"
 	"time"
 
@@ -14,15 +15,42 @@ var (
 	annotationNeedToHiden = []string{"runbook_url", "message", "summary", "summary_cn"}
 )
 
+// NMDispatchReference comes only from the accepted durable target before a
+// platform send. It is not an Alertmanager or PagerDuty incident identity.
+type NMDispatchReference struct {
+	SchemaVersion  string `json:"schema_version"`
+	AssessmentMode string `json:"assessment_mode"`
+	DispatchID     string `json:"dispatch_id"`
+	TargetID       string `json:"target_id"`
+}
+
+// AMInputReference preserves original AM transport locators without using them
+// to route notifications or change canonical alert/deduplication identities.
+type AMInputReference struct {
+	EntryIndexes  []int  `json:"entry_indexes,omitempty"`
+	SchemaVersion string `json:"schema_version"`
+	ReferenceKind string `json:"reference_kind"`
+	RequestSHA256 string `json:"request_sha256"`
+	Receiver      string `json:"receiver"`
+	GroupKey      string `json:"group_key"`
+	GroupLabels   KV     `json:"group_labels"`
+	ExternalURL   string `json:"external_url"`
+}
+
+func (r AMInputReference) Clone() AMInputReference { r.GroupLabels = r.GroupLabels.Clone(); return r }
+
 type Data struct {
-	JevCaptureExcluded  bool    `json:"jev_capture_excluded,omitempty"`
-	ProfileID           string  `json:"profile_id,omitempty"`
-	ProfileVersion      string  `json:"profile_version,omitempty"`
-	CardOwnerID         string  `json:"card_owner_id,omitempty"`
-	OriginalDestination string  `json:"original_destination,omitempty"`
-	FrozenContent       *string `json:"-"`
-	Alerts              Alerts  `json:"alerts"`
-	DeliveryID          string  `json:"deliveryID,omitempty"`
+	AMInputRefs         []AMInputReference   `json:"am_input_refs,omitempty" hash:"ignore"`
+	GroupCaptureIssue   string               `json:"group_capture_issue,omitempty" hash:"ignore"`
+	NMDispatch          *NMDispatchReference `json:"nm_dispatch,omitempty" hash:"ignore"`
+	JevCaptureExcluded  bool                 `json:"jev_capture_excluded,omitempty"`
+	ProfileID           string               `json:"profile_id,omitempty"`
+	ProfileVersion      string               `json:"profile_version,omitempty"`
+	CardOwnerID         string               `json:"card_owner_id,omitempty"`
+	OriginalDestination string               `json:"original_destination,omitempty"`
+	FrozenContent       *string              `json:"-"`
+	Alerts              Alerts               `json:"alerts"`
+	DeliveryID          string               `json:"deliveryID,omitempty"`
 
 	GroupLabels       KV `json:"groupLabels"`
 	CommonLabels      KV `json:"commonLabels"`
@@ -94,6 +122,14 @@ func (d *Data) Clone() *Data {
 		CommonAnnotations: d.CommonAnnotations.Clone(),
 	}
 
+	nd.GroupCaptureIssue = d.GroupCaptureIssue
+	for _, ref := range d.AMInputRefs {
+		nd.AMInputRefs = append(nd.AMInputRefs, ref.Clone())
+	}
+	if d.NMDispatch != nil {
+		ref := *d.NMDispatch
+		nd.NMDispatch = &ref
+	}
 	for _, a := range d.Alerts {
 		nd.Alerts = append(nd.Alerts, a.Clone())
 	}
@@ -206,11 +242,12 @@ func (kv KV) Clone() KV {
 }
 
 type Alert struct {
-	ID           string `json:"id"`
-	Status       string `json:"status"`
-	Labels       KV     `json:"labels"`
-	Annotations  KV     `json:"annotations"`
-	GeneratorURL string `json:"generatorURL,omitempty"`
+	AMInputRefs  []AMInputReference `json:"am_input_refs,omitempty" hash:"ignore"`
+	ID           string             `json:"id"`
+	Status       string             `json:"status"`
+	Labels       KV                 `json:"labels"`
+	Annotations  KV                 `json:"annotations"`
+	GeneratorURL string             `json:"generatorURL,omitempty"`
 
 	StartsAt time.Time `json:"startsAt,omitempty"`
 	EndsAt   time.Time `json:"endsAt,omitempty"`
@@ -276,7 +313,11 @@ func (as Alerts) Resolved() []*Alert {
 }
 
 func (a *Alert) Clone() *Alert {
-	return &Alert{
+	refs := make([]AMInputReference, len(a.AMInputRefs))
+	for i, ref := range a.AMInputRefs {
+		refs[i] = ref.Clone()
+	}
+	return &Alert{AMInputRefs: refs,
 		ID:               a.ID,
 		Status:           a.Status,
 		StartsAt:         a.StartsAt,
@@ -286,5 +327,41 @@ func (a *Alert) Clone() *Alert {
 		Annotations:      a.Annotations.Clone(),
 		GeneratorURL:     a.GeneratorURL,
 		Receiver:         a.Receiver,
+	}
+}
+
+// CompactAMInputReferences runs only on the frozen target's private Data copy.
+// Original template members and aggregation remain unchanged; metadata is
+// de-duplicated once with exact post-filter/post-aggregation entry indexes.
+func (d *Data) CompactAMInputReferences() {
+	refs := map[string]*AMInputReference{}
+	for index, alert := range d.Alerts {
+		for _, ref := range alert.AMInputRefs {
+			ref.EntryIndexes = nil
+			raw, _ := json.Marshal(ref)
+			key := string(raw)
+			v := refs[key]
+			if v == nil {
+				copy := ref.Clone()
+				v = &copy
+				refs[key] = v
+			}
+			if len(v.EntryIndexes) == 0 || v.EntryIndexes[len(v.EntryIndexes)-1] != index {
+				v.EntryIndexes = append(v.EntryIndexes, index)
+			}
+		}
+		alert.AMInputRefs = nil
+	}
+	if len(refs) == 0 {
+		return
+	}
+	d.AMInputRefs = nil
+	keys := []string{}
+	for key := range refs {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		d.AMInputRefs = append(d.AMInputRefs, *refs[key])
 	}
 }

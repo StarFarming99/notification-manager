@@ -22,7 +22,7 @@ import (
 )
 
 const relayCapacity = 128
-const maxSuccessBytes = 2 * 1024 * 1024
+const maxSuccessBytes = 8 * 1024 * 1024
 
 // SuccessfulDelivery owns read-only notifier data after the original platform
 // acknowledged the send. Neither the notifier nor relay may mutate these maps.
@@ -89,8 +89,14 @@ func NewNMFromEnv(logger log.Logger) (*Service, error) {
 	if config.SenderApp == "" || len(config.ReceiverAllowlist) == 0 || len(config.DestinationAllowlist) == 0 {
 		return nil, errors.New("relay requires explicit sender, receiver and destination bindings")
 	}
+	config.GroupProfiles = csvSet(os.Getenv("JEV_GROUP_ENABLED_PROFILES"))
 	if config.DeliveryScopes, err = loadDeliveryScopes(false); err != nil {
 		return nil, err
+	}
+	for key := range config.GroupProfiles {
+		if _, ok := config.DeliveryScopes[key]; !ok {
+			return nil, errors.New("group profile requires an installed immutable scope")
+		}
 	}
 	endpoint := strings.TrimSpace(os.Getenv("JEV_EXECUTOR_SUCCESS_URL"))
 	parsed, err := url.Parse(endpoint)

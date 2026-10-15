@@ -143,9 +143,11 @@ func New(logger log.Logger, config Config, client *http.Client) (*Service, error
 			return service, nil
 		}
 		service.cardStore = cardStore
-		for _, state := range cardStore.LoadRecent(config.MaxCards) {
-			service.cards[state.MessageID] = bindingFromCardState(state, nil)
-		}
+		// Durable group snapshots can be large. Do not preload or quarantine
+		// an entire PVC at startup: every referenced MID is decoded and fully
+		// validated by getCardBinding before use, retaining unknown/corrupt
+		// original evidence on disk.
+
 		outbox, err := newReceiptOutbox(logger, config, service.postDeliveryReceipt)
 		if err != nil {
 			_ = level.Error(logger).Log(
@@ -168,6 +170,8 @@ func New(logger log.Logger, config Config, client *http.Client) (*Service, error
 			childConfig.patchGate = service.writerGate
 			childConfig.DeliveryScopes = nil
 			childConfig.expectedProfileID = scope.ProfileID
+			_, childConfig.groupProfileEnabled = config.GroupProfiles[key]
+			childConfig.GroupProfiles = nil
 			childConfig.expectedProfileVersion = scope.ProfileVersion
 			_, childConfig.annotationProfileEnabled = config.AnnotationProfiles[key]
 			childConfig.AnnotationProfiles = nil
@@ -304,7 +308,7 @@ func (s *Service) captureDurable(data *template.Data, receiver, destination, mes
 	if scope != nil {
 		scope.Receiver = receiver
 	}
-	if err := s.captureCardBindingWithScope(receiver, destination, messageID, cardCopy, patcher, scope); err != nil {
+	if err := s.captureCardBindingWithSnapshot(receiver, destination, messageID, cardCopy, patcher, scope, receipt.FinalSnapshot); err != nil {
 		return err
 	}
 	if s.outbox == nil {
@@ -521,6 +525,13 @@ func (s *Service) authorized(header string) bool {
 
 func (s *Service) expired() bool {
 	return !s.config.ExpiresAt.IsZero() && !time.Now().UTC().Before(s.config.ExpiresAt)
+}
+
+func (s *Service) cardBindingCacheLimit() int {
+	if s.cardStore != nil && s.config.MaxCards > 32 {
+		return 32
+	}
+	return s.config.MaxCards
 }
 
 func (s *Service) evictOldestCardLocked() {

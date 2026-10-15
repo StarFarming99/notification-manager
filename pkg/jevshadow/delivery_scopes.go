@@ -257,3 +257,19 @@ func (s *Service) ProfileBindingConfigured(id, version, receiver, destination st
 	scope, ok := s.config.DeliveryScopes[scopeKey(id, version)]
 	return ok && scopeAllows(scope, receiver, destination)
 }
+
+// GroupModeForProfile is server-configured, never a client-body capability.
+func (s *Service) GroupModeForProfile(id, version, owner string) bool {
+	if s == nil || !s.Enabled() {
+		return false
+	}
+	if s.config.expectedProfileID != "" {
+		return s.config.groupProfileEnabled && s.config.expectedProfileID == id && s.config.expectedProfileVersion == version && s.config.CardOwnerID == owner
+	}
+	scope, ok := s.config.DeliveryScopes[scopeKey(id, version)]
+	if !ok || scope.CardOwnerID != owner {
+		return false
+	}
+	_, enabled := s.config.GroupProfiles[scopeKey(id, version)]
+	return enabled
+}

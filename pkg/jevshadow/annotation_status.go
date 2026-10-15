@@ -69,12 +69,12 @@ func (s *Service) HandleAnnotationStatus(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	projection := r.URL.Query().Get("projection")
-	if projection != "" && projection != rendererCardSummary {
+	if projection != "" && projection != rendererCardSummary && projection != rendererGroupCard {
 		writeJSON(w, 400, map[string]string{"error": "unsupported annotation projection"})
 		return
 	}
 	var projectionData map[string]interface{}
-	if projection == rendererCardSummary {
+	if projection == rendererCardSummary || projection == rendererGroupCard {
 		if scope := state.MemberScope; scope != nil && (scope.PermissionDomain != selected.config.PermissionDomain || scope.ProfileID != id || scope.ProfileVersion != version || scope.CardOwnerID != selected.config.CardOwnerID || (scope.ExecutionDomain != "" && scope.ExecutionDomain != selected.config.ExecutionDomain)) {
 			w.WriteHeader(http.StatusForbidden)
 			return
@@ -84,7 +84,11 @@ func (s *Service) HandleAnnotationStatus(w http.ResponseWriter, r *http.Request,
 			writeJSON(w, 400, map[string]string{"error": parseErr.Error()})
 			return
 		}
-		projectionData = selected.confirmedCardProjection(state, offset, limit)
+		if projection == rendererGroupCard {
+			projectionData = selected.groupCardProjection(state)
+		} else {
+			projectionData = selected.confirmedCardProjection(state, offset, limit)
+		}
 	}
 	out := map[string]interface{}{
 		"profile_id": id, "profile_version": version, "card_owner_id": selected.config.CardOwnerID,
@@ -96,7 +100,11 @@ func (s *Service) HandleAnnotationStatus(w http.ResponseWriter, r *http.Request,
 		"updated_at": state.UpdatedAt,
 	}
 	if projectionData != nil {
-		out["card_projection"] = projectionData
+		if projection == rendererGroupCard {
+			out["group_projection"] = projectionData
+		} else {
+			out["card_projection"] = projectionData
+		}
 	}
 	writeJSON(w, 200, out)
 }

@@ -34,6 +34,8 @@ const (
 )
 
 type Config struct {
+	GroupProfiles                             map[string]struct{}
+	groupProfileEnabled                       bool
 	PatchInterval                             time.Duration
 	WriterControlToken                        string
 	CutoverReadToken                          string
@@ -84,6 +86,7 @@ func ConfigFromEnv() (Config, error) {
 
 	config.ExistingCallbackIntegrated = os.Getenv("JEV_EXISTING_CALLBACK_INTEGRATED") == "true"
 	config.AnnotationProfiles = csvSet(os.Getenv(envAnnotationProfiles))
+	config.GroupProfiles = csvSet(os.Getenv("JEV_GROUP_ENABLED_PROFILES"))
 	config.ReceiptURL = strings.TrimSpace(os.Getenv(envReceiptURL))
 	config.ObservationURL = strings.TrimSpace(os.Getenv("JEV_SHADOW_OBSERVATION_URL"))
 	config.ExcludedIdentityLabels = csvSet(os.Getenv("JEV_SHADOW_IDENTITY_EXCLUDED_LABELS"))
@@ -185,6 +188,13 @@ func (c Config) validate() error {
 		for _, token := range business {
 			if token != "" && token == c.CutoverReadToken {
 				return fmt.Errorf("cutover read credential must be independent from intake/writer/business credentials")
+			}
+		}
+	}
+	if len(c.GroupProfiles) > 0 && c.expectedProfileID == "" {
+		for key := range c.GroupProfiles {
+			if _, ok := c.DeliveryScopes[key]; !ok {
+				return fmt.Errorf("JEV_GROUP_ENABLED_PROFILES must name an installed immutable profile/version")
 			}
 		}
 	}

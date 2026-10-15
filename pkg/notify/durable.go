@@ -142,6 +142,7 @@ func Freeze(logger log.Logger, ctl *controller.Controller, input map[internal.Re
 		}
 		for _, group := range groups {
 			data := group.Clone()
+			data.CompactAMInputReferences()
 			for _, alert := range data.Alerts {
 				if alert.Labels == nil {
 					alert.Labels = template.KV{}
@@ -203,6 +204,24 @@ func Freeze(logger log.Logger, ctl *controller.Controller, input map[internal.Re
 				payload, err := json.Marshal(FrozenNotification{Version: spool.Version, Receiver: raw, Options: ctl.ReceiverOpts, Data: data, Content: content, TemplateSnapshot: templateSnapshot, CredentialReferences: refs})
 				if err != nil {
 					return nil, err
+				}
+				if len(payload) > 2<<20 && len(data.AMInputRefs) > 0 {
+					// Optional Jev metadata must never introduce a new base
+					// notification rejection. Keep full original Alerts and
+					// record an explicit capture gap instead of truncating.
+					data.AMInputRefs = nil
+					data.GroupCaptureIssue = "am_input_metadata_byte_budget"
+					payload, err = json.Marshal(FrozenNotification{Version: spool.Version, Receiver: raw, Options: ctl.ReceiverOpts, Data: data, Content: content, TemplateSnapshot: templateSnapshot, CredentialReferences: refs})
+					if err != nil {
+						return nil, err
+					}
+					if len(payload) > 2<<20 {
+						data.GroupCaptureIssue = ""
+						payload, err = json.Marshal(FrozenNotification{Version: spool.Version, Receiver: raw, Options: ctl.ReceiverOpts, Data: data, Content: content, TemplateSnapshot: templateSnapshot, CredentialReferences: refs})
+						if err != nil {
+							return nil, err
+						}
+					}
 				}
 				if len(payload) > 2<<20 {
 					return nil, errors.New("frozen notification exceeds 2 MiB")
@@ -330,6 +349,10 @@ func SendFrozen(ctx context.Context, logger log.Logger, ctl *controller.Controll
 	}
 	if frozen.TemplateSnapshot == nil {
 		frozen.Data.FrozenContent = &frozen.Content
+	}
+	frozen.Data.NMDispatch = nil
+	if shadow := ctl.GetJevShadow(); shadow != nil && !frozen.Data.JevCaptureExcluded && shadow.GroupModeForProfile(target.ProfileID, target.ProfileVersion, target.CardOwnerID) && target.Channel == constants.Feishu && strings.HasPrefix(target.Destination, "chat:") {
+		frozen.Data.NMDispatch = &template.NMDispatchReference{SchemaVersion: "nm-target-v1", AssessmentMode: "group-v1", DispatchID: target.IntakeID, TargetID: target.ID}
 	}
 	return nf.Notify(ctx, frozen.Data)
 }

@@ -79,6 +79,13 @@ func run() error {
 		}
 		mux.HandleFunc("/internal/jev/card-feedback", service.HandleCardFeedback(callbackToken))
 	}
+	mux.HandleFunc("/internal/jev/group-annotations/", func(w http.ResponseWriter, r *http.Request) {
+		if os.Getenv("JEV_CARD_STATE_COORDINATED") != "true" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		service.HandleGroupAnnotation(w, r, strings.TrimPrefix(r.URL.Path, "/internal/jev/group-annotations/"))
+	})
 	mux.HandleFunc("/internal/jev/annotations/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			service.HandleAnnotationStatus(w, r, strings.TrimPrefix(r.URL.Path, "/internal/jev/annotations/"))

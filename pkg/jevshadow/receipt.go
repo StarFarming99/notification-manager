@@ -15,6 +15,8 @@ import (
 )
 
 type deliveryReceipt struct {
+	AssessmentMode       string           `json:"assessment_mode,omitempty"`
+	FinalSnapshot        *FinalSnapshot   `json:"final_snapshot,omitempty"`
 	ProfileID            string           `json:"profile_id,omitempty"`
 	ProfileVersion       string           `json:"profile_version,omitempty"`
 	OriginalDestination  string           `json:"original_destination,omitempty"`
@@ -122,6 +124,15 @@ func (s *Service) buildReceipt(data *template.Data, receiver, destination, messa
 	}
 	if data.CardOwnerID != "" && data.CardOwnerID != s.config.CardOwnerID {
 		return deliveryReceipt{}, fmt.Errorf("frozen card owner is outside this executor scope")
+	}
+	if s.GroupModeForProfile(data.ProfileID, data.ProfileVersion, data.CardOwnerID) && data.NMDispatch != nil {
+		snapshot, err := s.buildFinalSnapshot(data, receiver, destination)
+		if err != nil {
+			return deliveryReceipt{}, err
+		}
+		receipt.SchemaVersion = "2"
+		receipt.AssessmentMode = GroupAssessmentMode
+		receipt.FinalSnapshot = snapshot
 	}
 	if s.config.Environment == "production" {
 		receipt.Observation = s.observation(data, receipt)

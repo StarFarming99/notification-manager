@@ -105,8 +105,11 @@ func (s *Service) captureCardBinding(
 }
 
 func (s *Service) captureCardBindingWithScope(receiver, destination, messageID string, baseCard map[string]interface{}, patcher CardPatcher, scope *cardMemberScope) error {
+	return s.captureCardBindingWithSnapshot(receiver, destination, messageID, baseCard, patcher, scope, nil)
+}
+func (s *Service) captureCardBindingWithSnapshot(receiver, destination, messageID string, baseCard map[string]interface{}, patcher CardPatcher, scope *cardMemberScope, snapshot *FinalSnapshot) error {
 	now := time.Now().UTC()
-	state := cardPersistentState{
+	state := cardPersistentState{FinalSnapshot: snapshot,
 		MemberScope:        scope,
 		Version:            cardStateVersion,
 		MessageID:          messageID,
@@ -142,6 +145,20 @@ func (s *Service) captureCardBindingWithScope(receiver, destination, messageID s
 				}
 				// Legacy bindings remain scope-unknown. A replay must not invent
 				// the original receipt scope or modify an unresolved intent.
+				if snapshot != nil && existing.FinalSnapshot != nil && !equalGroupSnapshot(snapshot, existing.FinalSnapshot) {
+					return ErrRevision
+				}
+				if snapshot != nil && existing.FinalSnapshot == nil && existing.AnnotationRevision == 0 && existing.PendingPatch == nil && existing.PendingGroupPatch == nil && existing.PatchSendState != patchSendUnknown {
+					// A fresh authenticated successful receipt may bind a
+					// revision-0 legacy card in isolated replay/new mode. No
+					// completed annotation or unknown intent is rewritten.
+					existing.FinalSnapshot = snapshot
+					existing.MemberScope = scope
+					existing.Version = cardStateVersion
+					if err := s.cardStore.Save(&existing); err != nil {
+						return err
+					}
+				}
 				state = existing
 				return nil
 			}
@@ -159,7 +176,7 @@ func (s *Service) captureCardBindingWithScope(receiver, destination, messageID s
 		s.mu.Unlock()
 		return nil
 	}
-	if len(s.cards) >= s.config.MaxCards {
+	if len(s.cards) >= s.cardBindingCacheLimit() {
 		s.evictOldestCardLocked()
 	}
 	s.cards[messageID] = binding
@@ -189,7 +206,7 @@ func (s *Service) getCardBinding(messageID string) (*cardBinding, error) {
 	if existing := s.cards[messageID]; existing != nil {
 		binding = existing
 	} else {
-		if len(s.cards) >= s.config.MaxCards {
+		if len(s.cards) >= s.cardBindingCacheLimit() {
 			s.evictOldestCardLocked()
 		}
 		s.cards[messageID] = binding
@@ -219,6 +236,9 @@ func (s *Service) applyPersistentAnnotation(
 		state, loadErr := s.cardStore.Load(messageID)
 		if loadErr != nil {
 			return loadErr
+		}
+		if state.FinalSnapshot != nil || state.PendingGroupPatch != nil {
+			return ErrRevision
 		}
 		if state.SenderApp != s.config.SenderApp || state.Receiver != binding.receiver || state.Destination != binding.destination {
 			return fmt.Errorf("%w: persisted card writer identity changed", ErrCardWriterUnavailable)
@@ -363,6 +383,9 @@ func syncBindingFromCardState(binding *cardBinding, state cardPersistentState, p
 	binding.annotationRevision = state.AnnotationRevision
 	binding.annotations = state.Annotations
 	binding.memberScope = state.MemberScope
+	if state.FinalSnapshot != nil {
+		binding.memberScope = nil
+	}
 	binding.appliedKeys = applied
 	binding.patchSendState = state.PatchSendState
 	binding.pendingPatch = state.PendingPatch

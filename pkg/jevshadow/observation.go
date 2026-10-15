@@ -11,15 +11,24 @@ import (
 )
 
 type observationAlert struct {
-	Fingerprint string            `json:"fingerprint"`
-	Status      string            `json:"status"`
-	StartsAt    time.Time         `json:"starts_at"`
-	EndsAt      *time.Time        `json:"ends_at,omitempty"`
-	Labels      map[string]string `json:"labels"`
-	Annotations map[string]string `json:"annotations"`
-	SourceID    string            `json:"source_id"`
+	GeneratorURL string            `json:"generator_url,omitempty"`
+	Fingerprint  string            `json:"fingerprint"`
+	Status       string            `json:"status"`
+	StartsAt     time.Time         `json:"starts_at"`
+	EndsAt       *time.Time        `json:"ends_at,omitempty"`
+	Labels       map[string]string `json:"labels"`
+	Annotations  map[string]string `json:"annotations"`
+	SourceID     string            `json:"source_id"`
 }
 type observationWire struct {
+	AssessmentMode   string             `json:"assessment_mode,omitempty"`
+	FinalSnapshot    *FinalSnapshot     `json:"final_snapshot,omitempty"`
+	ProfileID        string             `json:"profile_id,omitempty"`
+	ProfileVersion   string             `json:"profile_version,omitempty"`
+	CardOwnerID      string             `json:"card_owner_id,omitempty"`
+	ExecutionDomain  string             `json:"execution_domain,omitempty"`
+	SenderApp        string             `json:"sender_app,omitempty"`
+	Destination      string             `json:"destination,omitempty"`
 	SchemaVersion    string             `json:"schema_version"`
 	IdentityVersion  string             `json:"identity_version"`
 	LogicalSource    string             `json:"logical_source"`
@@ -35,6 +44,17 @@ type observationWire struct {
 
 func (s *Service) observation(data *template.Data, receipt deliveryReceipt) *observationWire {
 	o := &observationWire{SchemaVersion: "1", IdentityVersion: "2", LogicalSource: s.config.LogicalSource, Environment: s.config.Environment, SourceRegion: s.config.SourceRegion, PermissionDomain: s.config.PermissionDomain, Receiver: receipt.Receiver, DeliveryID: receipt.DeliveryID, ObservedAt: receipt.SentAt, GroupKey: ""}
+	if receipt.FinalSnapshot != nil {
+		o.SchemaVersion = "2"
+		o.AssessmentMode = GroupAssessmentMode
+		o.FinalSnapshot = receipt.FinalSnapshot
+		o.ProfileID = receipt.ProfileID
+		o.ProfileVersion = receipt.ProfileVersion
+		o.CardOwnerID = receipt.CardOwnerID
+		o.ExecutionDomain = receipt.ExecutionDomain
+		o.SenderApp = receipt.SenderApp
+		o.Destination = receipt.Destination
+	}
 	groupJSON, _ := canonicalJSON(data.GroupLabels)
 	o.GroupKey = framedDigest("group-v2", string(groupJSON))
 	for _, a := range data.Alerts {
@@ -43,7 +63,11 @@ func (s *Service) observation(data *template.Data, receipt deliveryReceipt) *obs
 			v := a.EndsAt.UTC()
 			end = &v
 		}
-		o.Alerts = append(o.Alerts, observationAlert{Fingerprint: a.ID, Status: a.Status, StartsAt: a.StartsAt.UTC(), EndsAt: end, Labels: map[string]string(a.Labels), Annotations: map[string]string(a.Annotations), SourceID: s.config.LogicalSource})
+		generator := ""
+		if receipt.FinalSnapshot != nil {
+			generator = a.GeneratorURL
+		}
+		o.Alerts = append(o.Alerts, observationAlert{GeneratorURL: generator, Fingerprint: a.ID, Status: a.Status, StartsAt: a.StartsAt.UTC(), EndsAt: end, Labels: map[string]string(a.Labels), Annotations: map[string]string(a.Annotations), SourceID: s.config.LogicalSource})
 	}
 	return o
 }

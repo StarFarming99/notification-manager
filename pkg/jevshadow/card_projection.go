@@ -44,15 +44,17 @@ func (s *Service) confirmedCardProjection(state cardPersistentState, offset, lim
 	} else if state.AnnotationRevision == 0 {
 		reason = "no_confirmed_annotation"
 	}
-	pending := state.PendingPatch != nil
+	pending := state.PendingPatch != nil || state.PendingGroupPatch != nil
 	unknownPatch := state.PatchSendState == patchSendSending || state.PatchSendState == patchSendUnknown
 	platformCurrent := "not-read"
 	if pending || unknownPatch {
 		platformCurrent = "unknown"
 	}
 	var pendingRevision interface{}
-	if pending {
+	if state.PendingPatch != nil {
 		pendingRevision = state.PendingPatch.AnnotationRevision
+	} else if state.PendingGroupPatch != nil {
+		pendingRevision = state.PendingGroupPatch.Component.AnnotationRevision
 	}
 	baseHash, _ := hashCanonical(state.BaseCard)
 	projection := map[string]interface{}{

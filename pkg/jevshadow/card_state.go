@@ -57,6 +57,10 @@ type cardPatchIntent struct {
 }
 
 type cardPersistentState struct {
+	FinalSnapshot            *FinalSnapshot                     `json:"final_snapshot,omitempty"`
+	GroupComponent           *GroupAnnotationComponent          `json:"group_component,omitempty"`
+	GroupLifecycleRevision   int                                `json:"group_lifecycle_revision,omitempty"`
+	PendingGroupPatch        *groupCardPatchIntent              `json:"pending_group_patch,omitempty"`
 	ConfirmedRendererVersion string                             `json:"confirmed_renderer_version,omitempty"`
 	MemberScope              *cardMemberScope                   `json:"member_scope,omitempty"`
 	Version                  int                                `json:"version"`
@@ -263,7 +267,7 @@ func validateCardPersistentState(state cardPersistentState) error {
 	if state.Receiver == "" || state.Destination == "" || state.SenderApp == "" {
 		return errors.New("card state is missing writer identity")
 	}
-	if state.ConfirmedRendererVersion != "" && state.ConfirmedRendererVersion != rendererLegacyMember && state.ConfirmedRendererVersion != rendererCardSummary {
+	if state.ConfirmedRendererVersion != "" && state.ConfirmedRendererVersion != rendererLegacyMember && state.ConfirmedRendererVersion != rendererCardSummary && state.ConfirmedRendererVersion != rendererGroupCard {
 		return errors.New("invalid confirmed renderer version")
 	}
 	if state.ConfirmedRendererVersion != "" && state.AnnotationRevision == 0 {
@@ -292,7 +296,7 @@ func validateCardPersistentState(state cardPersistentState) error {
 	if _, ok := allowedPatchStates[state.PatchSendState]; !ok {
 		return errors.New("invalid card patch send state")
 	}
-	if (state.PatchSendState == patchSendSending || state.PatchSendState == patchSendUnknown) && state.PendingPatch == nil {
+	if (state.PatchSendState == patchSendSending || state.PatchSendState == patchSendUnknown) && state.PendingPatch == nil && state.PendingGroupPatch == nil {
 		return errors.New("ambiguous card patch state is missing its intent")
 	}
 	if state.PatchSendState == patchSendConfirmed && state.AnnotationRevision == 0 {
@@ -381,6 +385,9 @@ func validateCardPersistentState(state cardPersistentState) error {
 		if err != nil || expectedHash != pending.RenderedCardHash {
 			return errors.New("pending rendered card does not match persisted state")
 		}
+	}
+	if err := validateGroupCardState(state); err != nil {
+		return err
 	}
 	if len(state.LastPatchError) > maxCardStateErrorBytes {
 		return errors.New("persisted card patch error is too large")
