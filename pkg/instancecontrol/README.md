@@ -100,6 +100,11 @@ revision/phase CAS preserve the same sender. Activation also needs only this
 transactional gate: its allowed source phases have no legal local platform sends,
 and the exact retired-peer proof is still mandatory. The physical send barriers
 remain explicit freeze, final export and retirement.
+Freeze polls the writer permit within its original control context instead of
+registering a waiting writer that would block all still-legal draining readers.
+If traffic never offers a physical quiescent point, publication must fail or
+cancel within its budget while business requests continue; their caller budgets
+are not extended to make a release appear successful.
 
 A preseed may observe the old process's live synchronous attempt. New attempt
 records carry their actual instance identity. Import preserves the original local

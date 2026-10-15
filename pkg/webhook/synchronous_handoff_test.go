@@ -262,6 +262,54 @@ func TestFutureSynchronousActivePeerProofNeverWaitsForUnrelatedSlowPlatform(t *t
 	}
 }
 
+func TestFutureSynchronousPendingFreezeCannotQueueUnrelatedShortCaller(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	platform := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.URL.Path == "/held" {
+			close(entered)
+			<-release
+		}
+		w.WriteHeader(200)
+	}))
+	defer platform.Close()
+	a, b := synchronousPair(t)
+	heldDone := make(chan int, 1)
+	go func() {
+		code, _ := synchronousRequest(t, b, "notifications", platform.URL+"/held", context.Background())
+		heldDone <- code
+	}()
+	<-entered
+	draining := synchronousControl(t, a, "close-admission")
+	freezeCtx, cancelFreeze := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelFreeze()
+	frozen := make(chan error, 1)
+	go func() {
+		_, err := a.db.ControlReleaseContext(freezeCtx, spool.ReleaseCommand{OperationID: draining.OperationID, ExpectedRevision: draining.Revision, Action: "freeze", Actor: "fixture", Evidence: "wait for physical quiescence without blocking live readers"})
+		frozen <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	code, body := synchronousRequest(t, b, "verify", platform.URL+"/fast", ctx)
+	cancel()
+	close(release)
+	if code != 200 {
+		t.Fatal("pending publication writer consumed caller budget before platform", code, body)
+	}
+	if other := <-heldDone; other != 200 || calls.Load() != 2 {
+		t.Fatal("ordinary platform requests changed", other, calls.Load())
+	}
+	select {
+	case err := <-frozen:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("freeze did not complete at real quiescence")
+	}
+}
+
 func TestFutureSynchronousOldConnectionCrossesFrozenWindowWithout503(t *testing.T) {
 	var calls atomic.Int32
 	platform := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(200) }))

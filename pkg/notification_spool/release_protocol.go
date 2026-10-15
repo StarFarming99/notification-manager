@@ -278,7 +278,16 @@ func (s *Store) ControlReleaseContext(ctx context.Context, c ReleaseCommand) (Re
 	// Waiting behind a slow platform call here would stall unrelated requests
 	// merely because publication has begun.
 	switch c.Action {
-	case "freeze", "retire", "rollback-standby":
+	case "freeze":
+		// A pending RWMutex writer blocks subsequent readers. Do not let a
+		// publication waiting for a slow platform call stop other legitimate
+		// synchronous calls while this instance is still draining. If no
+		// physical quiet point fits the control budget, publication fails.
+		if err := s.releaseSafetyLock(ctx); err != nil {
+			return ReleaseState{}, err
+		}
+		defer s.releaseMu.Unlock()
+	case "retire", "rollback-standby":
 		s.releaseMu.Lock()
 		defer s.releaseMu.Unlock()
 	}
