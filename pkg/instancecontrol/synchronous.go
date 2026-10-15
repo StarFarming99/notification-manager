@@ -70,6 +70,9 @@ func (m *Manager) ConfigureSynchronousPeer(peer SyncPeer, client *http.Client) e
 }
 
 func hashSynchronous(raw []byte) string { sum := sha256.Sum256(raw); return hex.EncodeToString(sum[:]) }
+func canAssistActivation(st spool.ReleaseState) bool {
+	return st.Phase == "buffering" || st.Phase == "returning" || st.Phase == "buffer-closed"
+}
 func (m *Manager) syncMAC(raw []byte) string {
 	mac := hmac.New(sha256.New, m.syncKey)
 	_, _ = mac.Write([]byte("nm-synchronous-forward-v1\x00"))
@@ -205,7 +208,7 @@ func (m *Manager) forwardSynchronous(ctx context.Context, w http.ResponseWriter,
 		// stale/consumed proof can promote an instance through this assist.
 		if json.NewDecoder(io.LimitReader(response.Body, 8192)).Decode(&recovery) == nil && recovery.Proof != nil {
 			current, statusErr := m.store.ReleaseStatus()
-			if statusErr == nil && current.OperationID == claims.Operation && current.PeerID == claims.TargetID && current.ImportedChecksum == recovery.Proof.SnapshotChecksum {
+			if statusErr == nil && canAssistActivation(current) && current.OperationID == claims.Operation && current.PeerID == claims.TargetID && current.ImportedChecksum == recovery.Proof.SnapshotChecksum {
 				_, _ = m.store.ControlReleaseContext(ctx, spool.ReleaseCommand{OperationID: current.OperationID, ExpectedRevision: current.Revision, Action: "activate", PeerID: current.PeerID, Proof: recovery.Proof, Actor: "synchronous-handoff-assist", Evidence: "authenticated peer never executed this request; exact final snapshot and durable retirement proof"})
 			}
 		}
@@ -281,7 +284,7 @@ func (m *Manager) ForwardSynchronous(regular, compatibility map[string]http.Hand
 		}
 		if proof := claims.PredecessorProof; proof != nil {
 			current, statusErr := m.store.ReleaseStatus()
-			if statusErr == nil && current.OperationID == claims.Operation && current.PeerID == claims.SourceID && current.ImportedChecksum == proof.SnapshotChecksum {
+			if statusErr == nil && canAssistActivation(current) && current.OperationID == claims.Operation && current.PeerID == claims.SourceID && current.ImportedChecksum == proof.SnapshotChecksum {
 				_, _ = m.store.ControlReleaseContext(ctx, spool.ReleaseCommand{OperationID: current.OperationID, ExpectedRevision: current.Revision, Action: "activate", PeerID: current.PeerID, Proof: proof, Actor: "synchronous-handoff-assist", Evidence: "authenticated predecessor supplied exact final snapshot durable retirement proof"})
 			}
 		}

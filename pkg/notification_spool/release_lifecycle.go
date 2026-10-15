@@ -607,3 +607,26 @@ func restoreTerminalCurrentPointer(tx *bolt.Tx, t Target, proofIDs []string) err
 	}
 	return put(tx.Bucket([]byte("audit")), "lifecycle-current-restored:"+in.ID, map[string]interface{}{"action": "restore_recovered_am_current", "terminal_intake_id": in.ID, "resolved_intake_id": resolved.ID, "historical_intent_indexes_retained": true, "at": time.Now().UTC()})
 }
+
+// queuedObservationPrecedes preserves a sequence actually observed by one
+// authenticated generation. It does not invent a total order across peers or
+// make an old unknown/platform retry block a fresh lifecycle. A pre-send budget
+// deferral is still an unattempted send and must retain that known queue order.
+func queuedObservationPrecedes(prior, current Intake, before, after Target) bool {
+	if !prior.AMGroup || !current.AMGroup || prior.ID == current.ID || prior.DedupeKey == "" || prior.DedupeKey != current.DedupeKey || prior.IdentityOrigin == "legacy-unsequenced" || current.IdentityOrigin == "legacy-unsequenced" || prior.ReceptionInstance == "" || prior.ReceptionInstance != current.ReceptionInstance || prior.ReceptionSequence == 0 || prior.ReceptionSequence >= current.ReceptionSequence {
+		return false
+	}
+	if before.ProfileID != after.ProfileID || before.ProfileVersion != after.ProfileVersion || before.CardOwnerID != after.CardOwnerID || before.Receiver != after.Receiver || before.Channel != after.Channel || before.Destination != after.Destination || before.OriginalDestination != after.OriginalDestination {
+		return false
+	}
+	switch before.State {
+	case Pending:
+		return before.Attempts == 0
+	case Sending:
+		return true
+	case Retryable:
+		return before.SendPrepared
+	default:
+		return false
+	}
+}

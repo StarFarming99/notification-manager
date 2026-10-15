@@ -326,3 +326,103 @@ func TestLifecycleRuntimeTerminalKeepsCertainResolvedRetryDeduplicated(t *testin
 		t.Fatal("certain recovered retry became a new notification", dup, err, in)
 	}
 }
+
+func TestLifecycleKnownObservationPacingKeepsOldRecoveryBeforeNewStart(t *testing.T) {
+	s, _ := releaseFixture(t, "old", "active")
+	defer s.Close()
+	oldFire := submitLifecycle(t, s, "group", lifecycleTestAlert("canary", "firing", 10))
+	oldResolved := submitLifecycle(t, s, "group", lifecycleTestAlert("canary", "resolved", 10))
+	newFire := submitLifecycle(t, s, "group", lifecycleTestAlert("canary", "firing", 20))
+	var platformOrder []string
+	send := func(c Claim, now time.Time) error {
+		return s.WithSendPermit(c, 2*time.Second, now, func() error { platformOrder = append(platformOrder, c.Target.IntakeID); return nil })
+	}
+	first, err := s.Claim(time.Now())
+	if err != nil || first.Target.IntakeID != oldFire.ID {
+		t.Fatal("initial firing not first", err)
+	}
+	now := time.Now().UTC()
+	if err := send(first, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Finish(first, Delivered, "confirmed", "old-firing-receipt", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	recovery, err := s.Claim(now)
+	if err != nil || recovery.Target.IntakeID != oldResolved.ID {
+		t.Fatal("old recovery missing", err)
+	}
+	deferredErr := send(recovery, now)
+	var deferred *SendBudgetDeferred
+	if !errors.As(deferredErr, &deferred) {
+		t.Fatal("fixture did not exercise actual pre-send pacing", deferredErr)
+	}
+	if err := s.Finish(recovery, Retryable, "pre_send_budget_deferred", "budget-only", deferred.AvailableAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Claim(now); !errors.Is(err, ErrEmpty) {
+		t.Fatal("new startsAt overtook a known earlier pre-send recovery", err)
+	}
+	nextTime := deferred.AvailableAt.Add(time.Millisecond)
+	recovery, err = s.Claim(nextTime)
+	if err != nil || recovery.Target.IntakeID != oldResolved.ID {
+		t.Fatal("ready recovery lost to new firing", err, recovery.Target)
+	}
+	if err := send(recovery, nextTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Finish(recovery, Delivered, "confirmed", "old-recovery-receipt", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	nextTime = nextTime.Add(2 * time.Second)
+	fresh, err := s.Claim(nextTime)
+	if err != nil || fresh.Target.IntakeID != newFire.ID {
+		t.Fatal("new firing was lost or permanently blocked", err, fresh.Target)
+	}
+	if err := send(fresh, nextTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Finish(fresh, Delivered, "confirmed", "new-start-receipt", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{oldFire.ID, oldResolved.ID, newFire.ID}
+	if len(platformOrder) != 3 {
+		t.Fatal("wrong platform count", platformOrder)
+	}
+	for n, id := range want {
+		if platformOrder[n] != id {
+			t.Fatal("known observation order changed", platformOrder, want)
+		}
+	}
+	t.Log("platform order: firing(starts10), resolved(starts10), firing(starts20); pre-send retry retained observation sequence")
+}
+
+func TestLifecycleObservedUnknownAndPlatformRetryDoNotBlockFreshStart(t *testing.T) {
+	for _, state := range []string{Unknown, Retryable} {
+		t.Run(state, func(t *testing.T) {
+			s, _ := releaseFixture(t, "old", "active")
+			defer s.Close()
+			old := submitLifecycle(t, s, "group", lifecycleTestAlert("canary", "firing", 10))
+			c, err := s.Claim(time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Enter a real transport attempt, distinguishing this from a budget
+			// deferral which has positively never reached the platform.
+			if err := s.WithSendPermit(c, 0, time.Now(), func() error { return nil }); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Finish(c, state, "platform_failure", "prior-attempt", time.Now().Add(time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			fresh := submitLifecycle(t, s, "group", lifecycleTestAlert("canary", "firing", 20))
+			if c := finishOne(t, s); c.Target.IntakeID != fresh.ID {
+				t.Fatal("historical uncertainty/platform retry blocked a fresh lifecycle")
+			}
+			row := targetByIntake(t, s, old.ID)
+			if row.State != state || row.AttemptID != c.AttemptID || row.Attempts != 1 {
+				t.Fatal("old attempt was modified", row)
+			}
+		})
+	}
+}

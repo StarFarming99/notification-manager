@@ -224,6 +224,44 @@ func TestFutureSynchronousRetirementProofAssistsActivationAndOldConnection(t *te
 	}
 }
 
+func TestFutureSynchronousActivePeerProofNeverWaitsForUnrelatedSlowPlatform(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	platform := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.URL.Path == "/held" {
+			close(entered)
+			<-release
+		}
+		w.WriteHeader(200)
+	}))
+	defer platform.Close()
+	a, b := synchronousPair(t)
+	proof := synchronousRetire(t, a, b)
+	bs, _ := b.db.ReleaseStatus()
+	if _, err := b.db.ControlRelease(spool.ReleaseCommand{OperationID: bs.OperationID, ExpectedRevision: bs.Revision, Action: "activate", Proof: proof, Actor: "fixture", Evidence: "already active before old proof"}); err != nil {
+		t.Fatal(err)
+	}
+	heldDone := make(chan int, 1)
+	go func() {
+		code, _ := synchronousRequest(t, b, "notifications", platform.URL+"/held", context.Background())
+		heldDone <- code
+	}()
+	<-entered
+	// The old keepalive includes its durable proof. An already active peer
+	// must not acquire another activation writer lock behind the held request.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	code, body := synchronousRequest(t, a, "verify", platform.URL+"/fast", ctx)
+	cancel()
+	close(release)
+	if code != 200 {
+		t.Fatal("active peer queued a needless activation behind platform", code, body)
+	}
+	if other := <-heldDone; other != 200 || calls.Load() != 2 {
+		t.Fatal(other, calls.Load())
+	}
+}
+
 func TestFutureSynchronousOldConnectionCrossesFrozenWindowWithout503(t *testing.T) {
 	var calls atomic.Int32
 	platform := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(200) }))

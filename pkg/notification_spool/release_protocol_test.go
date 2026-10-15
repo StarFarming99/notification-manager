@@ -734,8 +734,12 @@ func TestReleaseCleanupPrunesOnlyOldCachesAndKeepsProofFences(t *testing.T) {
 func TestReleaseCanceledHTTPWaitCannotApplyLateMutation(t *testing.T) {
 	s, _ := releaseFixture(t, "old", "active")
 	defer s.Close()
+	b, _ := releaseFixture(t, "new", "standby")
+	defer b.Close()
+	beginPair(t, s, b)
+	controlRelease(t, s, "close-admission")
 	st, _ := s.ReleaseStatus()
-	c := ReleaseCommand{OperationID: "ctx-operation", ExpectedRevision: st.Revision, Action: "begin-active", PeerID: "new", Deadline: time.Now().Add(time.Second), MaxSendDelayMillis: 800, SyncRemainingMillis: 50, Actor: "test", Evidence: "isolated canceled request"}
+	c := commandFor(t, s, "freeze")
 	ctx, cancel := context.WithCancel(context.Background())
 	s.releaseMu.Lock()
 	done := make(chan error, 1)
@@ -746,7 +750,7 @@ func TestReleaseCanceledHTTPWaitCannotApplyLateMutation(t *testing.T) {
 		t.Fatal("canceled control mutated late", err)
 	}
 	after, _ := s.ReleaseStatus()
-	if after.Revision != st.Revision || after.OperationID != "" {
+	if after.Revision != st.Revision || after.Phase != "draining" || after.OperationID != st.OperationID {
 		t.Fatal("late state mutation", after)
 	}
 	if _, err := s.ExportReleaseContext(ctx, "ctx-operation", st.Revision, true); !errors.Is(err, context.Canceled) {
@@ -757,6 +761,39 @@ func TestReleaseCanceledHTTPWaitCannotApplyLateMutation(t *testing.T) {
 	}
 	if err := s.ResolveSynchronousAttemptContext(ctx, "missing", "test", "fixture", false); !errors.Is(err, context.Canceled) {
 		t.Fatal("canceled resolution", err)
+	}
+}
+
+func TestReleaseBeginWithPhysicalAttemptDoesNotTransferSendingAuthority(t *testing.T) {
+	a, _ := releaseFixture(t, "old", "active")
+	defer a.Close()
+	b, _ := releaseFixture(t, "new", "standby")
+	defer b.Close()
+	in, _ := submitGroup(t, a, "in-flight", "firing", time.Hour)
+	claim, err := a.Claim(time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	beginPair(t, a, b)
+	preseed(t, a, b)
+	if _, err = b.Claim(time.Now().UTC()); !errors.Is(err, ErrReleaseGate) {
+		t.Fatal("preseed allowed successor to send", err)
+	}
+	controlRelease(t, a, "close-admission")
+	controlRelease(t, a, "freeze")
+	st, _ := a.ReleaseStatus()
+	if _, err = a.ExportRelease(st.OperationID, st.Revision, true); err == nil {
+		t.Fatal("in-flight attempt entered final snapshot")
+	}
+	if err = a.Finish(claim, Delivered, "platform_confirmed", "receipt:"+in.ID, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	importRelease(t, b, exportRelease(t, a, true))
+	proof := controlRelease(t, a, "retire").RetirementProof
+	activateRelease(t, b, proof)
+	_, targets, err := b.Snapshot()
+	if err != nil || len(targets) != 1 || targets[0].State != Delivered || targets[0].Attempts != 1 || targets[0].IntakeID != in.ID {
+		t.Fatal("final snapshot lost completed attempt", targets, err)
 	}
 }
 func TestReleaseSeenOperationCannotResetBudgetAfterAnotherRelease(t *testing.T) {

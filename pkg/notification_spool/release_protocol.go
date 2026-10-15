@@ -272,8 +272,19 @@ func (s *Store) ControlRelease(c ReleaseCommand) (ReleaseState, error) {
 	return s.ControlReleaseContext(context.Background(), c)
 }
 func (s *Store) ControlReleaseContext(ctx context.Context, c ReleaseCommand) (ReleaseState, error) {
-	s.releaseMu.Lock()
-	defer s.releaseMu.Unlock()
+	// Physical send fences need the process-wide send boundary. Metadata
+	// changes retain the same sender and
+	// are serialized with retirement by the Bolt transaction and revision CAS.
+	// Waiting behind a slow platform call here would stall unrelated requests
+	// merely because publication has begun.
+	switch c.Action {
+	case "freeze", "retire", "rollback-standby":
+		s.releaseMu.Lock()
+		defer s.releaseMu.Unlock()
+	}
+	// Activation can only commit from a non-sending phase. Its transactional
+	// checksum/proof/CAS checks establish authority; a local send lock would
+	// only stall already-active requests on a redundant proof-assist call.
 	var result ReleaseState
 	if err := ctx.Err(); err != nil {
 		return result, err
@@ -316,9 +327,6 @@ func (s *Store) ControlReleaseContext(ctx context.Context, c ReleaseCommand) (Re
 					return err
 				} else if size > MaxReleaseTransferBytes {
 					return errors.New("release transfer exceeds supported bounded protocol size")
-				}
-				if err := releaseSafe(tx, false); err != nil {
-					return err
 				}
 			}
 			st.OperationID = c.OperationID
@@ -500,8 +508,13 @@ func (s *Store) ExportRelease(operation string, expected uint64, final bool) (Re
 	return s.ExportReleaseContext(context.Background(), operation, expected, final)
 }
 func (s *Store) ExportReleaseContext(ctx context.Context, operation string, expected uint64, final bool) (ReleaseManifest, error) {
-	s.releaseMu.Lock()
-	defer s.releaseMu.Unlock()
+	// A preseed is a consistent transactional observation, not a fence. It
+	// may contain in-flight attempts; only the frozen final snapshot grants
+	// authority to the successor and therefore takes the send boundary.
+	if final {
+		s.releaseMu.Lock()
+		defer s.releaseMu.Unlock()
+	}
 	var m ReleaseManifest
 	if err := ctx.Err(); err != nil {
 		return m, err
@@ -704,8 +717,10 @@ func (s *Store) ImportRelease(m ReleaseManifest, c ReleaseCommand) (ReleaseState
 	return s.ImportReleaseContext(context.Background(), m, c)
 }
 func (s *Store) ImportReleaseContext(ctx context.Context, m ReleaseManifest, c ReleaseCommand) (ReleaseState, error) {
-	s.releaseMu.Lock()
-	defer s.releaseMu.Unlock()
+	// Import never transfers sending authority. Standby cannot send, and a
+	// cancelled release retains the original sender. Transactional phase/CAS
+	// checks race safely with activation/retirement while preserving current
+	// local attempts during buffer return.
 	var result ReleaseState
 	if err := ctx.Err(); err != nil {
 		return result, err
@@ -844,6 +859,13 @@ func (s *Store) ImportReleaseContext(ctx context.Context, m ReleaseManifest, c R
 				}
 				if name == "meta" && strings.HasPrefix(key, "release-forward:") {
 					merged, err := mergeForwardReference(tx, key, value, st.InstanceID)
+					if err != nil {
+						return err
+					}
+					value = merged
+				}
+				if name == "meta" && strings.HasPrefix(key, "release-sync:") {
+					merged, err := mergeSynchronousReference(tx, key, value, st.InstanceID)
 					if err != nil {
 						return err
 					}
@@ -1055,7 +1077,7 @@ func groupDeliveryBlocked(tx *bolt.Tx, t Target) (bool, error) {
 			if target.State != Pending && target.State != Retryable && target.State != Sending {
 				continue
 			}
-			if target.ProfileID == t.ProfileID && target.Receiver == t.Receiver && target.Channel == t.Channel && target.Destination == t.Destination && lifecycleOverlap(target.Payload, t.Payload) {
+			if target.ProfileID == t.ProfileID && target.Receiver == t.Receiver && target.Channel == t.Channel && target.Destination == t.Destination && (lifecycleOverlap(target.Payload, t.Payload) || queuedObservationPrecedes(prior, current, target, t)) {
 				return true, nil
 			}
 		}

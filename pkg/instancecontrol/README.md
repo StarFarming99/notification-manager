@@ -91,6 +91,25 @@ fence under the release read permit. Restart marks unfinished forward references
 unknown without replay. Completed references expire only after both retention and
 the signed request deadline; unknown references stay available for reconciliation.
 
+Activation assistance is attempted only while buffering, returning, or buffer
+closed. An already active peer does not acquire another activation barrier merely
+because an old keepalive carries a retirement proof. Metadata-only begin, close,
+cancel and cancel-complete commands, consistent preseed export, and transactional
+import do not wait behind unrelated platform calls. Their Bolt transaction and
+revision/phase CAS preserve the same sender. Activation also needs only this
+transactional gate: its allowed source phases have no legal local platform sends,
+and the exact retired-peer proof is still mandatory. The physical send barriers
+remain explicit freeze, final export and retirement.
+
+A preseed may observe the old process's live synchronous attempt. New attempt
+records carry their actual instance identity. Import preserves the original local
+owner's record; an external Sending observation becomes diagnostic unknown with
+its original snapshot state, outcome and timestamp retained. A legacy empty owner
+stays empty. Such an imported observation is never counted as this process's
+physical request or automatically replayed, and the source's later real final
+completion can replace it. This prevents an old slow call from blocking return
+of a never-active candidate's zero-attempt buffers.
+
 Export body: `{ "operation_id": "…", "expected_revision": 1, "final": true }`.
 Import body: `{ "command": { …, "action": "import" }, "manifest": { … } }`.
 Controls are limited to 32 KiB; import is limited to 64 MiB. Preflight checks the

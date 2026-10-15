@@ -13,12 +13,18 @@ import (
 // SynchronousAttempt is an uncertainty fence, not a queue or retry policy.
 // Original Notification/Verify callers still receive the original result.
 type SynchronousAttempt struct {
-	ID        string    `json:"id"`
-	ProfileID string    `json:"profile_id,omitempty"`
-	State     string    `json:"state"`
-	Outcome   string    `json:"outcome"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Evidence  string    `json:"evidence,omitempty"`
+	ID                string     `json:"id"`
+	InstanceID        string     `json:"instance_id,omitempty"`
+	ProfileID         string     `json:"profile_id,omitempty"`
+	State             string     `json:"state"`
+	Outcome           string     `json:"outcome"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+	Evidence          string     `json:"evidence,omitempty"`
+	SnapshotState     string     `json:"snapshot_state,omitempty"`
+	SnapshotOutcome   string     `json:"snapshot_outcome,omitempty"`
+	SnapshotUpdatedAt *time.Time `json:"snapshot_updated_at,omitempty"`
+	ImportedFrom      string     `json:"imported_from,omitempty"`
+	ImportedAt        *time.Time `json:"imported_at,omitempty"`
 }
 
 func (s *Store) synchronousAttempt(profile string, send func() error) error {
@@ -33,7 +39,7 @@ func (s *Store) synchronousAttempt(profile string, send func() error) error {
 	if err != nil {
 		return err
 	}
-	attempt := SynchronousAttempt{ID: id, ProfileID: profile, State: Sending, Outcome: "platform_call_entered", UpdatedAt: time.Now().UTC()}
+	attempt := SynchronousAttempt{ID: id, InstanceID: st.InstanceID, ProfileID: profile, State: Sending, Outcome: "platform_call_entered", UpdatedAt: time.Now().UTC()}
 	if err = s.update(func(tx *bolt.Tx) error { return put(tx.Bucket([]byte("meta")), "release-sync:"+id, attempt) }); err != nil {
 		return err
 	}
