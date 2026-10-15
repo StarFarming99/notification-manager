@@ -510,9 +510,9 @@ func renderGroupCard(snapshot groupRenderSnapshot) (map[string]interface{}, erro
 			lines = append(lines, "恢复依据截止："+latest)
 		}
 	} else {
-		labels := map[string]string{"all_can_wait": "整组建议等待（仅旁路观察）", "needs_action": "整组需要处理", "needs_member_verification": "部分成员需要进一步核实", "insufficient_evidence": "证据不足，保持原通知"}
+		labels := map[string]string{"all_can_wait": "整组建议等待（仅旁路观察）", "needs_action": "整组需要处理", "needs_member_verification": "部分成员需要进一步核实，保持原通知", "insufficient_evidence": "证据不足，保持原通知"}
 		conclusion := labels[c.GroupResult.Decision]
-		if c.GroupResult.PolicyAction == "original" {
+		if c.GroupResult.PolicyAction == "original" && c.GroupResult.Decision != "needs_member_verification" {
 			conclusion = "证据不足，保持原通知"
 		} else if c.GroupResult.PolicyAction == "oncall" {
 			conclusion = "整组需要处理"

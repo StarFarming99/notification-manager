@@ -264,6 +264,38 @@ func TestNativeGroupRoundedDistributionStaysOriginalInConfirmedState(t *testing.
 		_ = os.WriteFile(path, append(raw, '\n'), 0600)
 	}
 }
+
+func TestNativeGroupFourChoicesKeepDistinctTitlesAndContradictoryWaitingFailsConservative(t *testing.T) {
+	cases := []struct{ name, decision, action, title string }{
+		{"waiting", "all_can_wait", "pool_candidate", "整组建议等待（仅旁路观察）"},
+		{"action", "needs_action", "oncall", "整组需要处理"},
+		{"member-verification", "needs_member_verification", "original", "部分成员需要进一步核实，保持原通知"},
+		{"insufficient", "insufficient_evidence", "original", "证据不足，保持原通知"},
+		{"waiting-gated-original", "all_can_wait", "original", "证据不足，保持原通知"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, snapshot, calls, last := nativeGroupFixture(t, 1)
+			c := nativeGroupComponent(snapshot, "om-native-group", 1, 0)
+			c.GroupResult.Decision, c.GroupResult.PolicyAction = tc.decision, tc.action
+			c.GroupResult.ExceptionMemberIDs = nil
+			for _, choice := range groupDecisions {
+				c.GroupResult.Probabilities[choice] = 0
+			}
+			c.GroupResult.Probabilities[tc.decision] = 1
+			if _, err := s.applyGroupAnnotation(context.Background(), "om-native-group", "distinct-choice-title", c); err != nil {
+				t.Fatal(err)
+			}
+			text := nativeCardText(t, *last)
+			if !strings.HasPrefix(text, "**Jev 组判断："+tc.title+"**\n") || strings.Count(text, "组概率：") != 1 || calls.Load() != 1 {
+				t.Fatal("group choice title lost its distinct meaning", text)
+			}
+			if tc.name == "waiting-gated-original" && strings.Contains(text, "建议等待") {
+				t.Fatal("policy-gated waiting was rendered as safe waiting", text)
+			}
+		})
+	}
+}
 func TestNativeGroupMixedLifecycleAllowsOnlyMatchingRiskEpoch(t *testing.T) {
 	s, _, snapshot, _, last := nativeGroupFixture(t, 2)
 	lifecycle := nativeLifecycle(snapshot, "om-native-group", 1, 0, 1, 0)
