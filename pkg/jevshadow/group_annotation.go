@@ -45,6 +45,37 @@ type GroupRiskResult struct {
 	ExceptionMemberIDs []string           `json:"exception_member_ids"`
 }
 
+// NotificationRiskResult preserves the ordinary two-question model response
+// and its independent policy facts. Legacy four-choice results are never
+// converted to this representation.
+type NotificationRiskResult struct {
+	Routing            *ChoiceAnswer `json:"routing"`
+	PoolReason         *ChoiceAnswer `json:"pool_reason"`
+	PolicyProposal     string        `json:"policy_proposal"`
+	PolicyReasonCode   string        `json:"policy_reason_code"`
+	PoolMinProbability *float64      `json:"pool_min_probability"`
+	DecisionSource     string        `json:"decision_source"`
+	ThresholdApplied   *bool         `json:"threshold_applied"`
+	ThresholdSource    string        `json:"threshold_source"`
+	ModelStatus        string        `json:"model_status"`
+	ModelErrorCode     string        `json:"model_error_code"`
+	ContextReduced     *bool         `json:"context_reduced"`
+}
+
+func (r NotificationRiskResult) ordinary(c GroupAnnotationComponent) AnnotationComponent {
+	id := ""
+	if c.AssessmentID != nil {
+		id = *c.AssessmentID
+	}
+	return AnnotationComponent{SchemaVersion: "2", Capability: "policy-facts-v1", JudgmentID: id,
+		Routing: r.Routing, PoolReason: r.PoolReason, PolicyProposal: r.PolicyProposal,
+		PolicyReasonCode: r.PolicyReasonCode, PoolMinProbability: r.PoolMinProbability,
+		DecisionSource: r.DecisionSource, ThresholdApplied: r.ThresholdApplied,
+		ThresholdSource: r.ThresholdSource, ModelStatus: r.ModelStatus,
+		ModelErrorCode: r.ModelErrorCode, ContextReduced: r.ContextReduced,
+		ExecutionMode: "shadow", TraceURL: &c.DetailURL}
+}
+
 // Group probabilities preserve TypeSafe's explicit two-decimal response. They
 // are never renormalized: only 0.99/1.00/1.01 totals whose rounding intervals can
 // contain one are accepted. Keep the legacy component validator unchanged.
@@ -101,6 +132,7 @@ type GroupAnnotationComponent struct {
 	ActiveMemberCount          int                     `json:"active_member_count"`
 	ResolvedMemberCount        int                     `json:"resolved_member_count"`
 	GroupResult                *GroupRiskResult        `json:"group_result"`
+	NotificationResult         *NotificationRiskResult `json:"notification_result,omitempty"`
 	Versions                   GroupAnnotationVersions `json:"versions"`
 	LifecycleMembers           []GroupLifecycleMember  `json:"lifecycle_members"`
 	DetailURL                  string                  `json:"detail_url"`
@@ -148,7 +180,8 @@ func parseGroupTime(value string) (time.Time, error) {
 	return v, nil
 }
 func (c GroupAnnotationComponent) validate(snapshot *FinalSnapshot, messageID string, base map[string]interface{}) error {
-	if snapshot == nil || c.SchemaVersion != "3" || c.Capability != groupAnnotationCapability || (c.Kind != "group_judgment" && c.Kind != "lifecycle") || c.AnnotationRevision < 1 || c.ExpectedAnnotationRevision < 0 || c.AnnotationRevision <= c.ExpectedAnnotationRevision || c.ExpectedBaseRevision < 1 || c.LifecycleRevision < 0 || c.ExpectedLifecycleRevision < 0 {
+	silent := c.Kind == "lifecycle_only"
+	if snapshot == nil || c.SchemaVersion != "3" || c.Capability != groupAnnotationCapability || (c.Kind != "group_judgment" && c.Kind != "notification_judgment" && c.Kind != "lifecycle" && !silent) || c.AnnotationRevision < 0 || (!silent && c.AnnotationRevision < 1) || c.ExpectedAnnotationRevision < 0 || (!silent && c.AnnotationRevision <= c.ExpectedAnnotationRevision) || (silent && c.AnnotationRevision != c.ExpectedAnnotationRevision) || c.ExpectedBaseRevision < 1 || c.LifecycleRevision < 0 || c.ExpectedLifecycleRevision < 0 {
 		return ErrInvalidPayload
 	}
 	baseHash, err := hashCanonical(base)
@@ -183,6 +216,9 @@ func (c GroupAnnotationComponent) validate(snapshot *FinalSnapshot, messageID st
 			return ErrInvalidPayload
 		}
 		expectedPath = "/apps/alert-center/groups/" + *c.AssessmentID
+		if c.Kind == "notification_judgment" || silent {
+			expectedPath = "/apps/alert-center/traces/" + *c.AssessmentID
+		}
 	}
 	if parsed.Path != expectedPath {
 		return ErrInvalidPayload
@@ -232,12 +268,23 @@ func (c GroupAnnotationComponent) validate(snapshot *FinalSnapshot, messageID st
 	if c.ActiveMemberCount != active || c.ResolvedMemberCount != resolved {
 		return ErrInvalidPayload
 	}
-	if c.Kind == "lifecycle" {
-		if c.GroupResult != nil || c.LifecycleRevision <= c.ExpectedLifecycleRevision {
+	if c.Kind == "lifecycle" || silent {
+		if c.GroupResult != nil || c.NotificationResult != nil || c.LifecycleRevision <= c.ExpectedLifecycleRevision {
+			return ErrInvalidPayload
+		}
+	} else if c.Kind == "notification_judgment" {
+		if c.NotificationResult == nil || c.GroupResult != nil || c.AssessmentID == nil || active < 1 || c.LifecycleRevision != c.ExpectedLifecycleRevision {
+			return ErrInvalidPayload
+		}
+		ordinary := c.NotificationResult.ordinary(c)
+		if err := ordinary.validateV2(); err != nil {
+			return err
+		}
+		if c.Versions.Template == "" || c.Versions.Compiler == "" || c.Versions.Questions == "" || len(c.Versions.QuestionsHash) != 64 || c.Versions.Policy == "" || len(c.Versions.ConfigHash) != 64 {
 			return ErrInvalidPayload
 		}
 	} else {
-		if c.GroupResult == nil || c.AssessmentID == nil || strings.TrimSpace(*c.AssessmentID) == "" || len(*c.AssessmentID) > 200 || active < 1 || c.LifecycleRevision != c.ExpectedLifecycleRevision {
+		if c.GroupResult == nil || c.NotificationResult != nil || c.AssessmentID == nil || strings.TrimSpace(*c.AssessmentID) == "" || len(*c.AssessmentID) > 200 || active < 1 || c.LifecycleRevision != c.ExpectedLifecycleRevision {
 			return ErrInvalidPayload
 		}
 		result := c.GroupResult
@@ -327,6 +374,20 @@ func (s *Service) HandleGroupAnnotation(w http.ResponseWriter, r *http.Request, 
 		}
 		return
 	}
+	if component.Kind == "lifecycle_only" || component.Kind == "lifecycle" {
+		state, loadErr := selected.cardStore.Load(messageID)
+		if loadErr != nil {
+			writeJSON(w, 502, map[string]string{"error": "fence confirmation unavailable"})
+			return
+		}
+		state, loadErr = selected.cardStore.effectiveGroupState(state)
+		if loadErr != nil {
+			writeJSON(w, 502, map[string]string{"error": "fence confirmation unavailable"})
+			return
+		}
+		writeJSON(w, 200, map[string]interface{}{"request_id": id, "lifecycle_only": true, "lifecycle_revision": state.GroupLifecycleRevision, "visible_annotation_revision": state.AnnotationRevision})
+		return
+	}
 	writeJSON(w, 200, map[string]string{"request_id": id})
 }
 
@@ -348,6 +409,15 @@ func groupPayloadHash(value interface{}) (string, error) {
 }
 
 func (s *Service) applyGroupAnnotation(ctx context.Context, messageID, key string, component GroupAnnotationComponent) (string, error) {
+	// Legacy lifecycle requests remain accepted, but recovery is now a silent
+	// control fact. Stored legacy render snapshots are not rewritten.
+	if component.Kind == "lifecycle" {
+		component.Kind = "lifecycle_only"
+		component.AnnotationRevision = component.ExpectedAnnotationRevision
+	}
+	if component.Kind == "lifecycle_only" {
+		return s.applySilentGroupLifecycle(messageID, key, component)
+	}
 	binding, err := s.getCardBinding(messageID)
 	if err != nil {
 		return "", err
@@ -360,7 +430,14 @@ func (s *Service) applyGroupAnnotation(ctx context.Context, messageID, key strin
 		if err != nil {
 			return err
 		}
+		state, err = s.cardStore.effectiveGroupState(state)
+		if err != nil {
+			return err
+		}
 		if state.FinalSnapshot == nil {
+			return ErrRevision
+		}
+		if state.GroupLifecycleFence != nil && state.GroupLifecycleFence.IdempotencyKey == key {
 			return ErrRevision
 		}
 		if state.PatchSendState == patchSendSending && (state.PendingPatch != nil || state.PendingGroupPatch != nil) {
@@ -397,9 +474,9 @@ func (s *Service) applyGroupAnnotation(ctx context.Context, messageID, key strin
 		if component.Kind == "lifecycle" && component.LifecycleRevision <= state.GroupLifecycleRevision {
 			return ErrRevision
 		}
-		if state.GroupComponent != nil {
+		if state.GroupComponent != nil || state.GroupLifecycleFence != nil {
 			resolved := map[string]bool{}
-			for _, member := range state.GroupComponent.LifecycleMembers {
+			for _, member := range latestGroupLifecycleMembers(state) {
 				if member.CurrentStatus == "resolved" {
 					resolved[member.EventID] = true
 				}
@@ -428,11 +505,33 @@ func (s *Service) applyGroupAnnotation(ctx context.Context, messageID, key strin
 		}
 		resultID = requestID(messageID, key)
 		return s.writerGate.withAttempt(ctx, messageID, func() error {
-			state.PatchSendState = patchSendSending
-			state.LastPatchError = ""
-			state.PendingGroupPatch = &groupCardPatchIntent{RendererVersion: rendererGroupCard, IdempotencyKey: key, PayloadHash: payloadHash, RequestID: resultID, Component: component, RenderSnapshot: frozen, RenderedCard: rendered, RenderedCardHash: renderedHash, StartedAt: time.Now().UTC()}
-			if err := s.cardStore.Save(&state); err != nil {
-				return fmt.Errorf("%w: persist group intent: %v", ErrCardWriterUnavailable, err)
+			err := s.cardStore.withLifecycleLock(func() error {
+				// Recheck at the final send boundary under the same cross-process
+				// message lock; a frozen render input alone is not a lifecycle gate.
+				latest, err := s.cardStore.Load(messageID)
+				if err != nil {
+					return err
+				}
+				latest, err = s.cardStore.effectiveGroupState(latest)
+				if err != nil {
+					return err
+				}
+				if latest.BaseRevision != component.ExpectedBaseRevision || latest.AnnotationRevision != component.ExpectedAnnotationRevision || latest.GroupLifecycleRevision != component.ExpectedLifecycleRevision {
+					return ErrRevision
+				}
+				if err := s.ensureRiskLifecycleCurrent(latest, component); err != nil {
+					return err
+				}
+				state.PatchSendState = patchSendSending
+				state.LastPatchError = ""
+				state.PendingGroupPatch = &groupCardPatchIntent{RendererVersion: rendererGroupCard, IdempotencyKey: key, PayloadHash: payloadHash, RequestID: resultID, Component: component, RenderSnapshot: frozen, RenderedCard: rendered, RenderedCardHash: renderedHash, StartedAt: time.Now().UTC()}
+				if err := s.cardStore.Save(&state); err != nil {
+					return fmt.Errorf("%w: persist group intent: %v", ErrCardWriterUnavailable, err)
+				}
+				return nil
+			})
+			if err != nil {
+				return err
 			}
 			if patchErr := patcher(ctx, messageID, rendered); patchErr != nil {
 				state.LastPatchError = boundedCardStateError(patchErr)
@@ -480,7 +579,15 @@ func renderGroupCard(snapshot groupRenderSnapshot) (map[string]interface{}, erro
 	}
 	c := snapshot.Component
 	lines := []string{}
-	if c.Kind == "lifecycle" {
+	if c.Kind == "lifecycle_only" {
+		return card, nil
+	}
+	if c.Kind == "notification_judgment" {
+		if c.NotificationResult == nil {
+			return nil, ErrInvalidPayload
+		}
+		lines = append(lines, c.NotificationResult.ordinary(c).markdownV2(false))
+	} else if c.Kind == "lifecycle" {
 		if c.ResolvedMemberCount == c.MemberCount {
 			late := false
 			for _, member := range c.LifecycleMembers {
@@ -529,7 +636,11 @@ func renderGroupCard(snapshot groupRenderSnapshot) (map[string]interface{}, erro
 		lines = append(lines, "配置："+c.Versions.Template+" / "+c.Versions.Policy)
 	}
 	lines = append(lines, "证据截止："+c.AsOf, "仍按原告警流程通知")
-	elements = append(elements, map[string]interface{}{"tag": "hr"}, map[string]interface{}{"tag": "div", "text": map[string]interface{}{"tag": "lark_md", "content": strings.Join(lines, "\n")}}, map[string]interface{}{"tag": "action", "actions": []interface{}{map[string]interface{}{"tag": "button", "type": "default", "text": map[string]interface{}{"tag": "plain_text", "content": "查看本卡全部判断与状态"}, "url": c.DetailURL}}})
+	label := "查看本卡全部判断与状态"
+	if c.Kind == "notification_judgment" {
+		label = "判断追溯"
+	}
+	elements = append(elements, map[string]interface{}{"tag": "hr"}, map[string]interface{}{"tag": "div", "text": map[string]interface{}{"tag": "lark_md", "content": strings.Join(lines, "\n")}}, map[string]interface{}{"tag": "action", "actions": []interface{}{map[string]interface{}{"tag": "button", "type": "default", "text": map[string]interface{}{"tag": "plain_text", "content": label}, "url": c.DetailURL}}})
 	card["elements"] = elements
 	return card, nil
 }
@@ -546,7 +657,7 @@ func equalGroupSnapshot(a, b interface{}) bool {
 
 func validateGroupCardState(state cardPersistentState) error {
 	if state.FinalSnapshot == nil {
-		if state.GroupComponent != nil || state.PendingGroupPatch != nil || state.GroupLifecycleRevision != 0 || state.ConfirmedRendererVersion == rendererGroupCard {
+		if state.GroupComponent != nil || state.GroupLifecycleFence != nil || state.PendingGroupPatch != nil || state.GroupLifecycleRevision != 0 || state.ConfirmedRendererVersion == rendererGroupCard {
 			return errors.New("group card state has no immutable final snapshot")
 		}
 		return nil
@@ -571,11 +682,17 @@ func validateGroupCardState(state cardPersistentState) error {
 		if err := state.GroupComponent.validate(snapshot, state.MessageID, state.BaseCard); err != nil {
 			return fmt.Errorf("invalid confirmed group component: %w", err)
 		}
-		if state.GroupComponent.AnnotationRevision != state.AnnotationRevision || state.GroupComponent.ExpectedBaseRevision != state.BaseRevision || state.GroupComponent.LifecycleRevision != state.GroupLifecycleRevision || state.ConfirmedRendererVersion != rendererGroupCard {
+		if state.GroupComponent.AnnotationRevision != state.AnnotationRevision || state.GroupComponent.ExpectedBaseRevision != state.BaseRevision || state.GroupComponent.LifecycleRevision > state.GroupLifecycleRevision || state.ConfirmedRendererVersion != rendererGroupCard {
 			return errors.New("confirmed group revision or renderer mismatch")
+		}
+		if state.GroupComponent.LifecycleRevision < state.GroupLifecycleRevision && state.GroupLifecycleFence == nil {
+			return errors.New("confirmed group has no later lifecycle fence")
 		}
 	} else if state.ConfirmedRendererVersion == rendererGroupCard {
 		return errors.New("group renderer has no confirmed component")
+	}
+	if err := validateGroupLifecycleFence(state); err != nil {
+		return err
 	}
 	if intent := state.PendingGroupPatch; intent != nil {
 		if intent.RendererVersion != rendererGroupCard || (state.PatchSendState != patchSendSending && state.PatchSendState != patchSendUnknown) || intent.StartedAt.IsZero() || len(intent.IdempotencyKey) < 8 || len(intent.IdempotencyKey) > 256 || intent.RequestID != requestID(state.MessageID, intent.IdempotencyKey) {
@@ -584,11 +701,14 @@ func validateGroupCardState(state cardPersistentState) error {
 		if err := intent.Component.validate(snapshot, state.MessageID, state.BaseCard); err != nil {
 			return err
 		}
-		if intent.Component.ExpectedAnnotationRevision != state.AnnotationRevision || intent.Component.AnnotationRevision <= state.AnnotationRevision || intent.Component.ExpectedLifecycleRevision != state.GroupLifecycleRevision {
+		if intent.Component.ExpectedAnnotationRevision != state.AnnotationRevision || intent.Component.AnnotationRevision <= state.AnnotationRevision || intent.Component.ExpectedLifecycleRevision > state.GroupLifecycleRevision {
 			return errors.New("group pending CAS mismatch")
 		}
-		if intent.Component.Kind == "group_judgment" && intent.Component.LifecycleRevision != state.GroupLifecycleRevision {
+		if (intent.Component.Kind == "group_judgment" || intent.Component.Kind == "notification_judgment") && intent.Component.LifecycleRevision > state.GroupLifecycleRevision {
 			return errors.New("stale risk pending lifecycle")
+		}
+		if intent.Component.ExpectedLifecycleRevision < state.GroupLifecycleRevision && state.GroupLifecycleFence == nil {
+			return errors.New("stale pending risk has no terminal lifecycle fence")
 		}
 		hash, err := groupPayloadHash(intent.Component)
 		if err != nil || hash != intent.PayloadHash {

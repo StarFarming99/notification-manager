@@ -60,6 +60,7 @@ type cardPersistentState struct {
 	FinalSnapshot            *FinalSnapshot                     `json:"final_snapshot,omitempty"`
 	GroupComponent           *GroupAnnotationComponent          `json:"group_component,omitempty"`
 	GroupLifecycleRevision   int                                `json:"group_lifecycle_revision,omitempty"`
+	GroupLifecycleFence      *groupLifecycleFence               `json:"group_lifecycle_fence,omitempty"`
 	PendingGroupPatch        *groupCardPatchIntent              `json:"pending_group_patch,omitempty"`
 	ConfirmedRendererVersion string                             `json:"confirmed_renderer_version,omitempty"`
 	MemberScope              *cardMemberScope                   `json:"member_scope,omitempty"`

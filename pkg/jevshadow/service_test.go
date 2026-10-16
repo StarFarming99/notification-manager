@@ -308,7 +308,7 @@ func TestRenderV2PoolClassificationExactlyAtCardBottom(t *testing.T) {
 	}
 }
 
-func TestRenderV2OncallHidesHypotheticalPoolReason(t *testing.T) {
+func TestRenderV2OncallRetainsReturnedPoolReason(t *testing.T) {
 	component := validV2Component()
 	component.Routing = &ChoiceAnswer{
 		Choice:        "oncall",
@@ -317,7 +317,7 @@ func TestRenderV2OncallHidesHypotheticalPoolReason(t *testing.T) {
 	component.PolicyProposal = "oncall"
 	component.PolicyReasonCode = "routing_oncall"
 
-	want := "**Oncall 93%** · Pool 7%"
+	want := "**Oncall 93%** · Pool 7%\n**Recurring**\nRecurring 80% · Same incident 12%\nNon-urgent 6% · Unclear 2%"
 	if got := component.markdown(); got != want {
 		t.Fatalf("unexpected v2 oncall summary: %q, want %q", got, want)
 	}

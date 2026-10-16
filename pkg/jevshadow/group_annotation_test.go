@@ -146,16 +146,15 @@ func TestNativeGroupAnnotationRendersOneTrueGroupDistributionAndReadonlyProjecti
 	}
 }
 func TestNativeLifecycleCrossesCancelledGapAndFencesOldRisk(t *testing.T) {
-	s, _, snapshot, calls, last := nativeGroupFixture(t, 14)
+	s, cfg, snapshot, calls, _ := nativeGroupFixture(t, 14)
 	// Reservation 1 was cancelled in Jev before reaching executor. Exact CAS0
 	// with no pending evidence safely accepts status revision2/lifecycle1.
 	lifecycle := nativeLifecycle(snapshot, "om-native-group", 2, 0, 1, 0)
 	if _, err := s.applyGroupAnnotation(context.Background(), "om-native-group", "status-revision-two", lifecycle); err != nil {
 		t.Fatal(err)
 	}
-	text := nativeCardText(t, *last)
-	if !strings.Contains(text, "该次告警已恢复") || !strings.Contains(text, "迟到的 firing") || !strings.Contains(text, "未重新判断") || strings.Contains(text, "组概率") {
-		t.Fatal(text)
+	if calls.Load() != 0 {
+		t.Fatal("recovery generated a visible PATCH")
 	}
 	stale := nativeGroupComponent(snapshot, "om-native-group", 3, 2)
 	if _, err := s.applyGroupAnnotation(context.Background(), "om-native-group", "stale-risk-after-recovery", stale); !errors.Is(err, ErrRevision) {
@@ -173,17 +172,18 @@ func TestNativeLifecycleCrossesCancelledGapAndFencesOldRisk(t *testing.T) {
 		t.Fatal("old member component overwrote group", err)
 	}
 	state, _ := s.cardStore.Load("om-native-group")
-	if state.AnnotationRevision != 2 || state.GroupLifecycleRevision != 1 || calls.Load() != 1 {
+	projection := nativeProjection(t, s, cfg)
+	if state.AnnotationRevision != 0 || projection["lifecycle_revision"] != float64(1) || calls.Load() != 0 {
 		t.Fatal("stale risk changed state")
 	}
 }
 
 func TestNativeLifecycleStatusOnlyAssessmentUsesExactlyBoundGroupDetail(t *testing.T) {
-	s, _, snapshot, calls, last := nativeGroupFixture(t, 2)
+	s, cfg, snapshot, calls, _ := nativeGroupFixture(t, 2)
 	c := nativeLifecycle(snapshot, "om-native-group", 1, 0, 1, 0)
 	assessment := "group_status-only-fixture"
 	c.AssessmentID = &assessment
-	c.DetailURL = "https://aiops.example/apps/alert-center/groups/" + assessment + "?domain=" + snapshot.PermissionDomain
+	c.DetailURL = "https://aiops.example/apps/alert-center/traces/" + assessment + "?domain=" + snapshot.PermissionDomain
 	wrong := c
 	wrong.DetailURL = "https://aiops.example/apps/alert-center/groups/another-group?domain=" + snapshot.PermissionDomain
 	if _, err := s.applyGroupAnnotation(context.Background(), "om-native-group", "wrong-status-subject", wrong); !errors.Is(err, ErrInvalidPayload) {
@@ -192,12 +192,13 @@ func TestNativeLifecycleStatusOnlyAssessmentUsesExactlyBoundGroupDetail(t *testi
 	if _, err := s.applyGroupAnnotation(context.Background(), "om-native-group", "status-only-group-detail", c); err != nil {
 		t.Fatal(err)
 	}
-	text := nativeCardText(t, *last)
-	if calls.Load() != 1 || strings.Contains(text, "组概率") || c.GroupResult != nil {
-		t.Fatal("status-only assessment rendered a model result", text)
+	if calls.Load() != 0 || c.GroupResult != nil {
+		t.Fatal("status-only assessment rendered a model result")
 	}
 	state, _ := s.cardStore.Load("om-native-group")
-	if state.GroupComponent == nil || state.GroupComponent.AssessmentID == nil || *state.GroupComponent.AssessmentID != assessment {
+	projection := nativeProjection(t, s, cfg)
+	fence := projection["lifecycle_fence"].(map[string]interface{})
+	if state.GroupComponent != nil || fence["assessment_id"] != assessment {
 		t.Fatal("status-only group subject not retained")
 	}
 }
@@ -307,7 +308,7 @@ func TestNativeGroupMixedLifecycleAllowsOnlyMatchingRiskEpoch(t *testing.T) {
 	if _, err := s.applyGroupAnnotation(context.Background(), "om-native-group", "mixed-lifecycle-key", lifecycle); err != nil {
 		t.Fatal(err)
 	}
-	risk := nativeGroupComponent(snapshot, "om-native-group", 2, 1)
+	risk := nativeGroupComponent(snapshot, "om-native-group", 1, 0)
 	risk.ExpectedLifecycleRevision = 1
 	risk.LifecycleRevision = 1
 	risk.ActiveMemberCount = 1
@@ -345,8 +346,8 @@ func TestNativeGroupUnknownPatchPreservesFrozenIntentAndBlocksGapAcrossRestart(t
 		return func(context.Context, string, map[string]interface{}) error { calls.Add(1); return nil }, nil
 	})
 	status := nativeLifecycle(snapshot, "om-native-group", 3, 0, 1, 0)
-	if _, err := restarted.applyGroupAnnotation(context.Background(), "om-native-group", "cannot-skip-unknown", status); !errors.Is(err, ErrPatchStateUnknown) {
-		t.Fatal("gap cleared unknown evidence", err)
+	if _, err := restarted.applyGroupAnnotation(context.Background(), "om-native-group", "cannot-skip-unknown", status); err != nil {
+		t.Fatal("unknown prevented terminal fact persistence", err)
 	}
 	loaded, err := restarted.cardStore.Load("om-native-group")
 	if err != nil {
@@ -357,7 +358,7 @@ func TestNativeGroupUnknownPatchPreservesFrozenIntentAndBlocksGapAcrossRestart(t
 		t.Fatal("pending group rewritten/replayed")
 	}
 	projection := nativeProjection(t, restarted, cfg)
-	if projection["pending"] != true || projection["patch_unknown"] != true || projection["platform_current"] != "unknown" || projection["group_component"] != nil {
+	if projection["pending"] != true || projection["patch_unknown"] != true || projection["platform_current"] != "unknown" || projection["group_component"] != nil || projection["lifecycle_revision"] != float64(1) || projection["lifecycle_fence"] == nil {
 		t.Fatal(projection)
 	}
 }
@@ -483,8 +484,8 @@ func TestNativeGroupTLSPlatformPreservesOriginalButtonsAndSameMID(t *testing.T) 
 	if _, err := s.applyGroupAnnotation(context.Background(), "om-native-group", "tls-native-lifecycle-second", lifecycle); err != nil {
 		t.Fatal(err)
 	}
-	if count.Load() != 2 {
-		t.Fatal("platform updates lost")
+	if count.Load() != 1 {
+		t.Fatal("silent lifecycle generated platform update")
 	}
 }
 

@@ -85,6 +85,11 @@ func (s *Service) HandleAnnotationStatus(w http.ResponseWriter, r *http.Request,
 			return
 		}
 		if projection == rendererGroupCard {
+			state, err = selected.cardStore.effectiveGroupState(state)
+			if err != nil {
+				writeJSON(w, 503, map[string]string{"error": "lifecycle state unavailable"})
+				return
+			}
 			projectionData = selected.groupCardProjection(state)
 		} else {
 			projectionData = selected.confirmedCardProjection(state, offset, limit)

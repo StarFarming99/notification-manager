@@ -308,6 +308,9 @@ func (s *Service) captureDurable(data *template.Data, receiver, destination, mes
 	if scope != nil {
 		scope.Receiver = receiver
 	}
+	if err := s.cardStore.captureSnapshotTerminals(receipt.FinalSnapshot); err != nil {
+		return err
+	}
 	if err := s.captureCardBindingWithSnapshot(receiver, destination, messageID, cardCopy, patcher, scope, receipt.FinalSnapshot); err != nil {
 		return err
 	}
@@ -1012,6 +1015,9 @@ func (c AnnotationComponent) validatePolicyFactsV1() error {
 	if modelAvailable != (c.Routing != nil && c.PoolReason != nil) {
 		return ErrInvalidPayload
 	}
+	if !modelAvailable && (c.Routing != nil || c.PoolReason != nil) {
+		return ErrInvalidPayload
+	}
 	if strings.TrimSpace(c.JudgmentID) == "" || c.TraceURL == nil {
 		return ErrInvalidPayload
 	}
@@ -1197,8 +1203,7 @@ func (c AnnotationComponent) markdownV2(showMemberScope bool) string {
 	if showMemberScope {
 		lines = append(lines, c.memberScopeLine())
 	}
-	if c.Routing.Choice == "pool" ||
-		(c.Capability == "policy-facts-v1" && c.PolicyProposal == "pool") {
+	if c.PoolReason != nil {
 		reasons := c.PoolReason.Probabilities
 		probabilityLine := "**Pool " + formatProbability(routing["pool"]) + "** · Oncall " + formatProbability(routing["oncall"])
 		if c.Routing.Choice == "oncall" {

@@ -25,6 +25,12 @@ func (s *Service) groupCardProjection(state cardPersistentState) map[string]inte
 	projection := map[string]interface{}{"schema_version": rendererGroupCard, "perspective": "last-confirmed-executor-state", "platform_current": current, "renderer_version": renderer, "permission_domain": s.config.PermissionDomain, "execution_domain": s.config.ExecutionDomain, "profile_id": s.config.expectedProfileID, "profile_version": s.config.expectedProfileVersion, "card_owner_id": s.config.CardOwnerID, "receiver": state.Receiver, "sender_app": state.SenderApp, "destination": state.Destination, "message_id": state.MessageID, "card_binding_id": cardBindingID(state.SenderApp, state.MessageID), "base_revision": state.BaseRevision, "base_card_hash": baseHash, "annotation_revision": state.AnnotationRevision, "lifecycle_revision": state.GroupLifecycleRevision, "group_component": component, "group_payload_hash": payloadHash, "request_id": request, "scope_known": state.FinalSnapshot != nil, "pending": pending, "patch_unknown": unknown, "pending_annotation_revision": nil, "snapshot_id": nil, "members_hash": nil, "logical_group_id": nil}
 	scope := GroupAnnotationScope{PermissionDomain: s.config.PermissionDomain, ExecutionDomain: s.config.ExecutionDomain, ProfileID: s.config.expectedProfileID, ProfileVersion: s.config.expectedProfileVersion, CardOwnerID: s.config.CardOwnerID, Receiver: state.Receiver, SenderApp: state.SenderApp, Destination: state.Destination}
 	projection["scope"] = scope
+	projection["lifecycle_fence"] = nil
+	projection["lifecycle_fence_request_id"] = nil
+	if state.GroupLifecycleFence != nil {
+		projection["lifecycle_fence"] = state.GroupLifecycleFence.Component
+		projection["lifecycle_fence_request_id"] = state.GroupLifecycleFence.RequestID
+	}
 	if state.FinalSnapshot != nil {
 		projection["snapshot_id"] = state.FinalSnapshot.SnapshotID
 		projection["members_hash"] = state.FinalSnapshot.MembersHash
