@@ -412,6 +412,16 @@ func (s *Service) applyGroupAnnotation(ctx context.Context, messageID, key strin
 	// Legacy lifecycle requests remain accepted, but recovery is now a silent
 	// control fact. Stored legacy render snapshots are not rewritten.
 	if component.Kind == "lifecycle" {
+		if component.AnnotationRevision < 1 || component.AnnotationRevision <= component.ExpectedAnnotationRevision {
+			return "", ErrInvalidPayload
+		}
+		if component.AssessmentID != nil {
+			oldURL, parseErr := url.Parse(component.DetailURL)
+			if parseErr == nil && oldURL.Path == "/apps/alert-center/groups/"+*component.AssessmentID {
+				oldURL.Path = "/apps/alert-center/traces/" + *component.AssessmentID
+				component.DetailURL = oldURL.String()
+			}
+		}
 		component.Kind = "lifecycle_only"
 		component.AnnotationRevision = component.ExpectedAnnotationRevision
 	}

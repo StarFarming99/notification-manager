@@ -417,3 +417,27 @@ func TestNotificationReplayContractFiles(t *testing.T) {
 		t.Fatalf("%d of %d frozen samples failed actual consumer validation/render", failed, len(samples))
 	}
 }
+
+func TestNotificationLegacyLifecycleExactGroupLinkBecomesSilentWithoutDiscardingValidation(t *testing.T) {
+	s, cfg, snapshot, calls, _ := nativeGroupFixture(t, 1)
+	c := nativeLifecycle(snapshot, "om-native-group", 1, 0, 1, 0)
+	assessment := "ga1_legacy-pending"
+	c.AssessmentID = &assessment
+	c.DetailURL = "https://aiops.example/apps/alert-center/groups/" + assessment + "?domain=" + snapshot.PermissionDomain
+	bad := c
+	bad.AnnotationRevision = 0
+	if _, err := s.applyGroupAnnotation(context.Background(), "om-native-group", "invalid-legacy-revision", bad); !errors.Is(err, ErrInvalidPayload) {
+		t.Fatal(err)
+	}
+	if _, err := s.applyGroupAnnotation(context.Background(), "om-native-group", "legacy-old-link-control", c); err != nil {
+		t.Fatal(err)
+	}
+	projection := nativeProjection(t, s, cfg)
+	if calls.Load() != 0 || projection["annotation_revision"] != float64(0) || projection["lifecycle_revision"] != float64(1) {
+		t.Fatal(projection)
+	}
+	fence := projection["lifecycle_fence"].(map[string]interface{})
+	if fence["detail_url"] != "https://aiops.example/apps/alert-center/traces/"+assessment+"?domain="+snapshot.PermissionDomain {
+		t.Fatal(fence)
+	}
+}
